@@ -1,0 +1,109 @@
+"""Integration tests for AgentConnection through the real bridge.
+
+Each test gets a running bridge with the stub agent already started
+(via the bridge_with_stub fixture). The tests exercise the full
+HTTP/SSE/JSON-RPC pipeline without any mocks.
+"""
+
+import asyncio
+
+from orpheus.lib.connection import AgentConnection
+
+
+async def test_initialize_and_new_session(bridge_with_stub):
+    """Full ACP handshake: initialize + session/new returns a session ID."""
+    conn = AgentConnection(bridge_with_stub)
+    try:
+        await conn.start()
+        session_id = await conn.new_session()
+        assert session_id == "stub-session-1"
+        assert conn.session_id == "stub-session-1"
+    finally:
+        await conn.close()
+
+
+async def test_prompt_and_response(bridge_with_stub):
+    """Send a prompt, verify the stub returns end_turn."""
+    conn = AgentConnection(bridge_with_stub)
+    try:
+        await conn.start()
+        await conn.new_session()
+        result = await asyncio.wait_for(conn.prompt("Hello, agent!"), timeout=5)
+        assert result["stopReason"] == "end_turn"
+    finally:
+        await conn.close()
+
+
+async def test_session_update_notifications(bridge_with_stub):
+    """Verify agent_message_chunk notifications arrive via the handler."""
+    events = []
+
+    async def on_update(params):
+        events.append(params)
+
+    conn = AgentConnection(bridge_with_stub)
+    try:
+        conn.on("session/update", on_update)
+        await conn.start()
+        await conn.new_session()
+        await asyncio.wait_for(conn.prompt("test"), timeout=5)
+
+        # Notifications are dispatched before the prompt response resolves,
+        # but give a small window for async delivery.
+        await asyncio.sleep(0.2)
+
+        update_types = [e["update"]["sessionUpdate"] for e in events]
+        assert "agent_message_chunk" in update_types
+
+        chunk = next(e for e in events if e["update"]["sessionUpdate"] == "agent_message_chunk")
+        assert chunk["update"]["content"]["type"] == "text"
+        assert "Response to prompt" in chunk["update"]["content"]["text"]
+    finally:
+        await conn.close()
+
+
+async def test_tool_call_notifications(bridge_with_stub):
+    """Verify tool_call and tool_call_update notifications are dispatched."""
+    events = []
+
+    async def on_update(params):
+        events.append(params)
+
+    conn = AgentConnection(bridge_with_stub)
+    try:
+        conn.on("session/update", on_update)
+        await conn.start()
+        await conn.new_session()
+        await asyncio.wait_for(conn.prompt("test"), timeout=5)
+        await asyncio.sleep(0.2)
+
+        update_types = [e["update"]["sessionUpdate"] for e in events]
+        assert "tool_call" in update_types
+        assert "tool_call_update" in update_types
+
+        tool_call = next(e for e in events if e["update"]["sessionUpdate"] == "tool_call")
+        assert tool_call["update"]["title"] == "echo"
+        assert tool_call["update"]["toolCallId"] == "tool-1"
+        assert tool_call["update"]["rawInput"] == {"message": "hello"}
+
+        tool_update = next(e for e in events if e["update"]["sessionUpdate"] == "tool_call_update")
+        assert tool_update["update"]["status"] == "completed"
+        assert tool_update["update"]["rawOutput"] == {"result": "hello"}
+    finally:
+        await conn.close()
+
+
+async def test_multiple_prompts(bridge_with_stub):
+    """Two prompts on the same session both succeed."""
+    conn = AgentConnection(bridge_with_stub)
+    try:
+        await conn.start()
+        await conn.new_session()
+
+        r1 = await asyncio.wait_for(conn.prompt("First"), timeout=5)
+        assert r1["stopReason"] == "end_turn"
+
+        r2 = await asyncio.wait_for(conn.prompt("Second"), timeout=5)
+        assert r2["stopReason"] == "end_turn"
+    finally:
+        await conn.close()
