@@ -20,6 +20,7 @@ from druids_server.lib.caption import CaptionSummarizer
 from druids_server.lib.connection import AgentConnection
 from druids_server.lib.machine import BRIDGE_PORT, Machine
 from druids_server.lib.program_dispatch import extract_agent_tool_schemas
+from druids_server.lib.sandbox.base import Sandbox
 from druids_server.lib.tools import BUILTIN_TOOL_SCHEMAS, BUILTIN_TOOLS
 from druids_server.utils import execution_trace
 
@@ -508,6 +509,122 @@ class Execution:
                     await machine.stop()
                 except Exception:
                     logger.warning("Failed to stop orphaned machine for agent '%s'", name)
+            raise
+
+    async def fork_agent(
+        self,
+        source_name: str,
+        name: str,
+        *,
+        prompt: str | None = None,
+        system_prompt: str | None = None,
+        model: str | None = None,
+        git: str | None = None,
+        context: bool = False,
+    ) -> Agent:
+        """Fork an agent's VM (COW) and create a new agent on the clone.
+
+        Snapshots the source agent's machine, creates a child from the
+        snapshot, and provisions a new agent on the child. The forked
+        agent inherits full filesystem state.
+
+        Args:
+            source_name: Name of the agent to fork.
+            name: Name for the new agent.
+            prompt: Initial prompt (or continuation prompt if context=True).
+            system_prompt: Override system prompt. Inherits from source if None.
+            model: Override model. Inherits from source if None.
+            git: Override git permissions. Inherits from source if None.
+            context: If True, copy the original agent's conversation history
+                by resuming its ACP session on the fork.
+        """
+        source = self.agents.get(source_name)
+        if not source:
+            raise ValueError(f"Source agent '{source_name}' not found")
+
+        # Inherit config from source where not overridden
+        src_config = source.config
+        resolved_system_prompt = system_prompt if system_prompt is not None else src_config.system_prompt
+        resolved_model = model if model is not None else src_config.model
+        resolved_git = git if git is not None else src_config.git
+
+        # Capture the source session ID before any changes, needed for context=True
+        source_session_id = source.session_id if context else None
+
+        secrets = await self._load_secrets()
+        agent_config = create_agent(
+            name,
+            agent_type=src_config.agent_type,
+            model=resolved_model,
+            prompt=prompt,
+            system_prompt=resolved_system_prompt,
+            working_directory=src_config.working_directory,
+            git=resolved_git,
+            slug=self.slug,
+            user_id=self.user_id,
+            secrets=secrets,
+            spec=self.spec,
+        )
+
+        machine: Machine | None = None
+        try:
+            t0 = time.monotonic()
+
+            # Snapshot the source machine and create a child from it
+            snapshot_id = await source.machine.snapshot()
+            has_git = bool(agent_config.git and self.repo_full_name)
+            metadata = {"druids:agent_name": name, "druids:forked_from": source_name}
+            child_sandbox = await Sandbox.create(
+                snapshot_id=snapshot_id,
+                metadata=metadata,
+                workdir=source.machine.sandbox.workdir if source.machine.sandbox else None,
+            )
+            child = Machine(
+                sandbox=child_sandbox,
+                snapshot_id=snapshot_id,
+                repo_full_name=self.repo_full_name or "",
+                git_branch=self.git_branch,
+                git_permissions=agent_config.git if has_git else None,
+            )
+            await child.init()
+            machine = child
+
+            t1 = time.monotonic()
+            logger.info("fork_agent '%s' from '%s': machine ready in %.2fs", name, source_name, t1 - t0)
+            execution_trace.program_added(self.user_id, self.slug, name, "agent", machine.instance_id)
+
+            cls = agent_class(agent_config.agent_type)
+            agent_obj = await cls.create(
+                agent_config,
+                machine,
+                is_shared=False,
+                slug=self.slug,
+                user_id=self.user_id,
+                secrets=secrets,
+                resume_session_id=source_session_id,
+            )
+            self._bind_trace(name, agent_obj.connection)
+            self.agents[name] = agent_obj
+
+            t2 = time.monotonic()
+            execution_trace.agent_connected(self.user_id, self.slug, name, "deferred")
+            logger.info(
+                "fork_agent '%s': bridge ready, session deferred, total=%.2fs (forked from '%s')",
+                name, t2 - t0, source_name,
+            )
+
+            if agent_config.prompt:
+                execution_trace.prompt(self.user_id, self.slug, name, agent_config.prompt)
+                await agent_obj.prompt(agent_config.prompt)
+
+            return agent_obj
+
+        except BaseException:
+            if machine and name not in self.agents:
+                try:
+                    await machine.stop()
+                except Exception:
+                    logger.warning("Failed to stop orphaned machine for forked agent '%s'", name)
             raise
 
     async def _resolve_machine(self, config: AgentConfig, share_with_name: str | None) -> Machine:

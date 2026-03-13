@@ -90,16 +90,31 @@ class Agent:
         slug: str,
         user_id: str,
         secrets: dict[str, str] | None = None,
+        resume_session_id: str | None = None,
     ) -> Self:
         """Provision and connect an agent. Returns a fully-initialized instance.
 
         The ACP connection is established but the session is NOT created yet.
         Session creation is deferred until the first prompt so that program-
         defined tool handlers are visible to ACP during `tools/list`.
+
+        Args:
+            config: Agent configuration.
+            machine: Machine to run on.
+            is_shared: Whether the machine is shared with another agent.
+            slug: Execution slug.
+            user_id: User ID.
+            secrets: Decrypted secrets for env injection.
+            resume_session_id: If set, pass --resume to the ACP process
+                so it resumes an existing conversation session (used by fork
+                with context=True).
         """
         await cls._prepare_machine(config, machine, is_shared)
 
         acp = cls.build_acp(config, slug=slug, user_id=user_id, secrets=secrets)
+        if resume_session_id:
+            acp.command_args = [*acp.command_args, "--resume", resume_session_id]
+
         bridge_id, bridge_token = await machine.ensure_bridge(
             acp,
             config.working_directory,

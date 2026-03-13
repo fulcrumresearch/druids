@@ -66,6 +66,15 @@ class CallToolRequest(BaseModel):
     args: dict[str, Any] = Field(default_factory=dict)
 
 
+class ForkAgentRequest(BaseModel):
+    name: str
+    prompt: str | None = None
+    system_prompt: str | None = None
+    model: str | None = None
+    git: str | None = None
+    context: bool = False
+
+
 class SnapshotAgentRequest(BaseModel):
     devbox_name: str | None = None  # optional name for the devbox (default: agent name)
 
@@ -98,6 +107,34 @@ async def create_agent(
         working_directory=request.working_directory,
         share_machine_with=request.share_machine_with,
         mcp_servers=request.mcp_servers,
+    )
+    return {"name": agent.name}
+
+
+@router.post("/executions/{slug}/agents/{source_name}/fork", tags=["executions"], dependencies=[Depends(require_driver)])
+async def fork_agent(
+    slug: str,
+    source_name: str,
+    request: ForkAgentRequest,
+    caller: Caller,
+    executions: UserExecutions,
+):
+    """Fork an agent's VM and create a new agent on the clone.
+
+    Snapshots the source agent's machine (COW), creates a child from the
+    snapshot, and provisions a new agent on it. The forked agent inherits
+    full filesystem state.
+    """
+    ex = _get_runtime_execution(executions, slug)
+    _get_runtime_agent(ex, source_name)
+    agent = await ex.fork_agent(
+        source_name,
+        request.name,
+        prompt=request.prompt,
+        system_prompt=request.system_prompt,
+        model=request.model,
+        git=request.git,
+        context=request.context,
     )
     return {"name": agent.name}
 

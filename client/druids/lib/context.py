@@ -47,6 +47,30 @@ class Agent(Protocol):
         """Expose a port on this agent's VM as a public HTTPS URL."""
         ...
 
+    async def fork(
+        self,
+        name: str,
+        *,
+        prompt: str | None = None,
+        system_prompt: str | None = None,
+        model: str | None = None,
+        git: str | None = None,
+        context: bool = False,
+    ) -> Agent:
+        """Fork this agent's VM (COW) and create a new agent on the clone.
+
+        Args:
+            name: Name for the new agent.
+            prompt: Initial prompt (or continuation prompt if context=True).
+            system_prompt: Override the system prompt. Inherits original if None.
+            model: Override the model. Inherits original if None.
+            git: Override git permissions. Inherits original if None.
+            context: If True, copy the original agent's conversation history
+                into the fork. The prompt is appended to the existing history.
+                If False (default), start a fresh conversation.
+        """
+        ...
+
 
 @runtime_checkable
 class ProgramContext(Protocol):

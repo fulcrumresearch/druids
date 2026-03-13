@@ -91,6 +91,49 @@ class RuntimeAgent:
         resp = await self._ctx._post(f"/agents/{self.name}/expose", {"service_name": name, "port": port})
         return resp["url"]
 
+    async def fork(
+        self,
+        name: str,
+        *,
+        prompt: str | None = None,
+        system_prompt: str | None = None,
+        model: str | None = None,
+        git: str | None = None,
+        context: bool = False,
+    ) -> RuntimeAgent:
+        """Fork this agent's VM (COW) and create a new agent on the clone.
+
+        Args:
+            name: Name for the new agent.
+            prompt: Initial prompt (or continuation prompt if context=True).
+            system_prompt: Override the system prompt. Inherits original if None.
+            model: Override the model. Inherits original if None.
+            git: Override git permissions. Inherits original if None.
+            context: If True, copy the original agent's conversation history
+                into the fork. The prompt is appended to the existing history.
+                If False (default), start a fresh conversation.
+        """
+        await self._await_ready()
+        payload: dict[str, Any] = {"name": name, "context": context}
+        if prompt is not None:
+            payload["prompt"] = prompt
+        if system_prompt is not None:
+            payload["system_prompt"] = system_prompt
+        if model is not None:
+            payload["model"] = model
+        if git is not None:
+            payload["git"] = git
+
+        forked = RuntimeAgent(name=name, _ctx=self._ctx)
+        self._ctx._agents[name] = forked
+
+        async def _fork_and_wait():
+            await self._ctx._post(f"/agents/{self.name}/fork", payload)
+
+        forked._ready = asyncio.create_task(_fork_and_wait())
+        self._ctx._ensure_server()
+        return forked
+
     async def snapshot_machine(self, name: str | None = None) -> str:
         """Snapshot this agent's VM and register it as a new devbox.
 
