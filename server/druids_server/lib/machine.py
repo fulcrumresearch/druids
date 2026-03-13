@@ -117,7 +117,7 @@ class Machine:
         come from the DRUIDS_ACCESS_TOKEN env var set at bridge start time.
         """
         config = json.dumps({"base_url": base_url})
-        await self.exec("mkdir -p /home/agent/.druids")
+        await self.exec("mkdir -p /home/agent/.druids", timeout=10)
         await self.sandbox.write_file("/home/agent/.druids/config.json", config)
 
     async def init(self) -> None:
@@ -132,16 +132,17 @@ class Machine:
                 "git config --global --add safe.directory /home/agent/repo",
                 check=False,
                 user="root",
+                timeout=10,
             )
             await self._refresh_and_write_token()
 
     async def _sync_clock(self) -> None:
         """Sync system clock via NTP. Snapshots freeze the clock at snapshot time."""
-        await self.exec("timeout 10 ntpdate -s pool.ntp.org", check=False, user="root")
+        await self.exec("timeout 10 ntpdate -s pool.ntp.org", check=False, user="root", timeout=10)
 
     async def _kill_stale_processes(self) -> None:
         """Kill any bridge processes left over from a snapshot or fork."""
-        await self.exec("pkill -f 'bridge.py'", check=False, user="root")
+        await self.exec("pkill -f 'bridge.py'", check=False, user="root", timeout=10)
 
     async def _install_packages(self) -> None:
         """Install the druids CLI wheel.
@@ -156,7 +157,7 @@ class Machine:
         wheel_name = wheel_path.name
         wheel_version = wheel_path.stem.split("-", 2)[1]
 
-        result = await self.exec("cat /tmp/.druids_wheel_version 2>/dev/null", check=False)
+        result = await self.exec("cat /tmp/.druids_wheel_version 2>/dev/null", check=False, timeout=10)
         if result.ok and result.stdout.strip() == wheel_version:
             return
 
@@ -250,21 +251,22 @@ class Machine:
         log_file = f"/tmp/bridge-{port}.log"
         bridge_cmd = f"cd /opt/druids && nohup .venv/bin/python3 bridge.py --port {port} > {log_file} 2>&1 &"
         try:
-            await self.exec(bridge_cmd, check=False, timeout=2)
-        except (TimeoutError, asyncio.TimeoutError):
-            pass  # Expected -- exec blocks on backgrounded process
+            await self.exec(bridge_cmd, check=False, timeout=5)
+        except Exception:
+            pass  # Expected -- exec may timeout or hit transient API errors
 
         for attempt in range(15):
             status_result = await self.exec(
                 f"curl -fsS http://127.0.0.1:{port}/status >/dev/null 2>&1",
                 check=False,
+                timeout=15,
             )
             if status_result.ok:
                 logger.info("Machine.ensure_bridge port=%d ready after %d attempts", port, attempt + 1)
                 break
             await asyncio.sleep(0.5)
         else:
-            log_result = await self.exec(f"cat {log_file} 2>/dev/null || echo '(no log)'", check=False)
+            log_result = await self.exec(f"cat {log_file} 2>/dev/null || echo '(no log)'", check=False, timeout=10)
             logger.error("Machine.ensure_bridge not ready, log: %s", log_result.stdout)
             raise RuntimeError(f"Bridge not ready on {self.instance_id}. Log: {log_result.stdout}")
 
@@ -286,9 +288,9 @@ class Machine:
             "-H 'Content-Type: application/json' "
             f"--data-binary @{tmp_path} >/tmp/bridge_started_{port}.json"
         )
-        start_result = await self.exec(start_cmd, check=False)
+        start_result = await self.exec(start_cmd, check=False, timeout=30)
         if not start_result.ok:
-            log_result = await self.exec(f"cat {log_file} 2>/dev/null || echo '(no log)'", check=False)
+            log_result = await self.exec(f"cat {log_file} 2>/dev/null || echo '(no log)'", check=False, timeout=10)
             logger.error("Bridge start failed, bridge log: %s", log_result.stdout)
             raise RuntimeError(f"Bridge start failed: {start_result.stderr or start_result.stdout}")
 
@@ -319,6 +321,7 @@ class Machine:
             result = await self.exec(
                 f"cd {wd} && git symbolic-ref refs/remotes/origin/HEAD | sed 's@^refs/remotes/origin/@@'",
                 check=False,
+                timeout=10,
             )
             if result.ok and result.stdout.strip():
                 branch = result.stdout.strip()
@@ -326,7 +329,7 @@ class Machine:
                 logger.warning("Machine.git_pull could not detect default branch, skipping")
                 return
 
-        await self.exec(f"cd {wd} && git remote set-url origin {plain_url}", check=False)
+        await self.exec(f"cd {wd} && git remote set-url origin {plain_url}", check=False, timeout=10)
 
         result = await self.exec(f"cd {wd} && git fetch origin {branch}", check=False)
         if not result.ok:

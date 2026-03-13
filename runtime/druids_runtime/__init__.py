@@ -223,19 +223,22 @@ class RuntimeContext:
         async def _create_and_wait():
             if share_machine_with:
                 await share_machine_with._await_ready()
-            await self._post(
-                "/agents",
-                {
-                    "name": name,
-                    "prompt": prompt,
-                    "system_prompt": system_prompt,
-                    "model": model,
-                    "git": git,
-                    "working_directory": working_directory,
-                    "share_machine_with": share_name,
-                    "mcp_servers": mcp_servers,
-                },
-            )
+            payload: dict[str, Any] = {"name": name}
+            if prompt is not None:
+                payload["prompt"] = prompt
+            if system_prompt is not None:
+                payload["system_prompt"] = system_prompt
+            if model != "claude":
+                payload["model"] = model
+            if git is not None:
+                payload["git"] = git
+            if working_directory is not None:
+                payload["working_directory"] = working_directory
+            if share_name is not None:
+                payload["share_machine_with"] = share_name
+            if mcp_servers is not None:
+                payload["mcp_servers"] = mcp_servers
+            await self._post("/agents", payload)
 
         agent._ready = asyncio.create_task(_create_and_wait())
         self._ensure_server()
