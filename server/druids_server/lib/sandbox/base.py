@@ -47,6 +47,9 @@ class Sandbox(ABC):
     subclasses.
     """
 
+    supports_cow: bool = False
+    """Whether this backend supports copy-on-write cloning for fork()."""
+
     def __init__(self, instance_id: str, workdir: str | None = None) -> None:
         self.instance_id = instance_id
         self.workdir = workdir

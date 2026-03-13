@@ -14,11 +14,12 @@ from druids_server.lib.agents.config import AgentConfig
 from druids_server.lib.execution import Execution
 
 
-def _make_machine(instance_id="instance_1"):
+def _make_machine(instance_id="instance_1", supports_cow=True):
     m = MagicMock()
     m.instance_id = instance_id
     m.sandbox = MagicMock()
     m.sandbox.workdir = "/home/agent"
+    m.sandbox.supports_cow = supports_cow
     m.stop = AsyncMock()
     m.exec = AsyncMock(return_value=MagicMock(stdout="", stderr="", exit_code=0, ok=True))
     m.ensure_bridge = AsyncMock(return_value=(f"{instance_id}:7462", "bridge-token"))
@@ -344,3 +345,25 @@ class TestForkAgentCleanup:
 
         child_machine.stop.assert_called_once()
         assert "fork" not in execution.agents
+
+
+class TestForkDockerBackendError:
+    @pytest.mark.asyncio
+    async def test_raises_on_docker_backend(self):
+        """fork_agent raises RuntimeError when the source sandbox does not support COW."""
+        execution = _make_execution()
+        source = _make_agent("builder", machine=_make_machine("src", supports_cow=False))
+        execution.agents["builder"] = source
+
+        with pytest.raises(RuntimeError, match="COW cloning"):
+            await execution.fork_agent("builder", "fork")
+
+    @pytest.mark.asyncio
+    async def test_error_message_mentions_docker(self):
+        """The error message mentions Docker so the user knows what to fix."""
+        execution = _make_execution()
+        source = _make_agent("builder", machine=_make_machine("src", supports_cow=False))
+        execution.agents["builder"] = source
+
+        with pytest.raises(RuntimeError, match="Docker"):
+            await execution.fork_agent("builder", "fork")

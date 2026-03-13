@@ -45,9 +45,10 @@ def _mock_conn() -> MagicMock:
     return conn
 
 
-def _mock_sandbox(workdir="/home/agent/repo"):
+def _mock_sandbox(workdir="/home/agent/repo", supports_cow=True):
     sandbox = MagicMock()
     sandbox.workdir = workdir
+    sandbox.supports_cow = supports_cow
     sandbox.exec = AsyncMock(return_value=MagicMock(stdout="", stderr="", exit_code=0, ok=True))
     sandbox.write_file = AsyncMock()
     sandbox.read_file = AsyncMock(return_value="")

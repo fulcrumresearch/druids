@@ -542,6 +542,12 @@ class Execution:
         if not source:
             raise ValueError(f"Source agent '{source_name}' not found")
 
+        if not source.machine.sandbox.supports_cow:
+            raise RuntimeError(
+                "fork() requires a backend that supports COW cloning (e.g. Morph). "
+                "Docker does not support COW snapshots."
+            )
+
         # Inherit config from source where not overridden
         src_config = source.config
         resolved_system_prompt = system_prompt if system_prompt is not None else src_config.system_prompt
