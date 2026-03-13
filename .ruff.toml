@@ -1,0 +1,7 @@
+line-length = 120
+
+[lint]
+select = ["I", "TID252"]  # isort + ban relative imports
+
+[lint.isort]
+lines-after-imports = 2

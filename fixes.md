@@ -1,0 +1,2 @@
+- remove bugs/ directory
+- rename server/druids_server to something more reasonable, ideas?
