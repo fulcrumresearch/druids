@@ -1,8 +1,13 @@
 """
-ACP Bridge - HTTP-based subprocess bridge for ACP agents.
+ACP Bridge - message-aware subprocess bridge for ACP agents.
 
 Runs on Morph VMs. Starts an ACP-compatible agent as a subprocess
 and relays stdin/stdout over HTTP long-poll to the server.
+
+The bridge understands JSON-RPC messages. It queues session/prompt
+requests and feeds them to the agent one at a time, handles cancel
+directly, detects hung agents, and synthesizes error responses when
+the agent is unresponsive or dead.
 
 Usage:
     python bridge.py --port 8001
@@ -10,6 +15,7 @@ Usage:
 
 import argparse
 import asyncio
+import json
 import logging
 import subprocess
 import time
@@ -26,9 +32,9 @@ logger = logging.getLogger("bridge")
 
 app = FastAPI()
 
-# Set by --auth-token CLI arg. When set, all endpoints except /status
-# require Authorization: Bearer <token>.
+# Set by CLI args.
 _auth_token: str | None = None
+_liveness_timeout: float = 300.0
 
 
 @app.middleware("http")
@@ -50,14 +56,99 @@ class StartRequest(BaseModel):
     bridge_token: str | None = None
 
 
+# ---------------------------------------------------------------------------
+# Prompt queue
+# ---------------------------------------------------------------------------
+
+
+def _error_response(request_id: int | str, message: str) -> str:
+    """Build a JSON-RPC error response line (NDJSON)."""
+    resp = {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "error": {"code": -32000, "message": message},
+    }
+    return json.dumps(resp, separators=(",", ":")) + "\n"
+
+
+@dataclass
+class PromptQueue:
+    """Manages queued session/prompt requests for sequential processing."""
+
+    _items: asyncio.Queue[dict] = field(default_factory=asyncio.Queue)
+    processing_id: int | str | None = None
+    cancel_requested: bool = False
+    last_activity: float = field(default_factory=time.monotonic)
+
+    def add(self, msg: dict) -> None:
+        """Queue a session/prompt request."""
+        self._items.put_nowait(msg)
+        logger.info("Prompt queued: id=%s, depth=%d", msg.get("id"), self.depth)
+
+    async def get(self) -> dict:
+        """Block until a prompt is available, pop and start processing it."""
+        item = await self._items.get()
+        self.processing_id = item.get("id")
+        self.cancel_requested = False
+        self.last_activity = time.monotonic()
+        logger.info("Prompt started: id=%s, remaining=%d", self.processing_id, self.depth)
+        return item
+
+    def finish(self) -> None:
+        """Mark the current prompt as finished."""
+        logger.info("Prompt finished: id=%s", self.processing_id)
+        self.processing_id = None
+        self.cancel_requested = False
+
+    def drain_errors(self, reason: str) -> list[str]:
+        """Drain all in-flight and queued prompts, returning error response lines.
+
+        Called when the agent dies or is declared unresponsive.
+        """
+        errors = []
+        if self.processing_id is not None:
+            errors.append(_error_response(self.processing_id, reason))
+            self.processing_id = None
+        while True:
+            try:
+                msg = self._items.get_nowait()
+                request_id = msg.get("id")
+                if request_id is not None:
+                    errors.append(_error_response(request_id, reason))
+            except asyncio.QueueEmpty:
+                break
+        self.cancel_requested = False
+        if errors:
+            logger.info("Drained %d prompt(s) with error: %s", len(errors), reason)
+        return errors
+
+    @property
+    def depth(self) -> int:
+        """Number of prompts waiting (not including the in-flight one)."""
+        return self._items.qsize()
+
+
+# ---------------------------------------------------------------------------
+# Agent process
+# ---------------------------------------------------------------------------
+
+
 @dataclass
 class AgentProcess:
     proc: asyncio.subprocess.Process
-    stdin_queue: asyncio.Queue
+    stdin_queue: asyncio.Queue  # raw messages from relay
+    prompt_queue: PromptQueue = field(default_factory=PromptQueue)
+    prompt_done: asyncio.Event = field(default_factory=asyncio.Event)
+
+    # Tasks
     read_task: asyncio.Task | None = None
-    write_task: asyncio.Task | None = None
+    router_task: asyncio.Task | None = None
+    turn_task: asyncio.Task | None = None
+    liveness_task: asyncio.Task | None = None
     stderr_task: asyncio.Task | None = None
     exit_task: asyncio.Task | None = None
+
+    # Stats
     stdout_lines: int = 0
     stdin_lines: int = 0
     last_stdout_time: float = field(default_factory=time.monotonic)
@@ -80,24 +171,59 @@ RELAY_PUSH_BATCH_SIZE = 256
 
 
 # ---------------------------------------------------------------------------
-# Core bridge: stdin/stdout relay
+# Core bridge: message-aware stdin/stdout relay
 # ---------------------------------------------------------------------------
 
 
+def _push_output(line: str) -> None:
+    """Append a line to the output buffer and wake the relay pusher."""
+    output_buffer.append(line)
+    output_event.set()
+
+
 async def read_stdout(proc: asyncio.subprocess.Process):
-    """Read lines from process stdout and append to output buffer."""
+    """Read lines from agent stdout, track prompt completion, pass to output buffer.
+
+    Every line is forwarded to the output buffer (and from there to the server
+    via the relay). Additionally, if the line is a JSON-RPC response whose id
+    matches the in-flight prompt, the prompt_done event is set so the turn
+    processor knows to move on.
+    """
     while True:
         line = await proc.stdout.readline()
         if not line:
             break
+
+        decoded = line.decode()
         if agent:
             agent.stdout_lines += 1
             agent.last_stdout_time = time.monotonic()
-        output_buffer.append(line.decode())
-        output_event.set()
+            agent.prompt_queue.last_activity = time.monotonic()
+
+        # Check if this is the response to the in-flight prompt
+        if agent and agent.prompt_queue.processing_id is not None:
+            try:
+                msg = json.loads(decoded)
+                # A response has 'id' and no 'method'
+                if "id" in msg and "method" not in msg:
+                    if msg["id"] == agent.prompt_queue.processing_id:
+                        agent.prompt_done.set()
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+        _push_output(decoded)
+
     logger.info("read_stdout: pipe closed after %d lines", agent.stdout_lines if agent else -1)
+
+    # Agent died. Flush any in-flight/queued prompts as errors.
+    if agent:
+        errors = agent.prompt_queue.drain_errors("agent process exited")
+        for err in errors:
+            _push_output(err)
+        agent.prompt_done.set()  # unblock turn processor
+
     stdout_done.set()
-    output_event.set()  # wake push_stdout so it sees stdout_done immediately
+    output_event.set()  # wake push_stdout so it sees stdout_done
 
 
 async def read_stderr(proc: asyncio.subprocess.Process):
@@ -110,25 +236,140 @@ async def read_stderr(proc: asyncio.subprocess.Process):
     logger.info("read_stderr: pipe closed")
 
 
-async def write_stdin(proc: asyncio.subprocess.Process, queue: asyncio.Queue):
-    """Read messages from queue and write to process stdin."""
+async def _write_to_stdin(proc: asyncio.subprocess.Process, data: str) -> bool:
+    """Write a message to the agent's stdin. Returns False on pipe error."""
+    if agent:
+        agent.stdin_lines += 1
+        agent.last_stdin_time = time.monotonic()
+    try:
+        proc.stdin.write(data.encode() if isinstance(data, str) else data)
+        await proc.stdin.drain()
+        return True
+    except (BrokenPipeError, ConnectionResetError, OSError) as exc:
+        logger.warning("write_stdin: pipe error: %s", exc)
+        return False
+
+
+async def route_incoming(proc: asyncio.subprocess.Process, queue: asyncio.Queue):
+    """Read messages from the relay and route them.
+
+    session/prompt requests are queued for sequential processing by the
+    turn processor. session/cancel notifications are handled directly.
+    Everything else (initialize, session/new, session/set_model, etc.)
+    passes through to the agent immediately.
+    """
     while True:
-        msg = await queue.get()
-        if agent:
-            agent.stdin_lines += 1
-            agent.last_stdin_time = time.monotonic()
+        raw = await queue.get()
+
         try:
-            proc.stdin.write(msg.encode() if isinstance(msg, str) else msg)
-            await proc.stdin.drain()
-        except (BrokenPipeError, ConnectionResetError, OSError) as exc:
-            logger.warning("write_stdin: pipe error after %d msgs: %s", agent.stdin_lines if agent else -1, exc)
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            # Not valid JSON -- pass through unchanged
+            await _write_to_stdin(proc, raw)
+            continue
+
+        method = parsed.get("method")
+        has_id = "id" in parsed
+
+        if method == "session/prompt" and has_id:
+            # Queue for sequential processing
+            if agent:
+                agent.prompt_queue.add(parsed)
+        elif method == "session/cancel":
+            # Handle cancel: set flag and forward to agent
+            if agent:
+                agent.prompt_queue.cancel_requested = True
+                logger.info("Cancel requested for prompt id=%s", agent.prompt_queue.processing_id)
+            await _write_to_stdin(proc, raw)
+        else:
+            # Pass through (initialize, session/new, session/set_model, etc.)
+            await _write_to_stdin(proc, raw)
+
+
+async def process_turns(proc: asyncio.subprocess.Process):
+    """Process queued prompts one at a time.
+
+    Pops a prompt from the queue, forwards it to the agent via stdin,
+    waits for the agent to respond (signaled by read_stdout), then
+    moves on to the next prompt.
+    """
+    while True:
+        if not agent:
             return
+
+        try:
+            item = await agent.prompt_queue.get()
+        except asyncio.CancelledError:
+            return
+
+        agent.prompt_done.clear()
+
+        # Forward the prompt to the agent
+        raw = json.dumps(item, separators=(",", ":")) + "\n"
+        ok = await _write_to_stdin(proc, raw)
+        if not ok:
+            # Agent stdin is broken -- drain everything with errors
+            errors = agent.prompt_queue.drain_errors("agent stdin pipe broken")
+            for err in errors:
+                _push_output(err)
+            return
+
+        # Wait for the agent to respond (read_stdout sets prompt_done
+        # when it sees a response matching the in-flight prompt id)
+        try:
+            await agent.prompt_done.wait()
+        except asyncio.CancelledError:
+            return
+
+        agent.prompt_queue.finish()
+
+
+async def monitor_liveness():
+    """Detect hung agents and synthesize error responses.
+
+    Checks every 5 seconds whether a prompt is in-flight and the agent
+    has gone silent (no stdout) for longer than the liveness timeout.
+    """
+    while True:
+        await asyncio.sleep(5)
+
+        if not agent or agent.prompt_queue.processing_id is None:
+            continue
+
+        elapsed = time.monotonic() - agent.prompt_queue.last_activity
+        if elapsed < _liveness_timeout:
+            continue
+
+        logger.warning(
+            "Agent unresponsive: prompt id=%s, no stdout for %.0fs (timeout=%.0fs)",
+            agent.prompt_queue.processing_id, elapsed, _liveness_timeout,
+        )
+
+        # Synthesize errors for all in-flight and queued prompts
+        errors = agent.prompt_queue.drain_errors(
+            f"agent unresponsive (no output for {int(elapsed)}s)"
+        )
+        for err in errors:
+            _push_output(err)
+
+        agent.prompt_done.set()  # unblock turn processor
+
+        # Kill the agent process
+        try:
+            agent.proc.terminate()
+        except ProcessLookupError:
+            pass
 
 
 async def watch_exit(proc: asyncio.subprocess.Process):
     """Wait for the agent process to exit and log the result."""
     returncode = await proc.wait()
     logger.info("Agent process exited with code %d", returncode)
+
+
+# ---------------------------------------------------------------------------
+# Reverse relay (transport layer -- unchanged)
+# ---------------------------------------------------------------------------
 
 
 async def run_reverse_relay(relay_url: str, bridge_id: str, bridge_token: str):
@@ -197,12 +438,6 @@ async def run_reverse_relay(relay_url: str, bridge_id: str, bridge_token: str):
         pull_task = asyncio.create_task(pull_stdin(client))
 
         try:
-            # Wait for push_stdout to drain everything and return. It checks
-            # stdout_done.is_set() after each drain cycle: once the pipe is
-            # closed AND the buffer is empty, it exits on its own. This means
-            # push_stdout owns the full lifecycle of pushing -- no separate
-            # flush path, no cancellation race, and its existing retry logic
-            # covers transient errors during the final drain.
             await push_task
         except asyncio.CancelledError:
             push_task.cancel()
@@ -211,6 +446,11 @@ async def run_reverse_relay(relay_url: str, bridge_id: str, bridge_token: str):
             pull_task.cancel()
             await asyncio.gather(pull_task, return_exceptions=True)
             logger.info("Relay: stopped, pushed %d lines total", sent_cursor)
+
+
+# ---------------------------------------------------------------------------
+# FastAPI endpoints
+# ---------------------------------------------------------------------------
 
 
 @app.post("/start")
@@ -246,9 +486,11 @@ async def start_agent(req: StartRequest):
     stdin_queue = asyncio.Queue()
     agent = AgentProcess(proc=proc, stdin_queue=stdin_queue)
 
-    # Start background tasks for reading/writing
+    # Start background tasks
     agent.read_task = asyncio.create_task(read_stdout(proc))
-    agent.write_task = asyncio.create_task(write_stdin(proc, stdin_queue))
+    agent.router_task = asyncio.create_task(route_incoming(proc, stdin_queue))
+    agent.turn_task = asyncio.create_task(process_turns(proc))
+    agent.liveness_task = asyncio.create_task(monitor_liveness())
     agent.stderr_task = asyncio.create_task(read_stderr(proc))
     agent.exit_task = asyncio.create_task(watch_exit(proc))
     if req.relay_url and req.bridge_id and req.bridge_token:
@@ -276,8 +518,9 @@ async def _stop_task(task: asyncio.Task, timeout: float = 0) -> None:
 async def stop_agent():
     """Stop the ACP agent subprocess.
 
-    Order matters: terminate the process, wait for read_stdout to drain
-    the pipe, let the relay push whatever remains, then cancel write_stdin.
+    Order: terminate the process, wait for read_stdout to drain the pipe
+    and synthesize error responses for pending prompts, let the relay push
+    whatever remains, then cancel the queue processing tasks.
     """
     global agent, relay_task
 
@@ -291,19 +534,19 @@ async def stop_agent():
         pass
 
     # 2. Wait for read_stdout to drain the pipe. After this, output_buffer
-    #    is complete and stdout_done is set.
+    #    is complete (including synthesized error responses) and stdout_done is set.
     if agent.read_task:
         await _stop_task(agent.read_task, timeout=5.0)
 
-    # 3. Let the relay drain remaining output. stdout_done is already set,
-    #    so push_stdout will finish after pushing whatever is left.
+    # 3. Let the relay drain remaining output.
     if relay_task:
         await _stop_task(relay_task, timeout=10.0)
         relay_task = None
 
-    # 4. Cancel write_stdin -- it may be blocked on the dead queue.
-    if agent.write_task:
-        await _stop_task(agent.write_task)
+    # 4. Cancel the queue processing tasks.
+    for task in [agent.router_task, agent.turn_task, agent.liveness_task]:
+        if task:
+            await _stop_task(task)
 
     await agent.proc.wait()
     agent = None
@@ -313,7 +556,7 @@ async def stop_agent():
 
 @app.get("/status")
 async def get_status():
-    """Get agent status."""
+    """Get agent status including prompt queue state."""
     global agent
 
     if agent is None:
@@ -323,8 +566,10 @@ async def get_status():
         return {"status": "exited", "returncode": agent.proc.returncode}
 
     now = time.monotonic()
+    pq = agent.prompt_queue
     relaying = relay_task is not None and not relay_task.done()
-    return {
+
+    result = {
         "status": "running",
         "pid": agent.proc.pid,
         "relaying": relaying,
@@ -332,19 +577,31 @@ async def get_status():
         "stdin_lines": agent.stdin_lines,
         "seconds_since_stdout": round(now - agent.last_stdout_time, 1),
         "seconds_since_stdin": round(now - agent.last_stdin_time, 1),
+        "queue_depth": pq.depth,
+        "prompt_in_flight": pq.processing_id is not None,
     }
+
+    if pq.processing_id is not None:
+        result["seconds_since_prompt_activity"] = round(now - pq.last_activity, 1)
+
+    return result
 
 
 def main():
-    global _auth_token
+    global _auth_token, _liveness_timeout
 
     parser = argparse.ArgumentParser(description="ACP Bridge")
     parser.add_argument("--port", type=int, default=8001, help="Port to listen on")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
     parser.add_argument("--auth-token", default=None, help="Bearer token required for all requests (except /status)")
+    parser.add_argument(
+        "--liveness-timeout", type=float, default=300.0,
+        help="Seconds of agent silence before declaring it unresponsive (default: 300)",
+    )
     args = parser.parse_args()
 
     _auth_token = args.auth_token
+    _liveness_timeout = args.liveness_timeout
     uvicorn.run(app, host=args.host, port=args.port)
 
 
