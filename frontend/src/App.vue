@@ -19,6 +19,9 @@ function isActive(path) {
       <router-link to="/" class="sidebar-link" :class="{ active: isActive('/') }">
         Home
       </router-link>
+      <router-link to="/setup" class="sidebar-link" :class="{ active: isActive('/setup') }">
+        Setup
+      </router-link>
       <router-link to="/docs" class="sidebar-link" :class="{ active: isActive('/docs') }">
         Docs
       </router-link>
