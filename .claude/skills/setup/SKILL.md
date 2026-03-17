@@ -1,7 +1,7 @@
 ---
 name: setup
 description: >
-  Guide for helping users set up their devbox on Orpheus. Covers the full
+  Guide for helping users set up their devbox on Druids. Covers the full
   flow from provisioning to snapshot, using remote_exec to assist with
   dependency installation and environment configuration.
 user-invocable: true
@@ -9,7 +9,7 @@ user-invocable: true
 
 # Devbox Setup
 
-A devbox is a VM snapshot with the user's repo cloned and dependencies installed. Every repo needs one before tasks can run against it. The `setup start` endpoint provisions the VM and clones the repo. The user (or you via `remote_exec`) installs dependencies and configures the environment. Then `setup save` snapshots the VM.
+A devbox is a VM snapshot with the user's repo cloned and dependencies installed. Every repo needs one before tasks can run against it. The `setup start` endpoint provisions the VM and clones the repo. The user (or you via `remote_exec`) installs dependencies and configures the environment. Then `setup finish` snapshots the VM.
 
 At each step, explain what you are about to do, what you found, and what you need from the user. By default, figure things out from the codebase. But give the user a chance to intervene -- they may know about services that need to run, dependencies that are tricky to install, environment variables that are not obvious from the code, or testing requirements like headless browsers.
 
@@ -20,10 +20,10 @@ At each step, explain what you are about to do, what you found, and what you nee
 If it's not clear from the current directory which repo the user wants, ask them. Then call:
 
 ```
-orpheus setup start
+druids devbox create
 ```
 
-This provisions a VM from the base Orpheus snapshot, clones the repo, and returns SSH credentials. The user can SSH in, or you can use `remote_exec` to run commands on the devbox.
+This provisions a VM from the base Druids snapshot, clones the repo, and returns SSH credentials. The user can SSH in, or you can use `remote_exec` to run commands on the devbox.
 
 If the user has already started setup, this returns the existing instance.
 
@@ -36,9 +36,9 @@ If they have guidance, follow it. If not, proceed by exploring the codebase.
 Read the project's setup files to figure out what it needs:
 
 ```
-remote_exec(repo="owner/repo", command="cat /home/agent/myrepo/package.json")
-remote_exec(repo="owner/repo", command="cat /home/agent/myrepo/pyproject.toml")
-remote_exec(repo="owner/repo", command="cat /home/agent/myrepo/Makefile")
+remote_exec(repo="owner/repo", command="cat /home/agent/repo/package.json")
+remote_exec(repo="owner/repo", command="cat /home/agent/repo/pyproject.toml")
+remote_exec(repo="owner/repo", command="cat /home/agent/repo/Makefile")
 ```
 
 Tell the user what you found and what you are about to install. For example: "I found a Python project using uv with these dependencies. I'm going to run `uv sync`. Anything I should know before I install?"
@@ -48,11 +48,11 @@ The user may flag things like: pinned system libraries, packages that need build
 Then install:
 
 ```
-remote_exec(repo="owner/repo", command="sudo -u agent bash -c 'cd /home/agent/myrepo && npm install'")
-remote_exec(repo="owner/repo", command="sudo -u agent bash -c 'cd /home/agent/myrepo && pip install -e .'")
+remote_exec(repo="owner/repo", command="sudo -u agent bash -c 'cd /home/agent/repo && npm install'")
+remote_exec(repo="owner/repo", command="sudo -u agent bash -c 'cd /home/agent/repo && pip install -e .'")
 ```
 
-Commands run as root, so prefix with `sudo -u agent` when needed. The repo is cloned at `/home/agent/{repo_name}`.
+Commands run as root, so prefix with `sudo -u agent` when needed. The repo is cloned at `/home/agent/repo`.
 
 ### 3. Configure the environment
 
@@ -62,7 +62,7 @@ Figure out what the project needs beyond dependencies:
 - Identify services: databases, caches, message queues, background workers.
 - Identify ports: what the project binds to and whether any need external exposure.
 
-Present your findings to the user. For example: "I found the server reads these env vars from `server/.env`: `DATABASE_URL`, `REDIS_URL`, `API_KEY`, `WEBHOOK_SECRET`. The database URL I can set to localhost. For `API_KEY` and `WEBHOOK_SECRET`, I'll need values from you. The project also needs PostgreSQL and Redis running. Should I install and start both?"
+Present your findings to the user. For example: "I found the server reads these env vars from `server/.env`: `DATABASE_URL`, `REDIS_URL`, `API_KEY`, `SECRET_KEY`. The database URL I can set to localhost. For `API_KEY` and `SECRET_KEY`, I'll need values from you. The project also needs PostgreSQL and Redis running. Should I install and start both?"
 
 Be specific about what you need:
 
@@ -77,7 +77,7 @@ Set up services and write config files via `remote_exec`. Ask the user for secre
 Run the project's test suite to confirm the basics work:
 
 ```
-remote_exec(repo="owner/repo", command="sudo -u agent bash -c 'cd /home/agent/myrepo && npm test'")
+remote_exec(repo="owner/repo", command="sudo -u agent bash -c 'cd /home/agent/repo && npm test'")
 ```
 
 If something fails, diagnose and fix it.
@@ -86,20 +86,16 @@ But tests are just a baseline. Before moving on, ask the user: "Tests pass. Is t
 
 If the project has a server, start it and hit its health endpoint. If it has a CLI, run a command. If it has a database, confirm it connects. The goal is a VM where an agent can build, run, and interact with the system end to end, not just pass unit tests.
 
-### 5. Write .orpheus/SETUP.md
+### 5. Update SETUP.md
 
-Synthesize what you learned during setup into `.orpheus/SETUP.md`. Agent VMs are forked from this snapshot, so dependencies are already installed and the environment is already configured. This file tells agents what is already set up for them and how to use it.
+If the repo has a `SETUP.md`, add an "Agent environment" section describing what agents need to know about the snapshot environment. If it does not have one, create it.
+
+Agent VMs are forked from this snapshot, so dependencies are already installed and the environment is already configured. The agent environment section tells agents what is already set up for them and how to use it.
 
 Write the file locally, then upload it to the devbox:
 
 ```
-orpheus upload .orpheus/SETUP.md /home/agent/myrepo/.orpheus/SETUP.md
-```
-
-Make sure `.orpheus/` exists on the devbox:
-
-```
-remote_exec(repo="owner/repo", command="sudo -u agent mkdir -p /home/agent/myrepo/.orpheus")
+druids upload SETUP.md /home/agent/repo/SETUP.md
 ```
 
 Do not duplicate information already in the repo's README, CLAUDE.md, or other docs. Focus on the runtime environment that was configured during setup:
@@ -108,31 +104,29 @@ Do not duplicate information already in the repo's README, CLAUDE.md, or other d
 - What environment variables were set, where they live, and what they control (names and purpose, not secret values).
 - What ports are in use. If any need to be exposed externally, what env vars or config must change to match the new URL.
 - How to verify the system works: not just "run pytest" but the full loop. If the project has a server, how to start it and confirm it responds. If it has an API, how to call it. If it has agents or workers, how to trigger them and observe the result.
-- Known issues or quirks specific to the environment (e.g. "Postgres must be running before the server starts", "the webhook URL must match ORPHEUS_BASE_URL").
+- Known issues or quirks specific to the environment (e.g. "Postgres must be running before the server starts").
 
 The purpose is so agents can immediately interact with the system end to end without rediscovering how the project works. An agent reading this file should know how to start the system, exercise it, and confirm their changes work -- not just run a test suite. Keep it concise.
 
-If the repo already has `.orpheus/SETUP.md`, update it rather than overwriting.
+After uploading, ask the user if they want to commit `SETUP.md` to the repo. If yes, commit and push it to the default branch.
 
-After uploading, ask the user if they want to commit `.orpheus/SETUP.md` to the repo so that Orpheus agents always have it, even if the snapshot is rebuilt. If yes, commit and push it to the default branch.
-
-### 6. Save the snapshot
+### 6. Finish and snapshot
 
 Once the environment is working:
 
 ```
-orpheus setup save
+druids devbox snapshot
 ```
 
-This snapshots the VM and stores the snapshot ID in the database. Future tasks against this repo will branch from this snapshot. The old snapshot (if any) is deleted.
+This snapshots the VM and stores the snapshot ID in the database. Future executions against this repo will fork from this snapshot. The old snapshot (if any) is deleted.
 
 ## Tips
 
 - The VM runs Debian with Python 3.11, Node.js LTS, and GitHub CLI pre-installed.
-- The `orpheus` CLI is available on the VM for file transfers between VMs.
+- The `druids` CLI is available on the VM for file transfers between VMs.
 - The agent user has passwordless sudo.
 - If the project needs a database (Postgres, Redis, etc.), install and configure it during setup. It will be captured in the snapshot.
 - If the project needs environment variables or config files, create them during setup. Use `.env` files or write to `/home/agent/.bashrc`.
 - The user can SSH in alongside you. Coordinate if they want to do some steps manually.
 - If setup fails partway through, `setup start` will return the same instance so you can retry.
-- After saving, test by creating a quick task: `create_task(spec="Run the test suite and report results.", repo_full_name="owner/repo", programs=["claude"])`.
+- After finishing, test by creating a quick execution with a simple program that runs the test suite.

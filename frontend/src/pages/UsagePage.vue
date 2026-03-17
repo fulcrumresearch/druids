@@ -1,16 +1,18 @@
-<script setup>
+<script setup lang="ts">
 import { ref, computed, onMounted } from "vue"
-import { get } from "../api.js"
+import { get } from "../api"
+import { statusClass, timeAgo } from "../utils"
+import type { UsageStats } from '../types'
 
-const usage = ref(null)
+const usage = ref<UsageStats | null>(null)
 const loading = ref(true)
-const error = ref(null)
+const error = ref<string | null>(null)
 
 onMounted(async () => {
   try {
-    usage.value = await get("/admin/usage")
+    usage.value = await get<UsageStats>("/admin/usage")
   } catch (e) {
-    error.value = e.message
+    error.value = (e as Error).message
   } finally {
     loading.value = false
   }
@@ -22,31 +24,13 @@ const totalTokens = computed(() => {
   return t.input + t.output + t.cache_read + t.cache_creation
 })
 
-function formatNumber(n) {
+function formatNumber(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M"
   if (n >= 1_000) return (n / 1_000).toFixed(1) + "K"
   return String(n)
 }
 
-function statusClass(status) {
-  if (status === "running" || status === "starting") return "badge-active"
-  if (status === "completed") return "badge-completed"
-  if (status === "error" || status === "failed" || status === "stopped") return "badge-error"
-  return ""
-}
-
-function timeAgo(dateStr) {
-  if (!dateStr) return ""
-  const d = new Date(dateStr)
-  const now = new Date()
-  const diff = Math.floor((now - d) / 1000)
-  if (diff < 60) return "just now"
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`
-  return `${Math.floor(diff / 86400)}d ago`
-}
-
-function prNumber(url) {
+function prNumber(url: string | null): string | null {
   if (!url) return null
   const m = url.match(/\/pull\/(\d+)/)
   return m ? m[1] : null
@@ -74,7 +58,6 @@ function prNumber(url) {
         <div class="card stat-card">
           <div class="stat-label">Users</div>
           <div class="stat-value">{{ usage.users.total }}</div>
-          <div class="stat-detail">{{ usage.users.subscribed }} subscribed</div>
         </div>
         <div class="card stat-card">
           <div class="stat-label">Repos</div>
@@ -130,35 +113,54 @@ function prNumber(url) {
       <!-- Recent executions -->
       <h2 class="mb-2">Recent executions</h2>
       <div v-if="usage.recent_executions.length">
-        <table class="data-table">
-          <thead>
-            <tr>
-              <th>Repo</th>
-              <th>User</th>
-              <th>Status</th>
-              <th>PR</th>
-              <th>Tokens</th>
-              <th>Started</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="ex in usage.recent_executions" :key="ex.slug">
-              <td class="text-secondary" style="font-size: 0.72rem;">{{ ex.repo_full_name || "\u2014" }}</td>
-              <td class="text-secondary" style="font-size: 0.72rem;">{{ ex.user_login || "\u2014" }}</td>
-              <td><span class="badge" :class="statusClass(ex.status)">{{ ex.status }}</span></td>
-              <td>
-                <a v-if="ex.pr_url" :href="ex.pr_url" target="_blank" class="text-bright">
-                  #{{ prNumber(ex.pr_url) }}
-                </a>
-                <span v-else class="text-dim">&mdash;</span>
-              </td>
-              <td class="text-dim" style="font-size: 0.72rem;">
-                {{ formatNumber((ex.input_tokens || 0) + (ex.output_tokens || 0)) }}
-              </td>
-              <td class="text-dim">{{ timeAgo(ex.started_at) }}</td>
-            </tr>
-          </tbody>
-        </table>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Repo</th>
+                <th>User</th>
+                <th>Status</th>
+                <th>PR</th>
+                <th>Tokens</th>
+                <th>Started</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="ex in usage.recent_executions" :key="ex.slug">
+                <td class="text-secondary" style="font-size: 0.72rem;">{{ ex.repo_full_name || "\u2014" }}</td>
+                <td class="text-secondary" style="font-size: 0.72rem;">{{ ex.user_login || "\u2014" }}</td>
+                <td><span class="badge" :class="statusClass(ex.status)">{{ ex.status }}</span></td>
+                <td>
+                  <a v-if="ex.pr_url" :href="ex.pr_url" target="_blank" class="text-bright">
+                    #{{ prNumber(ex.pr_url) }}
+                  </a>
+                  <span v-else class="text-dim">&mdash;</span>
+                </td>
+                <td class="text-dim" style="font-size: 0.72rem;">
+                  {{ formatNumber((ex.input_tokens || 0) + (ex.output_tokens || 0)) }}
+                </td>
+                <td class="text-dim">{{ timeAgo(ex.started_at) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="mobile-cards">
+          <div v-for="ex in usage.recent_executions" :key="ex.slug" class="mobile-card">
+            <div class="mobile-card-row">
+              <span class="mobile-card-primary">{{ ex.repo_full_name || "\u2014" }}</span>
+              <span class="badge" :class="statusClass(ex.status)">{{ ex.status }}</span>
+            </div>
+            <div class="mobile-card-row" style="flex-wrap: wrap;">
+              <span class="mobile-card-dim">{{ ex.user_login || "\u2014" }}</span>
+              <a v-if="ex.pr_url" :href="ex.pr_url" target="_blank" class="mobile-card-dim" style="color: var(--text-bright);">
+                #{{ prNumber(ex.pr_url) }}
+              </a>
+              <span v-else class="mobile-card-dim">&mdash;</span>
+              <span class="mobile-card-dim">{{ formatNumber((ex.input_tokens || 0) + (ex.output_tokens || 0)) }} tokens</span>
+              <span class="mobile-card-dim">{{ timeAgo(ex.started_at) }}</span>
+            </div>
+          </div>
+        </div>
       </div>
       <div v-else class="empty-state">No executions yet.</div>
     </template>

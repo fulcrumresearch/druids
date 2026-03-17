@@ -3,12 +3,11 @@ import os
 from logging.config import fileConfig
 
 # Import all models so SQLModel.metadata is populated
-import orpheus.db.models.devbox  # noqa: F401
-import orpheus.db.models.execution  # noqa: F401
-import orpheus.db.models.spec  # noqa: F401
-import orpheus.db.models.task  # noqa: F401
-import orpheus.db.models.user  # noqa: F401
-import orpheus.db.models.user_spec  # noqa: F401
+import druids_server.db.models.devbox  # noqa: F401
+import druids_server.db.models.execution  # noqa: F401
+import druids_server.db.models.program  # noqa: F401
+import druids_server.db.models.secret  # noqa: F401
+import druids_server.db.models.user  # noqa: F401
 from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
@@ -20,10 +19,10 @@ from sqlmodel import SQLModel
 # access to the values within the .ini file in use.
 config = context.config
 
-# Override sqlalchemy.url from environment. The application uses asyncpg but
-# Alembic needs the synchronous psycopg driver.
-database_url = os.environ.get("ORPHEUS_DATABASE_URL", "postgresql+asyncpg://postgres@localhost/orpheus")
-config.set_main_option("sqlalchemy.url", database_url.replace("+asyncpg", "+psycopg"))
+# Override sqlalchemy.url from environment. Swap async drivers for sync equivalents.
+database_url = os.environ.get("DRUIDS_DATABASE_URL", "sqlite+aiosqlite:///druids.db")
+sync_url = database_url.replace("+aiosqlite", "").replace("+asyncpg", "+psycopg")
+config.set_main_option("sqlalchemy.url", sync_url)
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.

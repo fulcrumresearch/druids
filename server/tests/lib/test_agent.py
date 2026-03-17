@@ -1,11 +1,14 @@
-"""Tests for Agent."""
+"""Tests for agent configuration and factory."""
 
 from unittest.mock import MagicMock, patch
 
 import pytest
-from orpheus.lib.agents.base import ACPConfig, Agent
-from orpheus.lib.agents.claude import ClaudeAgent
-from orpheus.lib.agents.codex import CodexAgent
+from druids_server.lib.acp import ACPConfig
+from druids_server.lib.agents import create_agent
+from druids_server.lib.agents.base import Agent
+from druids_server.lib.agents.claude import ClaudeAgent
+from druids_server.lib.agents.codex import CodexAgent
+from druids_server.lib.agents.config import AgentConfig
 
 
 class TestACPConfig:
@@ -38,137 +41,175 @@ class TestACPConfig:
         assert payload["working_directory"] == "/home/agent"
 
 
-class TestAgent:
-    def test_agent_is_program(self):
-        """Agent extends Program."""
-        agent = Agent(name="test")
+class TestAgentConfig:
+    def test_defaults(self):
+        """AgentConfig has sensible defaults."""
+        config = AgentConfig(name="test")
 
-        assert hasattr(agent, "name")
-        assert hasattr(agent, "constructors")
-        assert hasattr(agent, "exec")
-
-    def test_agent_has_config(self):
-        """Agent has config."""
-        config = ACPConfig(command="test-cmd")
-        agent = Agent(name="test", config=config)
-
-        assert agent.config.command == "test-cmd"
-
-    def test_system_prompt_defaults_to_none(self):
-        """system_prompt defaults to None."""
-        agent = Agent(name="test")
-        assert agent.system_prompt is None
-
-    def test_system_prompt_accepts_value(self):
-        """system_prompt can be set."""
-        agent = Agent(name="test", system_prompt="You are a helpful agent.")
-        assert agent.system_prompt == "You are a helpful agent."
-
-    def test_working_directory_default(self):
-        """working_directory defaults to /home/agent."""
-        agent = Agent(name="test")
-        assert agent.working_directory == "/home/agent"
+        assert config.name == "test"
+        assert config.agent_type == "claude"
+        assert config.model is None
+        assert config.prompt is None
+        assert config.system_prompt is None
+        assert config.working_directory == "/home/agent"
+        assert config.git is None
 
     def test_working_directory_custom(self):
         """working_directory can be overridden."""
-        agent = Agent(name="test", working_directory="/workspace")
-        assert agent.working_directory == "/workspace"
+        config = AgentConfig(name="test", working_directory="/workspace")
+        assert config.working_directory == "/workspace"
 
 
-class TestClaudeAgent:
+class TestAgent:
+    def test_name_delegates_to_config(self):
+        """Agent.name is a property delegating to config.name."""
+        config = AgentConfig(name="worker")
+        agent = Agent(
+            config=config,
+            machine=MagicMock(),
+            bridge_id="test:7462",
+            bridge_token="tok",
+            session_id="sess-1",
+            connection=MagicMock(),
+        )
+        assert agent.name == "worker"
+
+
+class TestCreateClaudeAgent:
     def test_creates_claude_config(self):
-        """ClaudeAgent creates an ACPConfig with claude-code-acp command."""
-        agent = ClaudeAgent(name="claude")
+        """create_agent with default agent_type creates a claude config."""
+        config = create_agent("claude", slug="test-slug", user_id="user-1")
 
-        assert agent.config.command == "claude-code-acp"
-        assert agent.config.env == {}
+        assert config.agent_type == "claude"
+        assert config.name == "claude"
 
     def test_default_model(self):
-        """Default model is claude-opus-4-6."""
-        agent = ClaudeAgent(name="claude")
+        """Default model is None (agent uses its own default)."""
+        config = create_agent("claude", slug="test-slug", user_id="user-1")
 
-        assert agent.model == "claude-opus-4-6"
+        assert config.model is None
 
     def test_custom_model(self):
         """Model can be overridden."""
-        agent = ClaudeAgent(name="claude", model="claude-sonnet-4-5-20250929")
+        config = create_agent("claude", model="claude-sonnet-4-5-20250929", slug="test-slug", user_id="user-1")
 
-        assert agent.model == "claude-sonnet-4-5-20250929"
+        assert config.model == "claude-sonnet-4-5-20250929"
 
-    def test_working_directory_in_bridge_payload(self):
-        """working_directory is passed through to_bridge_start()."""
-        agent = ClaudeAgent(name="claude", working_directory="/home/agent/myrepo")
-        payload = agent.config.to_bridge_start(agent.working_directory)
+    def test_working_directory_default(self):
+        """working_directory defaults to /home/agent."""
+        config = create_agent("claude", slug="test-slug", user_id="user-1")
+        assert config.working_directory == "/home/agent"
 
-        assert agent.working_directory == "/home/agent/myrepo"
-        assert payload["working_directory"] == "/home/agent/myrepo"
+    def test_working_directory_custom(self):
+        """working_directory can be overridden."""
+        config = create_agent("claude", working_directory="/home/agent/myrepo", slug="test-slug", user_id="user-1")
+        assert config.working_directory == "/home/agent/myrepo"
 
-    def test_to_bridge_start_has_permission_bypass(self):
-        """ClaudeAgent's config gets --dangerously-skip-permissions."""
-        agent = ClaudeAgent(name="claude")
-        payload = agent.config.to_bridge_start(agent.working_directory)
+
+class TestCreateCodexAgent:
+    def test_creates_codex_config(self):
+        """create_agent with agent_type='codex' creates a codex config."""
+        config = create_agent("codex", agent_type="codex", slug="test-slug", user_id="user-1")
+
+        assert config.agent_type == "codex"
+        assert config.name == "codex"
+
+    def test_working_directory_custom(self):
+        """working_directory can be overridden."""
+        config = create_agent(
+            "codex",
+            agent_type="codex",
+            working_directory="/home/agent/myrepo",
+            slug="test-slug",
+            user_id="user-1",
+        )
+        assert config.working_directory == "/home/agent/myrepo"
+
+
+class TestBuildClaudeACP:
+    @patch("druids_server.lib.agents.base.mint_token", return_value="t")
+    @patch("druids_server.lib.agents.claude.settings")
+    def test_claude_acp_command(self, mock_settings, _mock_mint):
+        """build_acp for claude produces claude-code-acp command."""
+        mock_settings.base_url = "http://localhost"
+        mock_settings.anthropic_api_key.get_secret_value.return_value = "sk-test"
+        config = AgentConfig(name="claude")
+        acp = ClaudeAgent.build_acp(config, slug="test-slug", user_id="user-1")
+
+        assert acp.command == "claude-code-acp"
+
+    @patch("druids_server.lib.agents.base.mint_token", return_value="t")
+    @patch("druids_server.lib.agents.claude.settings")
+    def test_claude_permission_bypass(self, mock_settings, _mock_mint):
+        """Claude ACP config gets --dangerously-skip-permissions."""
+        mock_settings.base_url = "http://localhost"
+        mock_settings.anthropic_api_key.get_secret_value.return_value = "sk-test"
+        config = AgentConfig(name="claude")
+        acp = ClaudeAgent.build_acp(config, slug="test-slug", user_id="user-1")
+        payload = acp.to_bridge_start(config.working_directory)
 
         assert "--dangerously-skip-permissions" in payload["args"]
 
-    def test_is_agent(self):
-        """ClaudeAgent is an agent."""
-        agent = ClaudeAgent(name="claude")
-        assert agent.is_agent is True
-
-
-class TestCodexAgent:
-    @patch("orpheus.lib.agents.codex.settings")
-    def test_creates_codex_config(self, mock_settings_obj):
-        """CodexAgent creates an ACPConfig with codex-acp command."""
-        mock_key = MagicMock()
-        mock_key.get_secret_value.return_value = "sk-test"
-        mock_settings_obj.openai_api_key = mock_key
-
-        agent = CodexAgent(name="codex")
-
-        assert agent.config.command == "codex-acp"
-        assert agent.config.env["OPENAI_API_KEY"] == "sk-test"
-
-    @patch("orpheus.lib.agents.codex.settings")
-    def test_raises_without_openai_key(self, mock_settings_obj):
-        """CodexAgent raises ValueError when OPENAI_API_KEY is not configured."""
-        mock_settings_obj.openai_api_key = None
-
-        with pytest.raises(ValueError, match="OPENAI_API_KEY not configured"):
-            CodexAgent(name="codex")
-
-    @patch("orpheus.lib.agents.codex.settings")
-    def test_working_directory_in_bridge_payload(self, mock_settings_obj):
+    @patch("druids_server.lib.agents.base.mint_token", return_value="t")
+    @patch("druids_server.lib.agents.claude.settings")
+    def test_working_directory_in_bridge_payload(self, mock_settings, _mock_mint):
         """working_directory is passed through to_bridge_start()."""
-        mock_key = MagicMock()
-        mock_key.get_secret_value.return_value = "sk-test"
-        mock_settings_obj.openai_api_key = mock_key
+        mock_settings.base_url = "http://localhost"
+        mock_settings.anthropic_api_key.get_secret_value.return_value = "sk-test"
+        config = AgentConfig(name="claude", working_directory="/home/agent/myrepo")
+        acp = ClaudeAgent.build_acp(config, slug="test-slug", user_id="user-1")
+        payload = acp.to_bridge_start(config.working_directory)
 
-        agent = CodexAgent(name="codex", working_directory="/home/agent/myrepo")
-        payload = agent.config.to_bridge_start(agent.working_directory)
-
-        assert agent.working_directory == "/home/agent/myrepo"
         assert payload["working_directory"] == "/home/agent/myrepo"
 
-    @patch("orpheus.lib.agents.codex.settings")
-    def test_to_bridge_start_has_permission_bypass(self, mock_settings_obj):
-        """CodexAgent's config gets codex permission bypass flags."""
+
+class TestBuildCodexACP:
+    @patch("druids_server.lib.agents.base.mint_token", return_value="t")
+    @patch("druids_server.lib.agents.codex.settings")
+    def test_codex_acp_command(self, mock_settings, _mock_mint):
+        """build_acp for codex produces codex-acp command."""
         mock_key = MagicMock()
         mock_key.get_secret_value.return_value = "sk-test"
-        mock_settings_obj.openai_api_key = mock_key
+        mock_settings.openai_api_key = mock_key
+        config = AgentConfig(name="codex", agent_type="codex")
+        acp = CodexAgent.build_acp(config, slug="test-slug", user_id="user-1")
 
-        agent = CodexAgent(name="codex")
-        payload = agent.config.to_bridge_start(agent.working_directory)
+        assert acp.command == "codex-acp"
+        assert acp.env["OPENAI_API_KEY"] == "sk-test"
+
+    @patch("druids_server.lib.agents.base.mint_token", return_value="t")
+    @patch("druids_server.lib.agents.codex.settings")
+    def test_raises_without_openai_key(self, mock_settings, _mock_mint):
+        """build_acp raises ValueError when OPENAI_API_KEY is not configured."""
+        mock_settings.openai_api_key = None
+        config = AgentConfig(name="codex", agent_type="codex")
+
+        with pytest.raises(ValueError, match="OPENAI_API_KEY not configured"):
+            CodexAgent.build_acp(config, slug="test-slug", user_id="user-1")
+
+    @patch("druids_server.lib.agents.base.mint_token", return_value="t")
+    @patch("druids_server.lib.agents.codex.settings")
+    def test_codex_permission_bypass(self, mock_settings, _mock_mint):
+        """Codex ACP config gets codex permission bypass flags."""
+        mock_key = MagicMock()
+        mock_key.get_secret_value.return_value = "sk-test"
+        mock_settings.openai_api_key = mock_key
+        config = AgentConfig(name="codex", agent_type="codex")
+        acp = CodexAgent.build_acp(config, slug="test-slug", user_id="user-1")
+        payload = acp.to_bridge_start(config.working_directory)
 
         assert "-c" in payload["args"]
         assert 'approval_policy="never"' in payload["args"]
 
-    @patch("orpheus.lib.agents.codex.settings")
-    def test_is_agent(self, mock_settings_obj):
-        """CodexAgent is an agent."""
+    @patch("druids_server.lib.agents.base.mint_token", return_value="t")
+    @patch("druids_server.lib.agents.codex.settings")
+    def test_working_directory_in_bridge_payload(self, mock_settings, _mock_mint):
+        """working_directory is passed through to_bridge_start()."""
         mock_key = MagicMock()
         mock_key.get_secret_value.return_value = "sk-test"
-        mock_settings_obj.openai_api_key = mock_key
+        mock_settings.openai_api_key = mock_key
+        config = AgentConfig(name="codex", agent_type="codex", working_directory="/home/agent/myrepo")
+        acp = CodexAgent.build_acp(config, slug="test-slug", user_id="user-1")
+        payload = acp.to_bridge_start(config.working_directory)
 
-        agent = CodexAgent(name="codex")
-        assert agent.is_agent is True
+        assert payload["working_directory"] == "/home/agent/myrepo"

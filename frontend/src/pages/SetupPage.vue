@@ -1,985 +1,710 @@
-<script setup>
-import { ref, computed, onMounted, onUnmounted, nextTick, watchEffect } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
-import { get, post } from '../api.js'
+<script setup lang="ts">
+import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
+import { useRoute } from 'vue-router'
+import { get, post } from '../api'
+import type { Dashboard, Devbox } from '../types'
 
 const route = useRoute()
-const router = useRouter()
-const routeRepo = route.params.owner ? `${route.params.owner}/${route.params.repo}` : null
-const appInstallUrl = router._user?.github_app_install_url || null
+const routeRepo: string | null = route.params.owner
+  ? `${route.params.owner as string}/${route.params.repo as string}`
+  : null
 
-// step: 0=loading, 1=select repo, 2=provisioning, 3=wizard
+// step: 0=loading, 1=enter repo, 2=provisioning, 3=wizard, 4=already configured
 const step = ref(routeRepo ? 0 : 1)
-const repos = ref([])
-const search = ref('')
+const repoInput = ref(routeRepo || '')
 const loading = ref(true)
-const error = ref(null)
-const selectedRepo = ref(null)
-const devbox = ref(null)
+const error = ref<string | null>(null)
+const devbox = ref<Devbox | null>(null)
+
+// Repo suggestions
+const availableRepos = ref<string[]>([])
+const filteredRepos = computed(() => {
+  const q = repoInput.value.trim().toLowerCase()
+  if (!q) return availableRepos.value
+  return availableRepos.value.filter(r => r.toLowerCase().includes(q))
+})
+
+// Wizard types
+interface ChatMessage {
+  type: 'message'
+  role: string
+  text: string
+  streaming?: boolean
+}
+
+interface ToolMessage {
+  type: 'tool'
+  id: string
+  name: string
+  kind: string
+  input: string
+  output: string
+  status: string
+  expanded: boolean
+}
+
+type WizardMessage = ChatMessage | ToolMessage
+
+interface WizardStartResponse {
+  slug: string
+  status: 'started' | 'resumed'
+  mode: 'setup' | 'modify'
+}
 
 // Wizard state
-const slug = ref(null)
-const messages = ref([])
-const checklist = ref({
-  secrets: 'pending',
-  deps: 'pending',
-  lint: 'pending',
-  tests: 'pending',
-  verify: 'pending',
-  'setup-md': 'pending',
-})
+const activeRepo = ref<string | null>(null)
+const slug = ref<string | null>(null)
+const messages = ref<WizardMessage[]>([])
 const messageText = ref('')
 const sending = ref(false)
 const saving = ref(false)
 const saved = ref(false)
-const chatEl = ref(null)
+const chatEl = ref<HTMLElement | null>(null)
 const userScrolledUp = ref(false)
-const streamingMessage = ref(null)
-const textareaEl = ref(null)
+const streamingMessage = ref<number | null>(null)
+const textareaEl = ref<HTMLTextAreaElement | null>(null)
 const interrupting = ref(false)
 const resetting = ref(false)
-const setupMode = ref('setup')
+const setupMode = ref<'setup' | 'modify'>('setup')
 
 // SSE connection
-let sseAbortController = null
-let lastEventId = null
-let reconnectTimer = null
+let sseAbortController: AbortController | null = null
+let lastEventId: string | null = null
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 
-const CHECKLIST_STEPS = [
-  { key: 'secrets',   label: 'Configure secrets',   optional: true },
-  { key: 'deps',      label: 'Install dependencies', optional: false },
-  { key: 'lint',      label: 'Setup lint',           optional: true },
-  { key: 'tests',     label: 'Setup tests',          optional: true },
-  { key: 'verify',    label: 'Verify',               optional: false },
-  { key: 'setup-md',  label: 'Write SETUP.md',       optional: false },
-]
 
-const filteredRepos = computed(() => {
-  if (!search.value) return repos.value
-  const q = search.value.toLowerCase()
-  return repos.value.filter(r => r.full_name.toLowerCase().includes(q))
-})
-
-const TERMINAL_STATUSES = new Set(['done', 'skipped', 'error'])
-const isSetupComplete = computed(() => {
-  if (saved.value) return false
-  return CHECKLIST_STEPS.every(s => TERMINAL_STATUSES.has(checklist.value[s.key]))
-})
-
-function parseSSEStream(text, onFrame) {
-  // Split on double newlines to get frames
-  const frames = text.split(/\n\n/)
-  for (const frame of frames) {
-    if (!frame.trim()) continue
-    const lines = frame.split('\n')
-    let id = null
-    let event = 'message'
-    let data = ''
-    for (const line of lines) {
-      if (line.startsWith('id:')) {
-        id = line.slice(3).trim()
-      } else if (line.startsWith('event:')) {
-        event = line.slice(6).trim()
-      } else if (line.startsWith('data:')) {
-        data = line.slice(5).trim()
-      }
-    }
-    if (data) {
-      onFrame(id, event, data)
-    }
+function parseSSEFrame(frame: string, onFrame: (id: string | null, event: string, data: string) => void) {
+  if (!frame.trim()) return
+  const lines = frame.split('\n')
+  let id: string | null = null
+  let event = 'message'
+  let data = ''
+  for (const line of lines) {
+    if (line.startsWith('id:')) id = line.slice(3).trim()
+    else if (line.startsWith('event:')) event = line.slice(6).trim()
+    else if (line.startsWith('data:')) data = line.slice(5).trim()
   }
+  if (data) onFrame(id, event, data)
 }
 
-function findToolById(msgs, id) {
-  if (!id) return null
+function findToolById(msgs: WizardMessage[], id: string): ToolMessage | null {
   for (let i = msgs.length - 1; i >= 0; i--) {
-    if (msgs[i].type === 'tool' && msgs[i].id === id) return msgs[i]
+    const msg = msgs[i]
+    if (msg.type === 'tool' && msg.id === id) return msg
   }
   return null
 }
 
-function dispatchEvent(id, event, data) {
-  if (id !== null) lastEventId = id
-  let parsed
-  try {
-    parsed = JSON.parse(data)
-  } catch {
-    return
-  }
-  if (event === 'message_stream') {
-    streamingMessage.value = { type: 'message', role: 'assistant', text: parsed.text }
-    scrollToBottom()
-    return
-  }
-  if (event === 'message') {
-    streamingMessage.value = null
-    messages.value.push({ type: 'message', role: parsed.role, text: parsed.text })
-    scrollToBottom()
-  } else if (event === 'tool') {
-    streamingMessage.value = null
-    const existing = findToolById(messages.value, parsed.id)
-    if (existing) {
-      // Update all fields (ACP updates title mid-execution, e.g. "Terminal" -> actual command)
-      if (parsed.name) existing.name = parsed.name
-      if (parsed.kind) existing.kind = parsed.kind
-      if (parsed.input) existing.input = parsed.input
-      existing.output = parsed.output
-      existing.status = parsed.status
-    } else if (parsed.status === 'active') {
-      // No existing block -- tool just started, open a new one
-      messages.value.push({ type: 'tool', id: parsed.id, name: parsed.name, kind: parsed.kind || 'other', input: parsed.input, output: parsed.output, status: 'active', expanded: false })
-    } else {
-      // No active block (replay path: only done events in history)
-      messages.value.push({ type: 'tool', id: parsed.id, name: parsed.name, kind: parsed.kind || 'other', input: parsed.input, output: parsed.output, status: parsed.status, expanded: false })
-    }
-    scrollToBottom()
-  } else if (event === 'checklist') {
-    checklist.value[parsed.step] = parsed.status
-  }
+function scrollToBottom() {
+  if (userScrolledUp.value) return
+  nextTick(() => {
+    if (chatEl.value) chatEl.value.scrollTop = chatEl.value.scrollHeight
+  })
 }
 
-function onChatScroll() {
+function handleScroll() {
   if (!chatEl.value) return
   const el = chatEl.value
-  const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
-  userScrolledUp.value = distanceFromBottom > 80
+  const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40
+  userScrolledUp.value = !atBottom
 }
 
-async function scrollToBottom() {
-  if (userScrolledUp.value) return
-  await nextTick()
-  if (chatEl.value) {
-    chatEl.value.scrollTop = chatEl.value.scrollHeight
+function handleEvent(id: string | null, event: string, rawData: string) {
+  let data: Record<string, unknown>
+  try { data = JSON.parse(rawData) } catch { return }
+
+  if (id !== null) lastEventId = id
+
+  if (event === 'message') {
+    if (data.role === 'assistant' && streamingMessage.value !== null) {
+      messages.value[streamingMessage.value] = {
+        type: 'message', role: data.role as string, text: data.text as string,
+      }
+      streamingMessage.value = null
+    } else {
+      messages.value.push({
+        type: 'message', role: data.role as string, text: data.text as string,
+      })
+    }
+    scrollToBottom()
   }
+
+  if (event === 'message_stream') {
+    if (streamingMessage.value === null) {
+      streamingMessage.value = messages.value.length
+      messages.value.push({
+        type: 'message', role: 'assistant', text: data.text as string, streaming: true,
+      })
+    } else {
+      messages.value[streamingMessage.value] = {
+        type: 'message', role: 'assistant', text: data.text as string, streaming: true,
+      }
+    }
+    scrollToBottom()
+  }
+
+  if (event === 'tool') {
+    const existing = findToolById(messages.value, data.id as string)
+    if (existing) {
+      existing.name = data.name as string
+      existing.kind = data.kind as string
+      existing.input = data.input as string
+      existing.output = data.output as string
+      existing.status = data.status as string
+    } else {
+      messages.value.push({
+        type: 'tool',
+        id: data.id as string,
+        name: data.name as string,
+        kind: data.kind as string,
+        input: data.input as string,
+        output: data.output as string,
+        status: data.status as string,
+        expanded: false,
+      })
+    }
+    scrollToBottom()
+  }
+
 }
 
-async function connectChat(sessionSlug) {
-  // Cancel any existing connection
-  if (sseAbortController) {
-    sseAbortController.abort()
-    sseAbortController = null
-  }
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer)
-    reconnectTimer = null
-  }
+async function connectSSE() {
+  if (sseAbortController) sseAbortController.abort()
+  sseAbortController = new AbortController()
 
-  const controller = new AbortController()
-  sseAbortController = controller
+  const headers: Record<string, string> = {}
+  if (lastEventId !== null) headers['Last-Event-ID'] = lastEventId
 
-  const headers = { 'Accept': 'text/event-stream' }
-  if (lastEventId !== null) {
-    headers['Last-Event-ID'] = String(lastEventId)
-  }
-
-  let res
   try {
-    res = await fetch(`/api/setup/${sessionSlug}/chat`, {
-      method: 'GET',
+    const res = await fetch(`/api/setup/wizard/${slug.value}/chat`, {
       credentials: 'same-origin',
       headers,
-      signal: controller.signal,
+      signal: sseAbortController.signal,
     })
-  } catch (e) {
-    if (controller.signal.aborted) return
-    // Network error -- reconnect after delay
-    reconnectTimer = setTimeout(() => connectChat(sessionSlug), 2000)
-    return
-  }
-
-  if (res.status === 404) {
-    // Session gone (server restarted) -- start a new one
-    try {
-      const result = await post('/setup/start', { repo_full_name: selectedRepo.value.full_name, mode: setupMode.value })
-      slug.value = result.slug
-      lastEventId = null
-      messages.value = []
-      checklist.value = { secrets: 'pending', deps: 'pending', lint: 'pending', tests: 'pending', verify: 'pending', 'setup-md': 'pending' }
-      reconnectTimer = setTimeout(() => connectChat(result.slug), 500)
-    } catch (e) {
-      error.value = 'Session lost. Please refresh and try again.'
-    }
-    return
-  }
-
-  if (!res.ok || !res.body) {
-    reconnectTimer = setTimeout(() => connectChat(sessionSlug), 2000)
-    return
-  }
-
-  // Read the stream
-  const reader = res.body.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ''
-
-  while (true) {
-    let chunk
-    try {
-      chunk = await reader.read()
-    } catch {
-      if (controller.signal.aborted) return
-      break
-    }
-    if (chunk.done) break
-    buffer += decoder.decode(chunk.value, { stream: true })
-
-    // Process complete frames (separated by \n\n)
-    const boundary = buffer.lastIndexOf('\n\n')
-    if (boundary !== -1) {
-      const complete = buffer.slice(0, boundary + 2)
-      buffer = buffer.slice(boundary + 2)
-      parseSSEStream(complete, dispatchEvent)
-    }
-  }
-
-  // Process any remaining data left in the buffer when the stream closes.
-  // The final SSE event may not end with \n\n before the server closes the connection.
-  if (buffer.trim()) {
-    parseSSEStream(buffer, dispatchEvent)
-  }
-
-  if (controller.signal.aborted) return
-  // Stream closed -- reconnect
-  reconnectTimer = setTimeout(() => connectChat(sessionSlug), 2000)
-}
-
-function stopChat() {
-  if (sseAbortController) {
-    sseAbortController.abort()
-    sseAbortController = null
-  }
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer)
-    reconnectTimer = null
-  }
-}
-
-onMounted(async () => {
-  if (routeRepo) {
-    try {
-      const dash = await get('/me/dashboard')
-      const match = (dash.devboxes || []).find(d => d.repo_full_name === routeRepo)
-      devbox.value = match || null
-      selectedRepo.value = { full_name: routeRepo, name: routeRepo.split('/')[1] }
-
-      if (match?.has_snapshot) {
-        // Already configured -- go to step 3 with a done state
-        step.value = 3
-      } else if (match?.setup_slug) {
-        // Session in progress -- skip provisioning, go straight to wizard
-        slug.value = match.setup_slug
-        step.value = 3
-        connectChat(match.setup_slug)
-      } else {
-        // Not started -- go to provisioning
-        await startSetup({ full_name: routeRepo, name: routeRepo.split('/')[1] })
+    if (!res.ok || !res.body) {
+      if (res.status === 404) {
+        // Session is gone (server restart). Reset to step 1.
+        slug.value = null
+        step.value = 1
+        return
       }
-    } catch (e) {
-      error.value = e.message
-      step.value = 1
-    } finally {
-      loading.value = false
+      return
     }
-  } else {
-    try {
-      const data = await get('/repos')
-      repos.value = data.repos
-    } catch (e) {
-      error.value = e.message
-    } finally {
-      loading.value = false
+
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+
+      const parts = buffer.split('\n\n')
+      buffer = parts.pop()!
+      for (const part of parts) {
+        parseSSEFrame(part, handleEvent)
+      }
     }
+  } catch (e: unknown) {
+    if (e instanceof Error && e.name === 'AbortError') return
   }
-})
 
-// Widen the main-content container when the wizard layout is active
-const wizardActive = computed(() => step.value === 3 && slug.value)
-watchEffect(() => {
-  const el = document.querySelector('.main-content')
-  if (!el) return
-  if (wizardActive.value) {
-    el.classList.add('main-content--wide')
-  } else {
-    el.classList.remove('main-content--wide')
-  }
-})
+  reconnectTimer = setTimeout(connectSSE, 2000)
+}
 
-onUnmounted(() => {
-  stopChat()
-  document.querySelector('.main-content')?.classList.remove('main-content--wide')
-})
-
-async function startSetup(repo, mode = 'setup') {
-  selectedRepo.value = { full_name: repo.full_name, name: repo.name || repo.full_name.split('/')[1] }
-  step.value = 2
+async function startWizard(repo: string, mode: 'setup' | 'modify' = 'setup') {
   error.value = null
+  step.value = 2
   setupMode.value = mode
+
   try {
-    const result = await post('/setup/start', { repo_full_name: repo.full_name, mode })
-    slug.value = result.slug
+    const res = await post<WizardStartResponse>('/setup/wizard/start', { repo_full_name: repo, mode })
+    slug.value = res.slug
+    activeRepo.value = repo
     step.value = 3
-    connectChat(result.slug)
-  } catch (e) {
-    // Try to parse response for 409
-    let msg = e.message
-    try {
-      const parsed = JSON.parse(msg)
-      msg = parsed.detail || msg
-    } catch {}
-    if (msg.includes('409') || msg.toLowerCase().includes('already set up')) {
-      error.value = 'Already set up.'
-    } else {
-      error.value = msg
-    }
+    connectSSE()
+  } catch (e: unknown) {
+    error.value = (e as Error).message
     step.value = 1
   }
 }
 
-function autoResizeTextarea(el) {
-  el.style.height = 'auto'
-  el.style.height = Math.min(el.scrollHeight, 120) + 'px'
-}
-
 async function sendMessage() {
+  if (!messageText.value.trim() || sending.value) return
   const text = messageText.value.trim()
-  if (!text || sending.value || !slug.value) return
-  sending.value = true
   messageText.value = ''
-  await nextTick()
-  if (textareaEl.value) autoResizeTextarea(textareaEl.value)
+  sending.value = true
+
   try {
-    await post(`/setup/${slug.value}/message`, { text })
-  } catch (e) {
-    error.value = e.message
+    await post(`/setup/wizard/${slug.value}/message`, { text })
+  } catch (e: unknown) {
+    error.value = (e as Error).message
   } finally {
     sending.value = false
+    nextTick(() => textareaEl.value?.focus())
   }
 }
 
-function handleInputKeydown(e) {
-  if (e.key === 'Enter' && !e.shiftKey) {
-    e.preventDefault()
-    sendMessage()
-  }
-}
-
-async function interruptAgent() {
-  if (interrupting.value || !slug.value) return
+async function interrupt() {
   interrupting.value = true
   try {
-    await post(`/setup/${slug.value}/interrupt`, {})
-  } catch (e) {
-    error.value = e.message
-  } finally {
-    interrupting.value = false
-  }
+    await post(`/setup/wizard/${slug.value}/interrupt`)
+  } catch { /* best effort */ }
+  interrupting.value = false
 }
 
 async function saveSnapshot() {
   saving.value = true
-  error.value = null
   try {
-    await post('/setup/save', { repo_full_name: selectedRepo.value.full_name })
+    await post('/setup/wizard/save', { repo_full_name: activeRepo.value })
     saved.value = true
-    if (devbox.value) devbox.value.has_snapshot = true
-    stopChat()
-    router.push('/')
-  } catch (e) {
-    error.value = e.message
+  } catch (e: unknown) {
+    error.value = (e as Error).message
   } finally {
     saving.value = false
   }
 }
 
 async function resetSetup() {
-  if (resetting.value || !selectedRepo.value) return
+  if (!confirm('This will delete the current setup and start over. Continue?')) return
   resetting.value = true
-  error.value = null
   try {
-    stopChat()
-    await post('/setup/reset', { repo_full_name: selectedRepo.value.full_name })
-
-    // Clear local wizard state
+    await post('/setup/wizard/reset', { repo_full_name: activeRepo.value || repoInput.value })
     slug.value = null
+    activeRepo.value = null
     messages.value = []
-    streamingMessage.value = null
-    lastEventId = null
-    checklist.value = {
-      secrets: 'pending',
-      deps: 'pending',
-      lint: 'pending',
-      tests: 'pending',
-      verify: 'pending',
-      'setup-md': 'pending',
-    }
-
-    // Restart setup
-    await startSetup(selectedRepo.value)
-  } catch (e) {
-    error.value = e.message
-    resetting.value = false
+    saved.value = false
+    devbox.value = null
+    step.value = 1
+    if (sseAbortController) sseAbortController.abort()
+  } catch (e: unknown) {
+    error.value = (e as Error).message
   } finally {
     resetting.value = false
   }
 }
 
-async function modifySetup() {
-  if (resetting.value || !selectedRepo.value) return
-  await startSetup(selectedRepo.value, 'modify')
+function handleRepoSubmit() {
+  const repo = repoInput.value.trim()
+  if (!repo || !repo.includes('/')) return
+  startWizard(repo)
 }
 
-function toggleToolExpanded(msg) {
+function handleKeydown(e: KeyboardEvent) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault()
+    sendMessage()
+  }
+}
+
+
+function toggleToolOutput(msg: ToolMessage) {
   msg.expanded = !msg.expanded
 }
 
-function toolOutputLines(output) {
+function toolOutputLines(output: string): string[] {
   if (!output) return []
   return output.split('\n')
 }
 
-function isLongOutput(output) {
-  return toolOutputLines(output).length > 10
-}
+onMounted(async () => {
+  // Fetch available repos in background (best-effort).
+  get<{ repos: string[] }>('/github/repos')
+    .then(r => { availableRepos.value = r.repos })
+    .catch(() => {})
+
+  if (!routeRepo) {
+    loading.value = false
+    return
+  }
+
+  try {
+    const dash = await get<Dashboard>('/me/dashboard')
+    const existing = dash.devboxes?.find(d => d.repo_full_name === routeRepo)
+
+    if (existing) {
+      devbox.value = existing
+
+      if (existing.setup_slug) {
+        slug.value = existing.setup_slug
+        activeRepo.value = routeRepo
+        step.value = 3
+        connectSSE()
+      } else if (existing.has_snapshot) {
+        step.value = 4
+      } else if (existing.instance_id) {
+        step.value = 1
+      } else {
+        startWizard(routeRepo)
+      }
+    } else {
+      startWizard(routeRepo)
+    }
+  } catch (e: unknown) {
+    error.value = (e as Error).message
+    step.value = 1
+  } finally {
+    loading.value = false
+  }
+})
+
+onUnmounted(() => {
+  if (sseAbortController) sseAbortController.abort()
+  if (reconnectTimer) clearTimeout(reconnectTimer)
+})
 </script>
 
 <template>
   <div>
     <div class="page-header">
       <h1>Setup</h1>
-      <p v-if="selectedRepo">{{ selectedRepo.full_name }}</p>
-      <p v-else>Configure a repository for use with Orpheus</p>
-    </div>
-
-    <div v-if="appInstallUrl" class="card mb-2" style="border-color: var(--border-light);">
-      <span class="text-secondary" style="font-size: 0.82rem;">
-        Don't see your repo? <a :href="appInstallUrl" target="_blank" rel="noopener">Install the GitHub App</a> to grant access.
-      </span>
-    </div>
-
-    <div v-if="error" class="card mb-2" style="border-color: var(--red);">
-      <span class="text-red">{{ error }}</span>
+      <p>Configure a development environment for agents</p>
     </div>
 
     <!-- Step 0: Loading -->
-    <div v-if="step === 0" class="empty-state">
+    <div v-if="step === 0 || loading" class="empty-state">
       <span class="spinner"></span>
     </div>
 
-    <!-- Step 1: Select repo -->
-    <template v-if="step === 1">
-      <div v-if="loading" class="empty-state">
-        <span class="spinner"></span>
+    <!-- Step 1: Enter repo -->
+    <div v-else-if="step === 1" style="max-width: 480px;">
+      <div v-if="error" class="text-red mb-2" style="font-size: 0.8rem;">{{ error }}</div>
+
+      <label>Repository</label>
+      <div class="flex gap-1">
+        <input
+          v-model="repoInput"
+          placeholder="owner/repo"
+          @keydown.enter="handleRepoSubmit"
+          style="flex: 1;"
+        />
+        <button class="btn btn-primary" @click="handleRepoSubmit" :disabled="!repoInput.includes('/')">
+          Start
+        </button>
       </div>
-      <template v-else>
-        <div class="search-input mb-2">
-          <span class="icon">/</span>
-          <input v-model="search" placeholder="Search repositories..." />
-        </div>
-        <div class="card-grid">
-          <div
-            v-for="repo in filteredRepos"
-            :key="repo.full_name"
-            class="card repo-card"
-            @click="startSetup(repo)"
-          >
-            <h3 class="repo-name">{{ repo.name }}</h3>
-            <div class="repo-meta">{{ repo.full_name }}</div>
-            <span v-if="repo.private" class="badge btn-sm">private</span>
-          </div>
-        </div>
-        <div v-if="!filteredRepos.length" class="empty-state">
-          No repositories found.
-        </div>
-      </template>
-    </template>
+      <div v-if="filteredRepos.length" class="repo-suggestions">
+        <button
+          v-for="repo in filteredRepos"
+          :key="repo"
+          class="repo-suggestion"
+          @click="repoInput = repo; handleRepoSubmit()"
+        >
+          {{ repo }}
+        </button>
+      </div>
+      <p v-else class="text-dim mt-1" style="font-size: 0.72rem;">
+        Enter the full repository name (e.g. acme/backend). The wizard will provision a VM,
+        clone the repo, and walk through setup with you.
+      </p>
+    </div>
 
     <!-- Step 2: Provisioning -->
-    <template v-if="step === 2">
-      <div class="card" style="text-align: center; padding: 3rem;">
-        <span class="spinner" style="width: 24px; height: 24px;"></span>
-        <div class="mt-2">
-          {{ setupMode === 'modify' ? 'Launching modify wizard' : 'Launching setup wizard' }}
-          for {{ selectedRepo?.full_name }}...
-        </div>
-        <div class="text-secondary mt-1" style="font-size: 0.75rem;">
-          {{ setupMode === 'modify'
-            ? 'Starting from saved snapshot. This may take a minute.'
-            : 'Provisioning VM and starting agent. This may take a minute.' }}
-        </div>
-      </div>
-    </template>
+    <div v-else-if="step === 2" class="empty-state">
+      <span class="spinner"></span>
+      <p class="mt-2 text-secondary" style="font-size: 0.8rem;">
+        Provisioning VM and cloning {{ repoInput }}...
+      </p>
+    </div>
 
-    <!-- Step 3: Wizard interface -->
-    <template v-if="step === 3">
-      <!-- Already configured state -->
-      <div v-if="devbox?.has_snapshot && !slug" class="card">
-        <div style="display: flex; align-items: baseline; gap: 0.75rem;">
-          <h3>{{ selectedRepo?.full_name }}</h3>
-          <span class="badge badge-active" style="color: var(--green); border-color: rgba(63, 185, 80, 0.3);">Configured</span>
-        </div>
-        <div class="text-secondary mt-1" style="font-size: 0.75rem;">
-          This repository has a snapshot ready for code reviews.
-        </div>
-        <div class="mt-2" style="display: flex; gap: 0.5rem;">
-          <button class="btn btn-secondary" :disabled="resetting" @click="modifySetup">
-            Modify setup
+    <!-- Step 3: Wizard -->
+    <div v-else-if="step === 3" class="wizard-layout">
+      <!-- Top bar -->
+      <div class="wizard-topbar">
+        <div class="flex gap-1" style="align-items: center;">
+          <div v-if="saved" class="text-green" style="font-size: 0.72rem;">
+            Snapshot saved.
+          </div>
+          <button
+            v-if="!saved"
+            class="btn btn-primary btn-sm"
+            :disabled="saving"
+            @click="saveSnapshot"
+          >
+            {{ saving ? 'Saving...' : 'Save snapshot' }}
           </button>
-          <button class="btn btn-ghost" :disabled="resetting" @click="resetSetup">
+          <button
+            class="btn btn-ghost"
+            :disabled="resetting"
+            @click="resetSetup"
+            style="font-size: 0.68rem;"
+          >
             {{ resetting ? 'Resetting...' : 'Redo setup' }}
           </button>
         </div>
       </div>
 
-      <!-- Saving state -->
-      <div v-else-if="saving" class="card" style="text-align: center; padding: 3rem;">
-        <span class="spinner" style="width: 24px; height: 24px;"></span>
-        <div class="mt-2">Saving snapshot for {{ selectedRepo?.full_name }}...</div>
-        <div class="text-secondary mt-1" style="font-size: 0.75rem;">
-          Creating a snapshot of your environment. This may take a moment.
-        </div>
-      </div>
+      <!-- Chat -->
+      <div class="wizard-chat">
+        <div class="wizard-chat-messages" ref="chatEl" @scroll="handleScroll">
+          <div v-for="(msg, i) in messages" :key="i" class="chat-entry">
+            <!-- Text message -->
+            <template v-if="msg.type === 'message'">
+              <div class="chat-message" :class="msg.role">
+                <span class="chat-role">{{ msg.role === 'user' ? 'you' : 'agent' }}</span>
+                <div class="chat-text">{{ msg.text }}</div>
+              </div>
+            </template>
 
-      <!-- Active wizard -->
-      <div v-else class="wizard-layout">
-        <!-- Left: checklist panel -->
-        <div class="checklist-panel">
-          <div class="checklist-steps">
-            <div
-              v-for="s in CHECKLIST_STEPS"
-              :key="s.key"
-              class="checklist-step"
-              :class="checklist[s.key]"
-            >
-              <span class="step-icon">
-                <span v-if="checklist[s.key] === 'active'" class="spinner" style="width: 12px; height: 12px;"></span>
-                <span v-else-if="checklist[s.key] === 'done'" class="icon-done">x</span>
-                <span v-else-if="checklist[s.key] === 'error'" class="icon-error">!</span>
-                <span v-else-if="checklist[s.key] === 'skipped'" class="icon-skipped">-</span>
-                <span v-else class="icon-pending"> </span>
-              </span>
-              <span class="step-label" :class="{ 'step-skipped-label': checklist[s.key] === 'skipped' }">
-                {{ s.label }}
-                <span v-if="s.optional" class="step-optional">(optional)</span>
-              </span>
-            </div>
-          </div>
-
-          <div class="checklist-footer">
-            <div v-if="isSetupComplete && !saved" class="setup-complete-notice">
-              Setup complete. Save a snapshot to use this environment for code reviews.
-            </div>
-            <button
-              :class="['btn', isSetupComplete && !saved ? 'btn-primary' : 'btn-secondary']"
-              style="width: 100%;"
-              :disabled="saving"
-              @click="saveSnapshot"
-            >
-              {{ saving ? 'Saving...' : saved ? 'Snapshot saved' : 'Save snapshot' }}
-            </button>
-            <div v-if="saved" class="text-green" style="font-size: 0.72rem; text-align: center;">
-              Setup complete.
-            </div>
-            <button
-              v-if="!saved"
-              class="btn btn-ghost"
-              style="width: 100%;"
-              :disabled="resetting || saving"
-              @click="resetSetup"
-            >
-              {{ resetting ? 'Resetting...' : 'Redo setup' }}
-            </button>
-          </div>
-        </div>
-
-        <!-- Right: chat panel -->
-        <div class="chat-panel">
-          <div class="chat-messages" ref="chatEl" @scroll="onChatScroll">
-            <div v-if="!messages.length" class="empty-state" style="padding: 2rem 1rem;">
-              <span class="spinner"></span>
-              <div class="mt-1 text-secondary" style="font-size: 0.75rem;">Connecting to agent...</div>
-            </div>
-
-            <div
-              v-for="(msg, i) in messages"
-              :key="i"
-              class="chat-entry"
-              :class="msg.type === 'message' ? (msg.role === 'user' ? 'entry-user' : 'entry-agent') : 'entry-tool'"
-            >
-              <!-- Chat message -->
-              <template v-if="msg.type === 'message'">
-                <div class="message-role">{{ msg.role === 'user' ? 'you' : 'agent' }}</div>
-                <div class="message-text">{{ msg.text }}</div>
-              </template>
-
-              <!-- Tool block -->
-              <template v-else-if="msg.type === 'tool'">
-                <div class="tool-header">
-                  <span class="tool-kind">{{ msg.kind }}</span>
+            <!-- Tool call -->
+            <template v-if="msg.type === 'tool'">
+              <div class="chat-tool" :class="'tool-' + msg.status">
+                <div class="tool-header" @click="toggleToolOutput(msg)">
+                  <span class="tool-icon">{{ msg.status === 'active' ? '~' : msg.status === 'error' ? '!' : 'x' }}</span>
                   <span class="tool-name">{{ msg.name }}</span>
-                  <span v-if="msg.status === 'active'" class="spinner" style="width: 10px; height: 10px; flex-shrink: 0;"></span>
-                  <span v-else-if="msg.status === 'error'" class="tool-error-badge">error</span>
-                  <button
-                    v-else-if="isLongOutput(msg.output)"
-                    class="tool-toggle"
-                    @click="toggleToolExpanded(msg)"
-                  >
-                    {{ msg.expanded ? 'collapse' : 'expand' }}
-                  </button>
+                  <span v-if="msg.input" class="tool-input">{{ msg.input }}</span>
                 </div>
-                <div v-if="msg.input" class="tool-input">{{ msg.input }}</div>
-                <div
-                  v-if="msg.output"
-                  class="tool-output"
-                  :class="{ 'tool-output-collapsed': isLongOutput(msg.output) && !msg.expanded }"
-                >{{ msg.output }}</div>
-              </template>
-            </div>
-
-            <!-- In-progress streaming message -->
-            <div v-if="streamingMessage" class="chat-entry entry-agent">
-              <div class="message-role">agent</div>
-              <div class="message-text">{{ streamingMessage.text }}</div>
-            </div>
+                <div v-if="msg.expanded && msg.output" class="tool-output">
+                  <template v-if="toolOutputLines(msg.output).length > 20">
+                    <pre>{{ toolOutputLines(msg.output).slice(0, 20).join('\n') }}</pre>
+                    <span class="text-dim" style="font-size: 0.68rem;">
+                      ... {{ toolOutputLines(msg.output).length - 20 }} more lines
+                    </span>
+                  </template>
+                  <pre v-else>{{ msg.output }}</pre>
+                </div>
+              </div>
+            </template>
           </div>
+        </div>
 
-          <div class="chat-input-row">
-            <textarea
-              ref="textareaEl"
-              v-model="messageText"
-              class="chat-input"
-              placeholder="Type a message..."
-              rows="1"
-              :disabled="sending || saved"
-              @keydown="handleInputKeydown"
-              @input="autoResizeTextarea($event.target)"
-            />
-            <button
-              class="btn btn-secondary"
-              style="flex-shrink: 0;"
-              :disabled="interrupting || !slug || saved"
-              @click="interruptAgent"
-            >
+        <!-- Input -->
+        <div class="wizard-chat-input">
+          <textarea
+            ref="textareaEl"
+            v-model="messageText"
+            @keydown="handleKeydown"
+            placeholder="Type a message..."
+            rows="2"
+          ></textarea>
+          <div class="chat-input-buttons">
+            <button class="btn btn-primary btn-sm" @click="sendMessage" :disabled="sending || !messageText.trim()">
+              Send
+            </button>
+            <button class="btn btn-secondary btn-sm" @click="interrupt" :disabled="interrupting">
               {{ interrupting ? '...' : 'Interrupt' }}
             </button>
-            <button
-              class="btn btn-primary"
-              style="flex-shrink: 0;"
-              :disabled="sending || !messageText.trim() || saved"
-              @click="sendMessage"
-            >
-              {{ sending ? '...' : 'Send' }}
-            </button>
           </div>
         </div>
       </div>
-    </template>
+    </div>
+
+    <!-- Step 4: Already configured -->
+    <div v-else-if="step === 4" style="max-width: 480px;">
+      <div class="card">
+        <h3 style="margin-bottom: 0.5rem;">{{ repoInput }}</h3>
+        <p class="text-secondary" style="font-size: 0.8rem; margin-bottom: 1rem;">
+          This repository has a saved devbox snapshot. Agents will fork from this environment.
+        </p>
+        <div class="flex gap-1">
+          <button class="btn btn-secondary btn-sm" @click="startWizard(repoInput, 'modify')">
+            Modify setup
+          </button>
+          <button class="btn btn-ghost" @click="resetSetup" :disabled="resetting">
+            {{ resetting ? 'Resetting...' : 'Redo setup' }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Error banner -->
+    <div v-if="error && step === 3" class="text-red mt-2" style="font-size: 0.8rem;">
+      {{ error }}
+    </div>
   </div>
 </template>
 
 <style scoped>
-.repo-card {
-  cursor: pointer;
-  overflow: hidden;
+.repo-suggestions {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin-top: 0.5rem;
 }
 
-.repo-name {
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.repo-meta {
-  font-size: 0.72rem;
+.repo-suggestion {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 0.4rem 0.5rem;
+  font-size: 0.78rem;
   color: var(--text-secondary);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  margin-bottom: 0.5rem;
+  background: none;
+  border: none;
+  border-left: 2px solid transparent;
+  cursor: pointer;
+  font-family: var(--font-mono);
+}
+
+.repo-suggestion:hover {
+  color: var(--text-bright);
+  border-left-color: var(--text-secondary);
+  background: var(--bg-hover);
 }
 
 .wizard-layout {
   display: flex;
-  gap: 0;
-  height: calc(100vh - 12rem);
+  flex-direction: column;
+  border: 1px dotted var(--border);
+  border-radius: 2px;
+  height: calc(100vh - 160px);
   min-height: 400px;
-  border: 1px solid var(--border-light);
-  border-radius: 6px;
   overflow: hidden;
 }
 
-.checklist-panel {
-  width: 260px;
-  flex-shrink: 0;
-  background: var(--bg-card);
-  border-right: 1px solid var(--border-light);
+.wizard-topbar {
+  padding: 0.5rem 1rem;
+  border-bottom: 1px dotted var(--border);
   display: flex;
-  flex-direction: column;
-  padding: 1.25rem 1rem;
-  gap: 0;
+  justify-content: flex-end;
 }
 
-.checklist-steps {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  gap: 0.75rem;
-}
-
-.checklist-step {
-  display: flex;
-  align-items: flex-start;
-  gap: 0.6rem;
-  font-size: 0.78rem;
-}
-
-.step-icon {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 1rem;
-  height: 1.4em;
-  flex-shrink: 0;
-  font-family: var(--font-mono);
-  font-size: 0.7rem;
-}
-
-.icon-done { color: var(--green); font-weight: bold; }
-.icon-error { color: var(--red); font-weight: bold; }
-.icon-skipped { color: var(--text-dim); }
-.icon-pending { color: var(--text-dim); }
-
-.checklist-step.done .step-label { color: var(--green); }
-.checklist-step.error .step-label { color: var(--red); }
-.checklist-step.active .step-label { color: var(--text-bright); }
-.checklist-step.skipped .step-label { color: var(--text-dim); }
-.checklist-step.pending .step-label { color: var(--text-secondary); }
-
-.step-label {
-  line-height: 1.4;
-}
-
-.step-skipped-label {
-  text-decoration: line-through;
-}
-
-.step-optional {
-  color: var(--text-dim);
-  font-size: 0.68rem;
-  margin-left: 0.25rem;
-}
-
-.checklist-footer {
-  padding-top: 1rem;
-  border-top: 1px solid var(--border-light);
-  margin-top: 1rem;
-  display: flex;
-  flex-direction: column;
-  gap: 0.75rem;
-}
-
-.setup-complete-notice {
-  font-size: 0.72rem;
-  color: var(--green);
-  line-height: 1.4;
-}
-
-/* Chat panel */
-.chat-panel {
+.wizard-chat {
   flex: 1;
   display: flex;
   flex-direction: column;
   min-width: 0;
-  background: var(--bg);
 }
 
-.chat-messages {
+.wizard-chat-messages {
   flex: 1;
   overflow-y: auto;
   padding: 1rem;
-  display: flex;
-  flex-direction: column;
-  gap: 0.75rem;
 }
 
 .chat-entry {
+  margin-bottom: 0.75rem;
+}
+
+.chat-message {
   max-width: 100%;
 }
 
-.entry-agent {
-  align-self: flex-start;
-  max-width: 85%;
-}
-
-.entry-user {
-  align-self: flex-end;
-  max-width: 85%;
-}
-
-.entry-tool {
-  align-self: stretch;
-}
-
-.message-role {
-  font-size: 0.65rem;
+.chat-role {
+  font-size: 0.68rem;
   text-transform: uppercase;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.04em;
   color: var(--text-dim);
-  margin-bottom: 0.2rem;
+  display: block;
+  margin-bottom: 0.15rem;
 }
 
-.entry-user .message-role {
-  text-align: right;
+.chat-message.user .chat-role {
+  color: var(--text-secondary);
 }
 
-.message-text {
+.chat-text {
   font-size: 0.82rem;
   line-height: 1.6;
   white-space: pre-wrap;
-  word-break: break-word;
+  word-wrap: break-word;
 }
 
-.entry-agent .message-text {
-  color: var(--text);
-}
-
-.entry-user .message-text {
-  background: rgba(200, 180, 150, 0.08);
-  border: 1px solid var(--border-light);
-  border-radius: 6px;
-  padding: 0.5rem 0.75rem;
+.chat-message.user .chat-text {
   color: var(--text-bright);
 }
 
-/* Tool blocks */
+.chat-tool {
+  border-left: 2px dotted var(--border);
+  padding: 0.25rem 0 0.25rem 0.75rem;
+  font-size: 0.75rem;
+}
+
+.chat-tool.tool-active {
+  border-left-color: var(--text-secondary);
+}
+
+.chat-tool.tool-done {
+  border-left-color: var(--border);
+}
+
+.chat-tool.tool-error {
+  border-left-color: var(--red);
+}
+
 .tool-header {
   display: flex;
   align-items: baseline;
-  gap: 0.5rem;
-  background: var(--bg-terminal);
-  border: 1px solid var(--border);
-  border-bottom: none;
-  border-radius: 6px 6px 0 0;
-  padding: 0.4rem 0.75rem;
-  font-size: 0.72rem;
+  gap: 0.4rem;
+  cursor: pointer;
+  color: var(--text-secondary);
 }
 
-.tool-kind {
-  color: var(--text-dim);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  font-size: 0.65rem;
+.tool-header:hover {
+  color: var(--text);
+}
+
+.tool-icon {
+  width: 0.8rem;
+  text-align: center;
   flex-shrink: 0;
+}
+
+.tool-active .tool-icon {
+  animation: spin 0.8s linear infinite;
+  display: inline-block;
 }
 
 .tool-name {
-  color: var(--text-bright);
-  flex: 1;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.tool-error-badge {
-  color: var(--red);
-  font-size: 0.65rem;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  flex-shrink: 0;
+  font-weight: normal;
 }
 
 .tool-input {
-  background: var(--bg-terminal);
-  border-left: 1px solid var(--border);
-  border-right: 1px solid var(--border);
-  border-top: 1px solid var(--border-light);
-  padding: 0.3rem 0.75rem;
-  font-family: var(--font-mono);
+  color: var(--text-dim);
   font-size: 0.72rem;
-  color: var(--text-secondary);
-  white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-}
-
-/* When input is the last child (no output), close the border */
-.tool-input:last-child {
-  border-bottom: 1px solid var(--border);
-  border-radius: 0 0 6px 6px;
-}
-
-.tool-toggle {
-  background: none;
-  border: none;
-  cursor: pointer;
-  color: var(--text-dim);
-  font-family: var(--font-mono);
-  font-size: 0.68rem;
-  padding: 0;
-  flex-shrink: 0;
-}
-
-.tool-toggle:hover {
-  color: var(--text);
+  white-space: nowrap;
+  max-width: 400px;
 }
 
 .tool-output {
+  margin-top: 0.25rem;
   background: var(--bg-terminal);
-  border: 1px solid var(--border);
-  border-top: 1px solid var(--border-light);
-  border-radius: 0 0 6px 6px;
-  padding: 0.5rem 0.75rem;
-  font-family: var(--font-mono);
-  font-size: 0.75rem;
-  color: var(--text);
+  border-radius: 2px;
+  padding: 0.5rem;
+  overflow-x: auto;
+}
+
+.tool-output pre {
+  margin: 0;
+  font-size: 0.72rem;
+  line-height: 1.4;
   white-space: pre-wrap;
   word-break: break-all;
-  line-height: 1.5;
-  overflow: hidden;
 }
 
-.tool-output-collapsed {
-  max-height: calc(1.5em * 4 + 1rem);
-  -webkit-mask-image: linear-gradient(to bottom, black 60%, transparent 100%);
-  mask-image: linear-gradient(to bottom, black 60%, transparent 100%);
-}
-
-/* Chat input */
-.chat-input-row {
-  display: flex;
-  align-items: flex-end;
-  gap: 0.5rem;
+.wizard-chat-input {
+  border-top: 1px dotted var(--border);
   padding: 0.75rem 1rem;
-  border-top: 1px solid var(--border-light);
-  background: var(--bg-card);
+  display: flex;
+  gap: 0.5rem;
+  align-items: flex-end;
 }
 
-.chat-input {
+.wizard-chat-input textarea {
   flex: 1;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  color: var(--text);
-  font-family: var(--font-mono);
-  font-size: 0.82rem;
-  padding: 0.5rem 0.75rem;
-  border-radius: 4px;
   resize: none;
-  overflow-y: auto;
-  min-height: 2rem;
+  font-size: 0.82rem;
+  padding: 0.5rem 0.6rem;
+  min-height: 2.5rem;
+  max-height: 8rem;
 }
 
-.chat-input:focus {
-  outline: none;
-  border-color: var(--text);
+.chat-input-buttons {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
 }
 
-.chat-input:disabled {
-  opacity: 0.5;
-}
-</style>
+@media (max-width: 720px) {
+  .wizard-layout {
+    height: auto;
+    min-height: 80vh;
+  }
 
-<style>
-/* Unscoped: widen parent container when wizard is active */
-.main-content.main-content--wide {
-  max-width: none;
+  .wizard-chat-messages {
+    min-height: 300px;
+  }
 }
 </style>

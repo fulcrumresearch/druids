@@ -1,18 +1,19 @@
-"""Integration tests for AgentConnection through the real bridge.
+"""Integration tests for AgentConnection through the relay hub.
 
-Each test gets a running bridge with the stub agent already started
-(via the bridge_with_stub fixture). The tests exercise the full
-HTTP/SSE/JSON-RPC pipeline without any mocks.
+Each test gets a stub agent communicating via the relay hub
+(via the relay_stub fixture). The tests exercise the full
+JSON-RPC pipeline without bridge subprocesses or mocks.
 """
 
 import asyncio
 
-from orpheus.lib.connection import AgentConnection
+from druids_server.lib.connection import AgentConnection
 
 
-async def test_initialize_and_new_session(bridge_with_stub):
+async def test_initialize_and_new_session(relay_stub):
     """Full ACP handshake: initialize + session/new returns a session ID."""
-    conn = AgentConnection(bridge_with_stub)
+    bridge_id, bridge_token = relay_stub
+    conn = AgentConnection(bridge_id, bridge_token)
     try:
         await conn.start()
         session_id = await conn.new_session()
@@ -22,9 +23,10 @@ async def test_initialize_and_new_session(bridge_with_stub):
         await conn.close()
 
 
-async def test_prompt_and_response(bridge_with_stub):
+async def test_prompt_and_response(relay_stub):
     """Send a prompt, verify the stub returns end_turn."""
-    conn = AgentConnection(bridge_with_stub)
+    bridge_id, bridge_token = relay_stub
+    conn = AgentConnection(bridge_id, bridge_token)
     try:
         await conn.start()
         await conn.new_session()
@@ -34,22 +36,20 @@ async def test_prompt_and_response(bridge_with_stub):
         await conn.close()
 
 
-async def test_session_update_notifications(bridge_with_stub):
+async def test_session_update_notifications(relay_stub):
     """Verify agent_message_chunk notifications arrive via the handler."""
     events = []
 
     async def on_update(params):
         events.append(params)
 
-    conn = AgentConnection(bridge_with_stub)
+    bridge_id, bridge_token = relay_stub
+    conn = AgentConnection(bridge_id, bridge_token)
     try:
         conn.on("session/update", on_update)
         await conn.start()
         await conn.new_session()
         await asyncio.wait_for(conn.prompt("test"), timeout=5)
-
-        # Notifications are dispatched before the prompt response resolves,
-        # but give a small window for async delivery.
         await asyncio.sleep(0.2)
 
         update_types = [e["update"]["sessionUpdate"] for e in events]
@@ -62,14 +62,15 @@ async def test_session_update_notifications(bridge_with_stub):
         await conn.close()
 
 
-async def test_tool_call_notifications(bridge_with_stub):
+async def test_tool_call_notifications(relay_stub):
     """Verify tool_call and tool_call_update notifications are dispatched."""
     events = []
 
     async def on_update(params):
         events.append(params)
 
-    conn = AgentConnection(bridge_with_stub)
+    bridge_id, bridge_token = relay_stub
+    conn = AgentConnection(bridge_id, bridge_token)
     try:
         conn.on("session/update", on_update)
         await conn.start()
@@ -93,9 +94,10 @@ async def test_tool_call_notifications(bridge_with_stub):
         await conn.close()
 
 
-async def test_multiple_prompts(bridge_with_stub):
+async def test_multiple_prompts(relay_stub):
     """Two prompts on the same session both succeed."""
-    conn = AgentConnection(bridge_with_stub)
+    bridge_id, bridge_token = relay_stub
+    conn = AgentConnection(bridge_id, bridge_token)
     try:
         await conn.start()
         await conn.new_session()

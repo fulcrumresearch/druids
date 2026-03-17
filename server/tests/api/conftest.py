@@ -5,12 +5,11 @@ from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import pytest
+from druids_server.api.deps import Caller, get_caller, get_executions_registry
+from druids_server.api.routes import router
+from druids_server.db.models.user import User
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from orpheus.api.deps import get_current_user, get_executions_registry
-from orpheus.api.routes import router
-from orpheus.db.models.user import User
-from orpheus.lib.agents.base import Agent
 
 
 def make_mock_session():
@@ -38,7 +37,6 @@ def mock_user():
     return User(
         id=uuid4(),
         github_id=12345,
-        access_token="test_token",
     )
 
 
@@ -48,12 +46,11 @@ def mock_execution():
     ex = MagicMock()
     ex.id = uuid4()
     ex.slug = SLUG
-    ex.programs = {}
-    ex.connections = {}
+    ex.agents = {}
+    ex.has_agent = MagicMock(side_effect=lambda name: name in ex.agents)
+    ex.all_agent_names = MagicMock(side_effect=lambda: list(ex.agents))
     ex.send = AsyncMock()
-    ex.spawn = AsyncMock()
-    ex.submit = AsyncMock()
-    ex._disconnect_agent = AsyncMock()
+    ex.shutdown_agent = AsyncMock()
     ex.exposed_services = []
     return ex
 
@@ -61,13 +58,12 @@ def mock_execution():
 @pytest.fixture
 def mock_agent():
     """Create a mock Agent with a Machine."""
-    agent = Agent(name="worker")
+    agent = MagicMock()
+    agent.name = "worker"
     mock_machine = MagicMock()
-    mock_machine.instance_id = "morph_123"
-    mock_machine.bridge_id = "morph_123"
-    mock_machine.bridge_token = "token-123"
+    mock_machine.instance_id = "instance_1"
     mock_machine.stop = AsyncMock()
-    mock_machine.ssh_key = AsyncMock()
+    mock_machine.ssh_credentials = AsyncMock()
     mock_machine.expose_http_service = AsyncMock()
     agent.machine = mock_machine
     return agent
@@ -84,7 +80,7 @@ def app(mock_user, mock_execution):
     user_id = str(mock_user.id)
     registry[user_id] = {mock_execution.slug: mock_execution}
 
-    app.dependency_overrides[get_current_user] = lambda: mock_user
+    app.dependency_overrides[get_caller] = lambda: Caller(user=mock_user)
 
     yield app
 
