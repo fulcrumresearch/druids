@@ -355,6 +355,17 @@ onUnmounted(() => {
       <div v-if="!isDemo" class="connection-status" :class="{ connected: stream.isConnected.value }">
         {{ stream.isDone.value ? 'done' : stream.isConnected.value ? 'live' : 'connecting...' }}
       </div>
+
+      <!-- Program state panel -->
+      <div v-if="!isDemo && Object.keys(stream.programState.value).length > 0" class="program-state-panel">
+        <div class="program-state-header">Program State</div>
+        <div class="program-state-content">
+          <div v-for="(value, key) in stream.programState.value" :key="key" class="state-row">
+            <span class="state-key">{{ key }}</span>
+            <span class="state-value">{{ value }}</span>
+          </div>
+        </div>
+      </div>
     </div>
 
     <div v-if="selectedAgent" class="chat-sidebar">
@@ -496,6 +507,61 @@ onUnmounted(() => {
 
 .connection-status.connected {
   color: var(--green);
+}
+
+/* Program state panel */
+.program-state-panel {
+  position: absolute;
+  top: 1rem;
+  right: 1rem;
+  max-width: 300px;
+  background: rgba(44, 39, 34, 0.95);
+  border: 1px dotted rgba(200, 180, 150, 0.25);
+  border-radius: 4px;
+  backdrop-filter: blur(4px);
+}
+
+.program-state-header {
+  padding: 0.5rem 0.75rem;
+  font-size: 0.65rem;
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-secondary);
+  border-bottom: 1px dotted rgba(200, 180, 150, 0.15);
+}
+
+.program-state-content {
+  padding: 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.state-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  padding: 0.4rem 0.5rem;
+  background: rgba(200, 180, 150, 0.05);
+  border-radius: 2px;
+  font-size: 0.72rem;
+}
+
+.state-key {
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: rgba(154, 143, 127, 0.8);
+  font-weight: 600;
+}
+
+.state-value {
+  font-family: var(--font-mono);
+  color: rgba(212, 202, 186, 0.9);
+  word-break: break-all;
 }
 
 /* Chat sidebar */

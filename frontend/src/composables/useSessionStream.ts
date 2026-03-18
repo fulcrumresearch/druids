@@ -9,6 +9,7 @@ export interface SessionStream {
   agentState: Ref<Record<string, AgentState>>
   allEvents: Ref<Record<string, TraceEvent[]>>
   topology: Ref<Topology | null>
+  programState: Ref<Record<string, unknown>>
   isConnected: Ref<boolean>
   isDone: Ref<boolean>
   connect: () => Promise<void>
@@ -30,6 +31,7 @@ export function useSessionStream(
   const agentState = ref<Record<string, AgentState>>({})
   const allEvents = ref<Record<string, TraceEvent[]>>({})
   const topology = ref<Topology | null>(null)
+  const programState = ref<Record<string, unknown>>({})
   const isConnected = ref(false)
   const isDone = ref(false)
 
@@ -82,6 +84,15 @@ export function useSessionStream(
         ensureAgent(target)
         agentState.value[target].caption = eventData?.text as string || ''
         agentState.value = { ...agentState.value }
+      }
+      return
+    }
+
+    // Program state events from program via ctx.emit()
+    if (parsed.type === 'client_event' && parsed.event === 'program_state') {
+      const eventData = parsed.data as Record<string, unknown> | undefined
+      if (eventData) {
+        programState.value = { ...eventData }
       }
       return
     }
@@ -260,6 +271,7 @@ export function useSessionStream(
     agentState,
     allEvents,
     topology,
+    programState,
     isConnected,
     isDone,
     connect,
