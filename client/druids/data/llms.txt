@@ -1,0 +1,1534 @@
+# Getting started
+
+This walkthrough gets you from zero to a running agent execution. It assumes you have Claude Code (or another coding agent) and want it to drive the setup.
+
+## Install the CLI
+
+```bash
+uv tool install druids
+```
+
+## Authenticate
+
+Sign in at druids.dev and go to Settings to create an API key. Then:
+
+```bash
+druids auth set-key druid_your_key_here
+```
+
+Verify it worked:
+
+```bash
+druids auth status
+```
+
+## How it works
+
+Once set up, the workflow looks like this:
+
+1. You create a devbox: a snapshotted VM with your repo cloned and dependencies installed.
+2. You write an agent coordination program (or use a starter program) that defines how agents work on your codebase.
+3. You run the program from the CLI or through the MCP server, which launches an execution: one or more agents working on VMs forked from your devbox.
+4. You check in on progress through druids.dev, the CLI, or the MCP tools.
+5. Agents finish (perhaps opening a PR on your repository).
+
+The rest of this guide walks through each piece.
+
+## Initialize your repo
+
+From the root of your project:
+
+```bash
+druids init
+```
+
+This fetches starter programs into `.druids/` and prints a snippet to add to your agent instructions (e.g. `CLAUDE.md`). The programs define how agents run on your codebase: `build.py` for feature work, `review.py` for code review, and `main.py` as a general-purpose entry point.
+
+## Add the MCP server
+
+Druids exposes an MCP endpoint that gives Claude Code tools for launching executions, monitoring agents, and running commands on VMs. Run:
+
+```bash
+druids init
+```
+
+This also prints a JSON block with your server URL and auth token for the MCP server. Add it to `.mcp.json` at the root of your repo (or `claude_desktop_config.json` for Claude Desktop) and restart Claude Code.
+
+Once connected, you can tell Claude Code what you want to build and it will use the Druids tools directly.
+
+## (Optional) Install the GitHub App
+
+Druids needs access to your repositories to clone code and open pull requests. Go to Settings on druids.dev and click "Configure GitHub App" to install it on the repos you want to work with.
+
+## Set up a devbox
+
+A devbox is a snapshotted VM with your repo cloned and dependencies installed. Every execution forks from it, so agents start with a working environment.
+
+Tell Claude Code:
+
+```
+Set up a devbox for this repo.
+```
+
+It will provision a VM, explore your project to figure out dependencies and services, install everything, verify the environment works, and snapshot the result. It will ask you for anything it cannot figure out on its own, like API keys or non-obvious configuration.
+
+If you prefer to do this manually:
+
+```bash
+druids devbox create --repo owner/repo
+# SSH in and install dependencies
+druids devbox snapshot --name owner/repo
+```
+
+## Run your first execution
+
+Tell Claude Code what you want built:
+
+```
+Use druids to write a /health endpoint that returns 200 OK.
+```
+
+It will write a spec, pick a program, and launch an execution. Agents implement the feature on a branch and open a PR when done. You can also launch directly from the CLI:
+
+```bash
+druids exec .druids/build.py \
+  task_name="health endpoint" \
+  spec="Add a /health endpoint that returns 200 OK"
+```
+
+## Monitor progress
+
+```bash
+druids execution ls                          # list executions
+druids execution status bright-fox           # check one execution
+druids execution activity bright-fox         # recent agent activity
+druids execution connect bright-fox          # SSH into the VM
+```
+
+Or just ask Claude Code: "How is my execution going?"
+# Run locally
+
+Run the full Druids stack on your machine using Docker for sandboxes.
+
+## Prerequisites
+
+1. Install `uv`:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+2. Install Docker and make sure the daemon is running.
+
+3. Install PostgreSQL and create the database:
+
+On macOS:
+
+```bash
+brew install postgresql@14
+brew services start postgresql@14
+createdb druids
+```
+
+On Linux:
+
+```bash
+sudo apt install postgresql
+sudo -u postgres createdb druids
+```
+
+4. Install the GitHub CLI (`gh`):
+
+On macOS:
+
+```bash
+brew install gh
+```
+
+On Linux, follow the [official apt instructions](https://github.com/cli/cli/blob/trunk/docs/install_linux.md).
+
+## Install dependencies
+
+```bash
+cd server && uv sync && cd ..
+cd client && uv sync && cd ..
+cd bridge && uv sync && cd ..
+```
+
+On macOS with Apple Silicon, `greenlet` is not installed automatically due to platform markers but is required by SQLAlchemy's async engine. Install it manually:
+
+```bash
+cd server && uv pip install greenlet && cd ..
+```
+
+Build the client wheel (the server installs this on agent VMs):
+
+```bash
+cd client && uv build && cd ..
+```
+
+## Build the Docker image
+
+```bash
+docker build -f docker/Dockerfile -t druids-base .
+```
+
+This builds the base image that agent containers start from. Override the image name with `DRUIDS_DOCKER_IMAGE` in the server config.
+
+## Configure the server
+
+Create `server/.env`:
+
+```
+DRUIDS_BASE_URL=http://host.docker.internal:8000
+DRUIDS_SECRET_KEY=<fernet-key>
+DRUIDS_SANDBOX_TYPE=docker
+ANTHROPIC_API_KEY=sk-ant-xxx
+FORWARDING_TOKEN_SECRET=dev-secret
+GITHUB_PAT=ghp_xxx
+```
+
+Generate `DRUIDS_SECRET_KEY`:
+
+```bash
+cd server && uv run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+`DRUIDS_BASE_URL` must be reachable from inside Docker containers. Do not use `localhost` -- containers cannot reach the host that way. On macOS, use `host.docker.internal`. On Linux, use `172.17.0.1` (the default Docker bridge gateway).
+
+`GITHUB_PAT` is how agents get git access in local mode (there is no GitHub App). Create a [personal access token](https://github.com/settings/tokens) with `repo` scope. Agents use it to clone repos, push branches, and create PRs. Optional: `OPENAI_API_KEY` for Codex agents.
+
+## Start the server
+
+```bash
+cd server && uv run druids-server
+```
+
+On macOS with Docker Desktop, the Docker socket is at `~/.docker/run/docker.sock` instead of the default `/var/run/docker.sock`. If the server fails to connect to Docker, set `DOCKER_HOST` before starting:
+
+```bash
+export DOCKER_HOST=unix://$HOME/.docker/run/docker.sock
+cd server && uv run druids-server
+```
+
+Tables are created automatically on first boot.
+
+## Configure the client
+
+Point the CLI at your local server:
+
+```bash
+mkdir -p ~/.druids
+echo '{"base_url": "http://localhost:8000"}' > ~/.druids/config.json
+```
+
+No API key is needed. Without a GitHub App configured, the server runs in local mode and skips authentication.
+
+## Set up a devbox
+
+A devbox is a snapshotted container with your repo cloned. Executions fork from it so agents start with a working environment.
+
+```bash
+druids devbox create --repo owner/repo
+```
+
+This provisions a container and clones the repo. You can SSH in to install extra dependencies if needed. When ready, snapshot it:
+
+```bash
+druids devbox snapshot --name owner/repo
+```
+
+## Verify
+
+Test that containers can reach the server:
+
+```bash
+docker run --rm curlimages/curl curl -s http://host.docker.internal:8000/
+```
+
+On Linux, replace `host.docker.internal` with `172.17.0.1`.
+
+Run the server tests:
+
+```bash
+cd server && uv run pytest
+```
+
+Start a test execution:
+
+```bash
+druids exec .druids/basher.py task_name="test" task_spec="Hello world"
+```
+
+## Troubleshooting
+
+**Agents cannot reach the server.** Check `DRUIDS_BASE_URL`. It must be `http://host.docker.internal:8000` on macOS or `http://172.17.0.1:8000` on Linux, not `localhost`.
+
+**Server crashes with `No module named 'greenlet'`.** On macOS Apple Silicon, run `cd server && uv pip install greenlet`. The SQLAlchemy dependency marker does not cover `arm64`.
+
+**Server cannot connect to Docker.** On macOS with Docker Desktop, set `DOCKER_HOST=unix://$HOME/.docker/run/docker.sock` before starting the server.
+
+**Bridge fails to start.** Check the log inside the container: `cat /tmp/bridge-7462.log`. Common causes: port conflicts, missing dependencies.
+
+**GitHub token errors.** Verify the PAT has access to the target repo. Server logs show the specific API error.
+
+**Database connection refused.** Verify PostgreSQL is running and the `druids` database exists. Default connection string: `postgresql+asyncpg://postgres@localhost/druids`.
+# How to write a Druids program
+
+## Minimal program
+
+```python
+async def program(ctx, spec=""):
+    agent = await ctx.agent("worker", prompt=spec, git="write")
+
+    @agent.on("done")
+    async def on_done(summary=""):
+        await ctx.done(summary)
+        return "Finished."
+```
+
+```bash
+druids exec my_program.py spec="Add a health check endpoint to the API"
+```
+
+A program is an async function named `program`. It receives `ctx` (the execution context) and keyword arguments from the CLI. This program creates one agent, gives it a prompt, and ends when the agent calls its `done` tool.
+
+## Adding a reviewer
+
+```python
+async def program(ctx, spec=""):
+    builder = await ctx.agent("builder", prompt=spec, git="write")
+    reviewer = await ctx.agent(
+        "reviewer",
+        system_prompt="You review code. Read the diff, demo it, approve or reject.",
+        git="post",
+        share_machine_with=builder,
+    )
+
+    @builder.on("submit")
+    async def on_submit(summary=""):
+        await reviewer.send(f"Review this:\n\n{summary}\n\nDiff: `git diff main...HEAD`")
+        return "Submitted for review."
+
+    @reviewer.on("approve")
+    async def on_approve(pr_url=""):
+        await ctx.done(f"PR: {pr_url}")
+        return "Done."
+
+    @reviewer.on("reject")
+    async def on_reject(feedback=""):
+        await builder.send(f"Fix this:\n{feedback}")
+        return "Feedback sent."
+```
+
+`share_machine_with=builder` puts the reviewer on the same VM. They share a filesystem, so the reviewer reads the builder's files without a push. `git="post"` lets the reviewer create PRs but not push branches.
+
+Tool handlers define the protocol. The builder calls `submit`, which messages the reviewer. The reviewer calls `approve` (ending the execution) or `reject` (looping back to the builder).
+
+## Running commands on a VM
+
+```python
+@builder.on("deploy")
+async def on_deploy(service=""):
+    result = await builder.exec(f"cd /home/agent/repo && make deploy-{service}")
+    if not result.ok:
+        return f"Deploy failed:\n{result.stderr}"
+    return f"Deployed.\n{result.stdout}"
+```
+
+`agent.exec()` runs a shell command on the agent's VM and returns an object with `exit_code`, `stdout`, `stderr`, and `ok` (a bool). The handler runs on the server, not inside the VM.
+
+## Using system prompts
+
+```python
+BUILDER_PROMPT = """\
+You are a builder. Read SETUP.md first. Create a feature branch:
+
+  git checkout -b {branch}
+
+Implement the spec. Run tests. Push. Call submit when ready."""
+
+async def program(ctx, spec="", task_name=""):
+    branch = f"druids/{task_name.lower().replace(' ', '-')}"
+    builder = await ctx.agent(
+        "builder",
+        system_prompt=BUILDER_PROMPT.format(branch=branch),
+        prompt=f"## Spec\n\n{spec}",
+        git="write",
+    )
+```
+
+The system prompt sets the agent's role and workflow. The user prompt provides the specific task. Keep system prompts reusable across tasks. Put task-specific details in the prompt.
+
+For more patterns (parallel agents, client events, retry loops, dynamic agent creation), see the [tutorials](../tutorials/build-flow.md). For every method on `ctx` and `agent`, see the [program API reference](../reference/program-api.md).
+# Program Design
+
+A program is an async function that orchestrates agents on remote machines. The program controls the creation and orchestration of the agents, which machines they run on, and how they communicate, etc. But the program also owns the high level state of the execution and how agents can modify it.
+
+## Agents
+
+An agent is a worker that runs on a remote VM. You create one with [`ctx.agent()`](../reference/ctx.md#ctxagent):
+
+```python
+builder = await ctx.agent(
+    "builder",
+    system_prompt="You are a builder agent. You implement specs.",
+    prompt="## Spec\n\nAdd rate limiting to POST /api/keys",
+    working_directory="/home/agent/repo",
+)
+```
+
+Each agent gets a name (unique within the execution), a system prompt, and an initial user prompt. `ctx.agent()` returns immediately; provisioning happens in the background. The returned [agent object](../reference/agent.md) is usable right away, and methods like `send` and `exec` block until provisioning completes.
+
+## Devboxes
+
+A devbox is a named VM snapshot. When an execution is run on a devbox, the agent starts in the state of that devbox, with all installed packages, configuration files, cloned repos, etc...
+
+If a devbox is configured with GitHub, it will also load a fresh copy of the code, and each agent can be configured with a [git access level](../reference/git-permissions.md).
+
+Secrets (environment variables like API keys) are stored on the devbox and injected into every agent that uses it. MCP server configs can reference these secrets with `$VAR_NAME` syntax.
+
+By default, each agent gets its own VM. When agents need to work on the same filesystem, use `share_machine_with`:
+
+```python
+builder = await ctx.agent("builder", git="write", working_directory="/home/agent/repo")
+critic = await ctx.agent(
+    "critic",
+    git="read",
+    working_directory="/home/agent/repo",
+    share_machine_with=builder,
+)
+```
+
+## Events
+
+Events are how programs define tools that agents can call. Each event is a function registered with the [`@agent.on("tool_name")`](../reference/agent.md#agenton) decorator. When the agent calls the tool, the handler fires, and its return value goes back to the agent as the tool result. Each event definition on an agent in the program maps to an MCP tool the agent has access to.
+
+```python
+@builder.on("submit_for_review")
+async def on_submit(summary: str = ""):
+    """Submit your verification for audit. Include real evidence."""
+    await auditor.send(f"Review this:\n{summary}")
+    return "Submitted for audit. Wait for the auditor."
+```
+
+Events allow you to inject deterministic structure and control flow to structure how your agents work towards the task of the program. They are useful for defining controlled steps and flows, like:
+
+- forcing a model to iterate against hard tests and harness signals
+- building a verification hierarchy, where agents spawn outputs that are verified and redteamed by other agents until they match a set of properties
+- controlling distributed task state, like having a lock around the ways agents write to shared resources or user-facing systems
+
+Programs can also send messages to agents directly with `agent.send()`. The agent processes it like any other message and can call tools in response. This is the primary way event handlers route information between agents.
+
+```python
+@reviewer.on("reject")
+async def on_reject(feedback: str = ""):
+    await builder.send(f"The reviewer rejected your submission:\n{feedback}")
+    return "Feedback sent to builder."
+```
+
+### Lifecycle
+
+`await ctx.done(result)` signals successful completion. `await ctx.fail(reason)` signals failure. Without one of these, the execution runs until its TTL expires. The TTL is set when creating an execution (in seconds, default 0 which defers to the server maximum of 2 hours). When the TTL fires, all agents are stopped and the execution is marked as failed.
+
+Most programs end via an event handler calling `await ctx.done()` or `await ctx.fail()`. Long-lived programs that accept client events indefinitely call `await ctx.wait()` at the end of the program function to block until one of these signals fires.
+
+Programs can also snapshot an agent's VM at any point with `agent.snapshot_machine(name)`. This captures the current state of the machine (installed packages, files, configuration) and registers it as a new devbox that future executions can use.
+
+
+## Communication
+
+
+Events and `agent.send` allow programmatic communication with agents, but agents can also talk to each other directly via the built-in `message` tool.
+
+You can connect agents to each other so they can communicate via `ctx.connect()`:
+
+```python
+ctx.connect(builder, reviewer)  # bidirectional
+ctx.connect(builder, logger, direction="forward")  # builder -> logger only
+```
+
+
+## Clients 
+
+Clients consume information about the execution of a program, and can receive and send messages to the program to steer it. For example, a frontend can allow a user to monitor and change the program execution.
+
+Executions emit a stream of activity events (tool calls, responses, connections, custom events from `ctx.emit()`) that clients can consume via SSE at `GET /api/executions/{slug}/stream`. Clients can also send events to the execution via `POST /api/events/send`. See the [client API reference](../reference/client-api.md) for endpoint details and message formats.
+
+Programs can also push events to connected clients with `await ctx.emit()`:
+
+```python
+@builder.on("surface")
+async def on_surface(title: str = "", body: str = ""):
+    """Surface a decision or consideration for the driver."""
+    await ctx.emit("consideration", {"title": title, "body": body})
+    return "Surfaced to driver."
+```
+
+Clients can also send information to the execution. They can do this in an unstructured way via messaging, and via custom events defined in the program, just like agents.
+
+These are registered with [`@ctx.on_client_event()`](../reference/ctx.md#ctxon_client_event):
+
+```python
+@ctx.on_client_event("input")
+async def handle_input(text=""):
+    """Route driver input to the builder."""
+    await builder.send(f"[Driver]: {text}")
+    return {"ack": True}
+```
+
+When a client sends this event it will fire the handler and the return value goes back to the client as the event result.
+# Tutorial: The build flow
+
+This tutorial walks through `build.py`, the program that implements a spec using three cooperating agents. Reading it shows how the core druids primitives work together in a real flow.
+
+## What it does
+
+`build.py` implements a spec on a feature branch. Three agents collaborate:
+
+- **builder** reads the spec, writes code, commits, and requests audits
+- **critic** reviews each commit for simplicity and sends feedback
+- **auditor** verifies the builder ran the tests for real before approving
+
+The flow ends when the auditor is satisfied. The result is a branch with working, tested code.
+
+## The program, annotated
+
+```python
+async def program(ctx, spec="", task_name="", repo_full_name=""):
+```
+
+Every program is an `async def` function. `ctx` is the execution context. Extra keyword arguments are passed from the command line (`druids exec build.py spec="..." task_name="..."`).
+
+```python
+    builder = await ctx.agent(
+        "builder",
+        system_prompt=BUILDER_SYSTEM_PROMPT.format(branch_name=branch_name),
+        prompt=f"## Spec: {task_name}\n\n{spec}",
+        git="write",
+        working_directory=working_dir,
+    )
+```
+
+`ctx.agent()` provisions a sandbox and starts an agent inside it. The call returns once the agent is running. `git="write"` gives it a GitHub token with push access. The agent immediately starts working on its initial prompt.
+
+```python
+    auditor = await ctx.agent(
+        "auditor",
+        git="post",
+        share_machine_with=builder,
+    )
+```
+
+`share_machine_with=builder` puts the auditor on the same VM as the builder. They share a filesystem, so the auditor can read the builder's uncommitted changes without a push. `git="post"` gives read access plus the ability to create PRs.
+
+```python
+    @builder.on("commit")
+    async def on_commit(message: str = ""):
+        """Commit staged changes and notify the critic."""
+        result = await builder.exec(f"git commit -m {shlex.quote(message)}")
+        await builder.exec("git push")
+        if critic is None:
+            critic = await ctx.agent("critic", git="read", share_machine_with=builder)
+            ...
+        await critic.send(f"New commit: {message}. Run git diff HEAD~1.")
+        return f"Committed.\n{result.stdout}"
+```
+
+`@builder.on("commit")` registers a tool named `commit` that the builder can call. When the builder calls it, the handler runs on the server, not inside the sandbox. It executes shell commands inside the builder's sandbox (`builder.exec()`), spawns the critic on first commit, and forwards a message to the critic.
+
+The return value becomes the tool result the agent sees. Agents use tool results to understand what happened and decide what to do next.
+
+```python
+    @auditor.on("approve")
+    async def on_approve(summary: str = ""):
+        await ctx.done(summary or "Build approved.")
+        return "Done."
+```
+
+`await ctx.done()` ends the execution. After this call, the server stops all agents and cleans up the sandboxes. The string passed to `done()` is recorded as the execution result and shown in the dashboard.
+
+## Running it
+
+```bash
+druids exec .druids/build.py --devbox owner/repo \
+  task_name="add rate limiting" \
+  spec="Add per-user rate limiting to the POST /api/keys endpoint. Max 10 keys per user. Return 429 with a clear error message when the limit is hit. Add tests."
+```
+
+## Why three agents?
+
+One agent implementing and self-reviewing is less reliable than three agents with distinct roles. The critic sees only the diff, not the full context, which forces it to judge each change on its own merits. The auditor sees only the final output and asks: did the builder actually verify this? Neither can be satisfied by optimistic self-assessment.
+
+
+## Variants
+
+Change the agent count and roles to suit your task:
+
+- Drop the critic if you trust the builder's judgment and want faster iterations.
+- Add a second auditor with a different focus (security vs correctness).
+- Replace the auditor's `approve` tool with a tool that runs your CI pipeline and passes only when it goes green.
+- Use `model="claude-sonnet-4-6"` for the critic to save cost, since it only needs to read diffs.
+# Tutorial: Client events and interactive programs
+
+Programs do not have to be fire-and-forget. The `workshop.py` program stays alive and accepts commands from the outside while agents are running. This tutorial explains how that works and how to build similar interactive programs.
+
+## What are client events?
+
+Client events are named endpoints on a running execution that external callers can trigger. You register them in your program with `@ctx.on_client_event("name")`. The handler runs when someone sends the event through the REST API.
+
+This is how you build human-in-the-loop workflows, live dashboards, or programs that accept new work while running.
+
+## The workshop pattern
+
+`workshop.py` is a long-lived program. It starts, registers two client events, and then waits:
+
+```python
+async def program(ctx):
+    executors = {}
+    results = {}
+
+    @ctx.on_client_event("get_state")
+    def get_state():
+        """Return current workshop state."""
+        return {
+            "agents": {name: {"connected": name in ctx.connections} for name in ctx.agents},
+            "features": {
+                "active": [f for f in executors if f not in results],
+                "completed": list(results.keys()),
+            },
+            "available_actions": ctx.list_client_events(),
+        }
+
+    @ctx.on_client_event("propose")
+    async def on_propose(feature="", plan=""):
+        """Spawn an executor agent for a feature."""
+        agent_name = f"{feature}-exec"
+        await ctx.agent(agent_name, prompt=plan, git="write")
+        executors[feature] = agent_name
+        return {"status": "executor_spawned", "feature": feature}
+
+    await ctx.emit("ready", {"message": "Workshop running."})
+    await ctx.wait()
+```
+
+`await ctx.wait()` suspends the program without ending the execution. The program stays alive until `await ctx.done()` or `await ctx.fail()` is called or the execution is stopped externally.
+
+`await ctx.emit("ready", ...)` sends an event to the execution stream. Clients watching the stream (via the dashboard or SSE/WebSocket) see it immediately.
+
+## Calling client events from the API
+
+```bash
+# Start the workshop
+druids exec .druids/workshop.py --devbox owner/repo
+>>> workshop-slug
+
+# Observe the state via the API
+curl -H "Authorization: Bearer druid_..." \
+  https://druids.dev/api/events/send \
+  -d '{"execution_slug": "workshop-slug", "event": "get_state", "data": {}}'
+
+# Spawn an executor for a new feature
+curl -H "Authorization: Bearer druid_..." \
+  https://druids.dev/api/events/send \
+  -d '{"execution_slug": "workshop-slug", "event": "propose", "data": {"feature": "auth", "plan": "Add JWT authentication to the API"}}'
+
+# Watch recent activity
+druids execution activity workshop-slug
+
+# Watch the executor's output
+druids execution status workshop-slug
+```
+
+## Building a dynamic UI
+
+Client events are available over the REST API, so you can build any kind of interface around them:
+
+```python
+import httpx
+
+BASE = "http://localhost:8000"
+SLUG = "workshop-slug"
+HEADERS = {"Authorization": "Bearer druid_..."}
+
+# Observe state
+state = httpx.get(f"{BASE}/api/executions/{SLUG}", headers=HEADERS).json()
+
+# Propose a feature
+httpx.post(
+    f"{BASE}/api/events/send",
+    json={"execution_slug": SLUG, "event": "propose", "data": {"feature": "rate-limiting", "plan": "Add per-user rate limiting"}},
+    headers=HEADERS,
+)
+
+# Stream execution events
+with httpx.stream("GET", f"{BASE}/api/executions/{SLUG}/stream", headers=HEADERS) as r:
+    for line in r.iter_lines():
+        if line.startswith("data: "):
+            print(line[6:])
+```
+
+## When to use this pattern
+
+Use client events when:
+- The scope of work is not fully known upfront (new features proposed as the execution runs)
+- You want a human to review and approve intermediate outputs before continuing
+- You are building a tool that other programs or scripts will drive
+
+Use fire-and-forget programs (like `build.py`) when:
+- The task is fully specified upfront
+- You want maximum parallelism and speed
+- There is no need for human checkpoints
+
+The two patterns compose: a workshop can spawn build-style sub-flows for each proposed feature, while the workshop itself stays interactive.
+# Program API
+
+A program is an `async def program(ctx)` function in a `.py` file. The runtime
+calls it with a `ctx` object that creates agents, registers event handlers,
+and controls the execution lifecycle.
+
+## Reference pages
+
+- [ctx](#/docs/ctx) -- the context object passed to every program: `ctx.agent()`, `ctx.done()`, `ctx.fail()`, `ctx.wait()`, `ctx.emit()`, `ctx.on_client_event()`, and ctx properties.
+- [Agent](#/docs/agent) -- the agent object returned by `ctx.agent()`: `agent.on()`, `agent.send()`, `agent.exec()`, `agent.expose()`.
+- [Git permission levels](#/docs/git-permissions) -- the `git` parameter values and their GitHub API scopes.
+- [Built-in agent tools](#/docs/built-in-tools) -- tools available to every agent via the `druids` CLI.
+- [Client API](#/docs/client-api) -- SSE streaming, REST client events, and other client-facing endpoints.
+# ctx
+
+The `ctx` object is passed to every program function. It creates agents,
+registers event handlers, and controls the execution lifecycle.
+
+## ctx.agent()
+
+```python
+agent = await ctx.agent(
+    name,
+    prompt=None,
+    system_prompt=None,
+    model="claude",
+    git=None,
+    working_directory=None,
+    share_machine_with=None,
+    mcp_servers=None,
+)
+```
+
+Create and register an agent. Returns immediately. VM provisioning, bridge
+startup, and ACP connection run in the background. Methods that need the
+connection (`send`, `exec`, `expose`) block until provisioning completes.
+
+### Parameters
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `name` | `str` | required | Unique agent name within this execution. |
+| `prompt` | `str \| None` | `None` | Initial user prompt sent after provisioning completes. |
+| `system_prompt` | `str \| None` | `None` | System prompt for the agent backend. Druids tool documentation is prepended automatically. |
+| `model` | `str` | `"claude"` | `"claude"`, `"codex"`, or a specific model ID (e.g. `"claude-sonnet-4-6"`, `"claude-opus-4-6"`). Bare `"claude"` or `"codex"` picks the default model for that backend. |
+| `git` | `str \| None` | `None` | Git access level: `"read"`, `"post"`, or `"write"`. `None` means no git token and no repo clone. See [Git permission levels](git-permissions.md). |
+| `working_directory` | `str \| None` | `None` | Override the default `/home/agent` directory. |
+| `share_machine_with` | `agent \| None` | `None` | An agent (returned by a previous `ctx.agent()` call) to share a VM with. Both agents run on the same VM with separate bridge processes. The shared agent must be provisioned first. |
+| `mcp_servers` | `dict \| None` | `None` | MCP servers to attach. Dict keyed by server name; each value has `"url"` and optional `"headers"`. String values containing `$VAR_NAME` are resolved from devbox secrets at startup. |
+
+### Template variables
+
+The `prompt` and `system_prompt` strings support `$variable` substitution
+using Python `string.Template`. Available variables:
+
+| Variable | Value |
+|---|---|
+| `$execution_slug` | The execution's slug identifier. |
+| `$agent_name` | This agent's name. |
+| `$working_directory` | This agent's working directory. |
+| `$branch_name` | Git branch name (`druids/{slug}`). |
+| `$spec` | The task specification string (if provided). |
+
+### Example
+
+```python
+async def program(ctx):
+    worker = await ctx.agent(
+        "worker",
+        model="claude-sonnet-4-6",
+        git="write",
+        prompt="Implement the feature described in the spec.",
+        system_prompt="You are an implementor agent. Spec:\n$spec",
+    )
+```
+
+## ctx.done()
+
+```python
+await ctx.done(result=None)
+```
+
+Signal successful completion. The execution transitions to `"completed"`
+status. The optional `result` value is stored with the execution.
+
+## ctx.fail()
+
+```python
+await ctx.fail(reason)
+```
+
+Signal failure. The execution transitions to `"failed"` status with the
+given reason string.
+
+## ctx.wait()
+
+```python
+await ctx.wait()
+```
+
+Signal readiness and block until the execution is stopped. Call this at the
+end of the program function after all agents and handlers are registered.
+Starts the internal HTTP server (if not already started) and registers
+client event names with the server.
+
+Programs that call `await ctx.done()` or `await ctx.fail()` from a handler do not need
+to call `await ctx.wait()`. Use `await ctx.wait()` when the program should stay alive
+indefinitely and rely on external signals to end.
+
+## ctx.emit()
+
+```python
+await ctx.emit(event, data=None)
+```
+
+Emit an event to connected clients (the web dashboard or CLI). Fire-and-forget.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `event` | `str` | Event name. |
+| `data` | `dict \| None` | Optional event payload. |
+
+## ctx.on_client_event()
+
+```python
+@ctx.on_client_event(name)
+async def handler(**data):
+    ...
+```
+
+Register a handler for events sent by clients (web dashboard or CLI) to
+the execution. The handler receives the event data as keyword arguments.
+Return value is sent back to the client.
+
+## ctx properties
+
+| Property | Type | Description |
+|---|---|---|
+| `ctx.slug` | `str` | Execution slug identifier. |
+| `ctx.repo_full_name` | `str \| None` | GitHub repository (`owner/repo`) if associated with a devbox that has a repo. |
+| `ctx.spec` | `str \| None` | Task specification string, passed as the `spec` argument to `druids exec`. |
+| `ctx.agents` | `dict[str, Agent]` | Read-only copy of agent name to agent mapping. |
+| `ctx.connections` | `set[str]` | Names of agents with active ACP connections. Refreshed on each client event. |
+# Agent
+
+The agent object is returned by [`ctx.agent()`](ctx.md#ctxagent). It
+provides methods to register tool handlers, send prompts, run shell
+commands, and expose ports.
+
+## agent.on()
+
+```python
+@agent.on(tool_name)
+async def handler(param1: str, param2: int) -> str:
+    ...
+```
+
+Register a tool handler. The decorated function becomes an MCP tool
+available to the agent. The runtime generates the tool schema from the
+function's parameter names and type annotations.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `tool_name` | `str` | The tool name the agent sees. |
+
+The handler function's signature defines the tool's input schema:
+- Parameter names become tool parameter names.
+- Type annotations are used for the schema (if provided).
+- The function's docstring becomes the tool description.
+- The return value is sent back to the agent as the tool result.
+
+Handlers can be sync or async. If async, the runtime awaits the coroutine.
+
+### Example
+
+```python
+@executor.on("submit_for_review")
+async def on_submit(diff: str, summary: str) -> str:
+    """Submit code for review."""
+    await reviewer.send(f"Review this diff:\n{diff}\n\nSummary: {summary}")
+    return "Submitted for review."
+```
+
+The executor agent sees a `submit_for_review` tool with `diff` and `summary`
+string parameters and the description "Submit code for review."
+
+## agent.send()
+
+```python
+await agent.send(message)
+```
+
+Send a prompt to the agent. Blocks until the agent is provisioned and
+connected, then delivers the message fire-and-forget (does not wait for
+the agent to finish processing).
+
+| Parameter | Type | Description |
+|---|---|---|
+| `message` | `str` | The message text to send. |
+
+## agent.exec()
+
+```python
+result = await agent.exec(command)
+```
+
+Run a shell command on the agent's VM. Blocks until the agent is provisioned.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `command` | `str` | Shell command to execute. |
+
+Returns an object with:
+
+| Field | Type | Description |
+|---|---|---|
+| `exit_code` | `int` | Process exit code. |
+| `stdout` | `str` | Standard output. |
+| `stderr` | `str` | Standard error. |
+| `ok` | `bool` | `True` if `exit_code == 0`. |
+
+### Example
+
+```python
+result = await agent.exec("cd /home/agent/repo && git diff")
+if result.ok:
+    print(result.stdout)
+```
+
+## agent.expose()
+
+```python
+url = await agent.expose(name, port)
+```
+
+Expose a port on the agent's VM as a public HTTPS URL. Blocks until the
+agent is provisioned.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `name` | `str` | Service name identifier. |
+| `port` | `int` | Port number to expose (1-65535, excluding the bridge port). |
+
+Returns the public HTTPS URL as a string.
+# Built-in agent tools
+
+Every agent automatically has access to these tools via the `druids` CLI on
+its VM. These are handled by the runtime, not by program-defined handlers.
+
+| Tool | Arguments | Description |
+|---|---|---|
+| `message` | `receiver`, `message` | Send a message to another agent in the execution. |
+| `list_agents` | (none) | List all agent names in the execution. |
+| `expose` | `service_name`, `port` | Expose a local port as a public HTTPS URL. |
+
+Agents call these via the CLI:
+
+```
+druids tool message receiver="other-agent" message="hello"
+druids tool list_agents
+druids tool expose service_name="web" port=3000
+```
+
+Program-defined tools (registered with [`@agent.on()`](agent.md#agenton)) are also available
+through the same CLI interface.
+# Git permission levels
+
+The `git` parameter on [`ctx.agent()`](ctx.md#ctxagent) controls what GitHub API scopes the
+agent's token receives. When `git` is `None`, the agent gets no GitHub token
+and no repo is cloned.
+
+| Level | GitHub permissions | Description |
+|---|---|---|
+| `"read"` | `contents: read` | Clone and read repository contents. |
+| `"post"` | `contents: read`, `pull_requests: write`, `issues: write` | Read contents, create/update PRs and issues. |
+| `"write"` | `contents: write`, `pull_requests: write` | Push commits, create/update PRs. |
+# CLI Reference
+
+The `druids` CLI runs programs on remote sandboxes and manages devbox
+environments, secrets, and authentication.
+
+```
+druids <command> [options]
+```
+
+## druids exec
+
+Run a program on a remote sandbox.
+
+```
+druids exec <program_file> [options] [key=value ...]
+```
+
+| Flag | Short | Description |
+|---|---|---|
+| `--devbox NAME` | `-d` | Devbox name. Default: devbox for current repo. |
+| `--branch BRANCH` | `-b` | Git branch to checkout. |
+| `--no-stream` | | Don't stream events after starting. |
+
+Extra arguments are passed as `key=value` pairs to the program function.
+
+```
+druids exec program.py spec="build the login page"
+druids exec program.py --devbox mybox --branch feat/new-ui spec="add dark mode"
+```
+
+## druids execution status
+
+Check status of an execution.
+
+```
+druids execution status <slug>
+```
+
+```
+druids execution status my-execution-slug
+```
+
+## druids execution stop
+
+Stop a running execution.
+
+```
+druids execution stop <slug>
+```
+
+```
+druids execution stop my-execution-slug
+```
+
+## druids execution ls
+
+List executions.
+
+```
+druids execution ls [options]
+```
+
+| Flag | Short | Description |
+|---|---|---|
+| `--all` | `-a` | Include stopped executions. |
+
+```
+druids execution ls
+druids execution ls --all
+```
+
+## druids execution connect
+
+SSH into an execution's VM as the agent user.
+
+```
+druids execution connect <execution_slug> [options]
+```
+
+| Flag | Short | Description |
+|---|---|---|
+| `--agent NAME` | `-a` | Agent name. Default: root instance. |
+
+```
+druids execution connect my-execution-slug
+druids execution connect my-execution-slug --agent worker
+```
+
+## druids apply
+
+Apply diff from an execution's VM to the local repo.
+
+```
+druids apply <execution_slug> [options]
+```
+
+| Flag | Short | Description |
+|---|---|---|
+| `--force` | `-f` | Overwrite existing files (uses `git apply --reject`). |
+
+```
+druids apply my-execution-slug
+druids apply my-execution-slug --force
+```
+
+## druids init
+
+Initialize your repo for Druids. Fetches starter programs and prints MCP server configuration for Claude Code or Claude Desktop.
+
+```
+druids init
+```
+
+Outputs a JSON block suitable for `.mcp.json` or `claude_desktop_config.json`.
+Requires authentication.
+
+## druids devbox create
+
+Provision a new devbox sandbox.
+
+```
+druids devbox create [options]
+```
+
+| Flag | Short | Description |
+|---|---|---|
+| `--name NAME` | `-n` | Devbox name. Default: repo name or `"default"`. |
+| `--repo OWNER/REPO` | `-r` | GitHub repo to clone into the devbox. |
+
+Creates a sandbox, optionally clones a repo, and prints SSH credentials.
+The sandbox stays running until `druids devbox snapshot` is called.
+
+```
+druids devbox create --repo myorg/myrepo
+druids devbox create --name my-devbox
+```
+
+## druids devbox snapshot
+
+Snapshot and stop a devbox sandbox.
+
+```
+druids devbox snapshot [options]
+```
+
+| Flag | Short | Description |
+|---|---|---|
+| `--name NAME` | `-n` | Devbox name. |
+| `--repo OWNER/REPO` | `-r` | GitHub repo. |
+
+```
+druids devbox snapshot --name my-devbox
+druids devbox snapshot --repo myorg/myrepo
+```
+
+## druids devbox ls
+
+List all devboxes.
+
+```
+druids devbox ls
+```
+
+## druids auth set-key
+
+Authenticate with an API key.
+
+```
+druids auth set-key <key>
+```
+
+The key must start with `druid_`. Get a key from the Druids dashboard
+settings page. Saved to `~/.druids/config.json`.
+
+```
+druids auth set-key druid_abc123
+```
+
+## druids auth logout
+
+Clear stored credentials.
+
+```
+druids auth logout
+```
+
+## druids auth status
+
+Show current authentication status.
+
+```
+druids auth status
+```
+
+## druids devbox secret set
+
+Set secrets on a devbox.
+
+```
+druids devbox secret set [NAME] [VALUE] [options]
+```
+
+| Flag | Short | Description |
+|---|---|---|
+| `--devbox NAME` | `-d` | Devbox name. Default: devbox for current repo. |
+| `--file PATH` | `-f` | Load secrets from a `.env` file. |
+
+Three modes:
+
+```
+# Single secret
+druids devbox secret set API_KEY sk-123 --devbox mybox
+
+# From .env file
+druids devbox secret set --file .env --devbox mybox
+
+# From stdin
+echo sk-123 | druids devbox secret set API_KEY --devbox mybox
+```
+
+## druids devbox secret ls
+
+List secrets on a devbox (names only, not values).
+
+```
+druids devbox secret ls [options]
+```
+
+| Flag | Short | Description |
+|---|---|---|
+| `--devbox NAME` | `-d` | Devbox name. Default: devbox for current repo. |
+
+```
+druids devbox secret ls --devbox mybox
+```
+
+## druids devbox secret rm
+
+Delete a secret from a devbox.
+
+```
+druids devbox secret rm <name> [options]
+```
+
+| Flag | Short | Description |
+|---|---|---|
+| `--devbox NAME` | `-d` | Devbox name. Default: devbox for current repo. |
+
+```
+druids devbox secret rm API_KEY --devbox mybox
+```
+
+## druids skill install
+
+Install Druids skills into a target codebase for Claude Code.
+
+```
+druids skill install [options]
+```
+
+| Flag | Short | Description |
+|---|---|---|
+| `--global` | `-g` | Install globally to `~/.claude` (applies to all repos). |
+| `--target-dir PATH` | `-t` | Override install directory. |
+
+Creates `.claude/skills/` entries for `druids-driver` and `write-spec`.
+
+```
+druids skill install
+druids skill install --global
+```
+
+## druids tools
+
+List tools available to this agent. Run from inside an agent VM.
+
+```
+druids tools
+```
+
+## druids tool
+
+Call a registered tool. Run from inside an agent VM.
+
+```
+druids tool <tool_name> [key=value ...]
+```
+
+```
+druids tool submit diff="..." summary="..."
+druids tool message receiver="reviewer" message="please review"
+druids tool list_agents
+druids tool expose service_name="web" port=3000
+```
+# Client API
+
+Clients connect to running executions to observe agent activity and send events. There are three transport options: SSE for read-only streaming, WebSocket for bidirectional communication, and REST for one-shot client events.
+
+All endpoints require authentication via `Authorization: Bearer <token>` header (REST and SSE) or `?token=<token>` query parameter (WebSocket).
+
+## SSE stream
+
+```
+GET /api/executions/{slug}/stream
+```
+
+Read-only stream of execution activity. Returns `text/event-stream`.
+
+### Resumption
+
+Pass the `Last-Event-ID` header with the `id` from the last received event to resume after a disconnect. The server replays all events after that cursor.
+
+### Event format
+
+Each SSE message has an `id`, `event` field, and JSON `data`:
+
+```
+id: 42
+event: activity
+data: {"type": "tool_use", "agent": "builder", "tool": "Bash", "params": {"command": "npm test"}, "ts": "2026-03-10T12:00:00Z"}
+```
+
+### Event types
+
+The `event` field is one of:
+
+| Event | Description |
+|---|---|
+| `activity` | Agent activity. The `data` payload contains a `type` field (see below). |
+| `done` | Execution finished. No more events will be sent. |
+
+Keepalives are sent as SSE comments (`: keepalive\n\n`) every 15 seconds when idle.
+
+### Activity types
+
+The `type` field inside an `activity` event's `data`:
+
+| Type | Fields | Description |
+|---|---|---|
+| `tool_use` | `agent`, `tool`, `params`, `ts` | Agent called a tool. |
+| `tool_result` | `agent`, `tool`, `result`, `exit_code`?, `duration_secs`?, `ts` | Tool returned a result. |
+| `prompt` | `agent`, `text`, `ts` | Message sent to an agent. |
+| `response_chunk` | `agent`, `text`, `ts` | Text output from an agent (chunks are merged). |
+| `connected` | `agent`, `session_id`, `ts` | Agent connected. |
+| `disconnected` | `agent`, `ts` | Agent disconnected. |
+| `client_event` | `event`, `data`, `ts` | Program emitted an event via `ctx.emit()`. |
+| `error` | `agent`?, `error`, `ts` | Error occurred. `agent` is null for execution-level errors. |
+
+### Example
+
+```python
+import httpx
+
+with httpx.stream(
+    "GET",
+    f"{BASE}/api/executions/{slug}/stream",
+    headers={"Authorization": f"Bearer {token}"},
+) as r:
+    for line in r.iter_lines():
+        if line.startswith("data: "):
+            print(line[6:])
+```
+
+
+## WebSocket
+
+```
+GET /api/executions/{slug}/ws?token=<token>
+```
+
+Bidirectional connection. The server streams the same activity events as SSE, and the client can send events to the execution.
+
+### Server messages
+
+The server sends JSON objects. Activity events have the same structure as SSE `data` payloads. In addition, the server sends:
+
+| Type | Fields | Description |
+|---|---|---|
+| `done` | (none) | Execution finished. |
+| `keepalive` | (none) | Sent every 15 seconds when idle. |
+| `event_result` | `event`, `result` | Response to a client event. |
+| `event_error` | `event`?, `error` | Client event failed. |
+
+### Client messages
+
+Send JSON objects to invoke client event handlers registered by the program:
+
+```json
+{"event": "propose", "data": {"feature": "auth", "plan": "Add JWT"}}
+```
+
+The server dispatches to the handler registered with `@ctx.on_client_event("propose")` and responds with:
+
+```json
+{"type": "event_result", "event": "propose", "result": {"status": "executor_spawned"}}
+```
+
+If the handler takes longer than 30 seconds or throws an error:
+
+```json
+{"type": "event_error", "event": "propose", "error": "Execution is not responding"}
+```
+
+### Close codes
+
+| Code | Meaning |
+|---|---|
+| 4001 | Missing or invalid authentication token. |
+| 4004 | Execution not found or not running. |
+| 1011 | Unexpected server error. |
+
+### Example
+
+```python
+import asyncio
+import json
+import websockets
+
+async def main():
+    async with websockets.connect(
+        f"ws://{host}/api/executions/{slug}/ws?token={token}"
+    ) as ws:
+        # Send a client event
+        await ws.send(json.dumps({"event": "get_state", "data": {}}))
+
+        async for msg in ws:
+            event = json.loads(msg)
+            if event.get("type") == "event_result":
+                print("Result:", event["result"])
+            elif event.get("type") == "done":
+                break
+            else:
+                print("Activity:", event)
+
+asyncio.run(main())
+```
+
+
+## REST: send client event
+
+```
+POST /api/events/send
+```
+
+One-shot endpoint for sending a single client event. Useful when you do not need a persistent connection.
+
+### Request
+
+```json
+{
+    "execution_slug": "flying-fox",
+    "event": "propose",
+    "data": {"feature": "auth", "plan": "Add JWT authentication"}
+}
+```
+
+### Response
+
+```json
+{"result": {"status": "executor_spawned", "feature": "auth"}}
+```
+
+### Errors
+
+| Status | Meaning |
+|---|---|
+| 404 | Execution not running or no handler for the event name. |
+| 504 | Handler did not respond within 30 seconds. |
+| 500 | Handler threw an exception. |
+
+### Discovering available events
+
+`GET /api/executions/{slug}` returns a `client_events` list with the names of all registered handlers:
+
+```json
+{
+    "execution_slug": "flying-fox",
+    "status": "running",
+    "client_events": ["get_state", "propose"],
+    ...
+}
+```
+
+
+## Other useful endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/executions/{slug}` | Execution status, agents, connections, client events. |
+| `GET` | `/api/executions/{slug}/activity?n=50&compact=true` | Recent activity (same event types as the stream, paginated). |
+| `POST` | `/api/executions/{slug}/agents/{name}/message` | Send a chat message to a specific agent. Body: `{"text": "..."}`. |
+| `GET` | `/api/executions/{slug}/diff?agent={name}` | Git diff from an agent's VM. |
+# Configuration
+
+## Server environment variables
+
+The server reads configuration from environment variables, with an optional
+`.env` file in the `server/` directory. All variables use the `DRUIDS_` prefix
+except where noted.
+
+Settings use [Pydantic Settings](https://docs.pydantic.dev/latest/concepts/pydantic_settings/)
+with `env_prefix="DRUIDS_"`.
+
+### Required
+
+| Variable | Description |
+|---|---|
+| `DRUIDS_BASE_URL` | Public base URL of the server (e.g. `https://druids.dev`). |
+| `DRUIDS_SECRET_KEY` | Fernet encryption key for secrets stored in the database. Generate with: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
+| `ANTHROPIC_API_KEY` | Anthropic API key for Claude agents. |
+| `FORWARDING_TOKEN_SECRET` | Secret used to sign forwarding tokens for agent-to-server auth. |
+
+### GitHub
+
+| Variable | Description |
+|---|---|
+| `GITHUB_PAT` | Personal access token for git operations (cloning repos, pushing branches). |
+
+### Optional
+
+| Variable | Default | Description |
+|---|---|---|
+| `DRUIDS_HOST` | `0.0.0.0` | Server bind address. |
+| `DRUIDS_PORT` | `8000` | Server bind port. |
+| `DRUIDS_DATABASE_URL` | `sqlite+aiosqlite:///druids.db` | Database connection string. |
+| `DRUIDS_DOCKER_IMAGE` | `ghcr.io/fulcrumresearch/druids-base:latest` | Docker image for sandbox containers. |
+| `DRUIDS_DOCKER_CONTAINER_ID` | | Attach to an existing container instead of creating new ones. |
+| `DRUIDS_DOCKER_HOST` | `localhost` | Hostname for SSH/HTTP access to Docker containers. |
+| `OPENAI_API_KEY` | | OpenAI API key for Codex agents. |
+
+### .env.example
+
+```
+# Required
+ANTHROPIC_API_KEY=sk-ant-xxx
+
+# Required for git operations (agents need this to clone repos and push branches)
+GITHUB_PAT=ghp_xxx
+
+# Optional: for Codex agents
+# OPENAI_API_KEY=sk-proj-xxx
+```
+
+## Client configuration
+
+The CLI stores machine-level configuration at `~/.druids/config.json`.
+Agent identity comes from per-process environment variables set by the
+bridge, not from the config file.
+
+### config.json fields
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `base_url` | `string` | `https://druids.dev` | Server URL. |
+| `user_access_token` | `string \| null` | `null` | API key (set by `druids auth set-key`). |
+
+Example `~/.druids/config.json`:
+
+```json
+{
+  "base_url": "https://druids.dev",
+  "user_access_token": "druid_abc123"
+}
+```
+
+### Agent environment variables
+
+These are set automatically by the bridge on agent VMs. They are not
+user-configurable.
+
+| Variable | Description |
+|---|---|
+| `DRUIDS_ACCESS_TOKEN` | Per-agent auth token for server API calls. |
+| `DRUIDS_AGENT_NAME` | This agent's name within the execution. |
+| `DRUIDS_EXECUTION_SLUG` | The execution slug this agent belongs to. |

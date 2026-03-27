@@ -1,79 +1,69 @@
-<script setup>
+<script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
-import { get } from '../api.js'
+import { get, post } from '../api'
+import { timeAgo } from '../utils'
+import type { Dashboard, ExecutionSummary, ApiKeyCreated } from '../types'
 
-const dashboard = ref(null)
-const tasks = ref([])
-const userInfo = ref(null)
+const dashboard = ref<Dashboard | null>(null)
+const tasks = ref<ExecutionSummary[]>([])
 const loading = ref(true)
-const error = ref(null)
+const error = ref<string | null>(null)
 
-const isActive = computed(() => userInfo.value?.subscription_status === 'active')
-const executionCount = computed(() => userInfo.value?.execution_count ?? 0)
-const freeLimit = computed(() => userInfo.value?.free_tier_reviews ?? 15)
-const freeRemaining = computed(() => Math.max(0, freeLimit.value - executionCount.value))
-const isLimitReached = computed(() => !isActive.value && executionCount.value >= freeLimit.value)
-const isNearLimit = computed(() => !isActive.value && !isLimitReached.value && freeRemaining.value <= 3)
+const generatedKey = ref<string | null>(null)
+const generatingKey = ref(false)
+
+async function generateKey() {
+  generatingKey.value = true
+  try {
+    const result = await post<ApiKeyCreated>('/keys', { name: 'cli' })
+    generatedKey.value = result.key
+  } catch (e) {
+    generatedKey.value = null
+  } finally {
+    generatingKey.value = false
+  }
+}
 
 onMounted(async () => {
   try {
-    const [dash, taskList, me] = await Promise.all([
-      get('/me/dashboard'),
-      get('/tasks?active_only=false').catch(() => ({ tasks: [] })),
-      get('/me'),
+    const [dash, taskList] = await Promise.all([
+      get<Dashboard>('/me/dashboard'),
+      get<{ executions: ExecutionSummary[] }>('/executions?active_only=false').catch(() => ({ executions: [] as ExecutionSummary[] })),
     ])
     dashboard.value = dash
-    tasks.value = taskList.tasks || []
-    userInfo.value = me
+    tasks.value = taskList.executions || []
   } catch (e) {
-    error.value = e.message
+    error.value = (e as Error).message
   } finally {
     loading.value = false
   }
 })
 
-const reviews = computed(() => {
-  const result = []
-  for (const task of tasks.value) {
-    for (const ex of (task.executions || [])) {
-      result.push({
-        slug: task.slug,
-        spec: task.spec,
-        repo: task.metadata?.repo_full_name || '',
-        status: ex.status,
-        pr_url: ex.pr_url,
-        pr_number: ex.pr_url ? ex.pr_url.match(/\/pull\/(\d+)/)?.[1] : null,
-        created_at: task.created_at,
-      })
-    }
-  }
-  return result.sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+const showGuide = ref(false)
+
+const isEmpty = computed(() => {
+  return !dashboard.value?.devboxes?.length && !tasks.value.length
 })
 
-function statusClass(status) {
-  if (status === 'running' || status === 'starting') return 'badge-active'
-  if (status === 'completed') return 'badge-completed'
-  if (status === 'error' || status === 'failed' || status === 'stopped') return 'badge-error'
-  return ''
-}
+const reviews = computed(() => {
+  return tasks.value
+    .map((ex) => ({
+      slug: ex.slug,
+      spec: ex.spec,
+      repo: ex.repo_full_name || '',
+      status: ex.status,
+      created_at: ex.started_at,
+    }))
+    .sort((a, b) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime())
+})
 
-function timeAgo(dateStr) {
-  if (!dateStr) return ''
-  const d = new Date(dateStr)
-  const now = new Date()
-  const diff = Math.floor((now - d) / 1000)
-  if (diff < 60) return 'just now'
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`
-  return `${Math.floor(diff / 86400)}d ago`
-}
 </script>
 
 <template>
   <div>
     <div class="page-header">
       <h1>Dashboard</h1>
-      <p>PR review overview</p>
+      <p>Agent executions</p>
     </div>
 
     <div v-if="loading" class="empty-state">
@@ -85,81 +75,109 @@ function timeAgo(dateStr) {
     </div>
 
     <template v-else>
-      <!-- Billing banner -->
-      <div v-if="isLimitReached" class="card mb-2" style="border-color: var(--red);">
-        <span class="text-red">
-          Free tier limit reached ({{ executionCount }}/{{ freeLimit }} reviews).
-        </span>
-        <router-link to="/billing" class="btn btn-sm btn-primary" style="margin-left: 0.75rem;">
-          Subscribe
-        </router-link>
-      </div>
-      <div v-else-if="isNearLimit" class="card mb-2" style="border-color: var(--yellow);">
-        <span class="text-yellow">
-          {{ freeRemaining }} free review{{ freeRemaining === 1 ? '' : 's' }} remaining.
-        </span>
-        <router-link to="/billing" style="margin-left: 0.75rem; font-size: 0.75rem;">
-          View billing
-        </router-link>
+      <!-- Getting started toggle -->
+      <div v-if="!isEmpty && !showGuide" style="margin-bottom: 1.5rem;">
+        <a href="#" @click.prevent="showGuide = true" class="text-dim" style="font-size: 0.8rem;">Show setup guide</a>
       </div>
 
+      <!-- Getting started guide -->
+      <div v-if="isEmpty || showGuide" class="card" style="padding: 2rem; margin-bottom: 1.5rem;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem;">
+          <h2 style="margin: 0;">Quickstart</h2>
+          <a v-if="!isEmpty" href="#" @click.prevent="showGuide = false" class="text-dim" style="font-size: 0.8rem;">Hide</a>
+        </div>
+
+        <div style="margin-bottom: 1.5rem;">
+          <h3 style="margin-bottom: 0.5rem;">1. Install and authenticate</h3>
+          <pre style="background: var(--bg-terminal); padding: 0.75rem 1rem; border-radius: 2px; font-size: 0.8rem; overflow-x: auto; margin: 0;">uv tool install druids</pre>
+          <div v-if="generatedKey" style="margin: 0.5rem 0;">
+            <pre style="background: var(--bg-terminal); padding: 0.75rem 1rem; border-radius: 2px; font-size: 0.8rem; overflow-x: auto; margin: 0;">druids auth set-key {{ generatedKey }}</pre>
+            <p class="text-secondary" style="font-size: 0.8rem; margin: 0.25rem 0 0 0;">Copy this now — the key won't be shown again.</p>
+          </div>
+          <div v-else style="margin: 0.5rem 0;">
+            <button @click="generateKey" :disabled="generatingKey" class="btn btn-sm" style="margin-bottom: 0.5rem;">
+              {{ generatingKey ? 'Generating...' : 'Generate API key' }}
+            </button>
+            <pre style="background: var(--bg-terminal); padding: 0.75rem 1rem; border-radius: 2px; font-size: 0.8rem; overflow-x: auto; margin: 0;">druids auth set-key &lt;your-api-key&gt;</pre>
+          </div>
+        </div>
+
+        <div style="margin-bottom: 1.5rem;">
+          <h3 style="margin-bottom: 0.5rem;">2. Run the optimize program</h3>
+          <p class="text-secondary" style="font-size: 0.85rem; margin: 0 0 0.5rem 0;">
+            This runs a program that profiles <a href="https://github.com/fulcrumresearch/logstat" target="_blank" rel="noopener" class="text-bright">logstat</a> (a sample project with performance bottlenecks), forks a VM for each bottleneck, and spawns optimizer agents to fix them in parallel.
+          </p>
+          <pre style="background: var(--bg-terminal); padding: 0.75rem 1rem; border-radius: 2px; font-size: 0.8rem; overflow-x: auto; margin: 0;">druids exec optimize --repo fulcrumresearch/logstat --no-setup</pre>
+          <p class="text-secondary" style="font-size: 0.85rem; margin: 0.5rem 0 0 0;">
+            Watch the execution here on the dashboard. Each optimizer sends its fix back to the profiler via <code>send_file</code>, the profiler integrates the changes and runs a final benchmark.
+          </p>
+        </div>
+
+        <p class="text-secondary" style="font-size: 0.85rem; margin: 0;">
+          See the <router-link to="/docs/get-started" class="text-bright">full getting started guide</router-link> for the program walkthrough — how <code>ctx.agent()</code>, <code>agent.fork()</code>, <code>ctx.connect()</code>, and <code>send_file</code> work together.
+        </p>
+      </div>
       <!-- Configured repos -->
-      <h2 class="mb-2">Repos</h2>
+      <h2 v-if="!isEmpty" class="mb-2">Repos</h2>
       <div v-if="dashboard?.devboxes?.length" class="card-grid mb-3">
-        <router-link
+        <div
           v-for="d in dashboard.devboxes"
           :key="d.repo_full_name"
-          :to="`/setup/${d.repo_full_name}`"
           class="card"
-          style="cursor: pointer; text-decoration: none; color: inherit;"
         >
           <h3>{{ d.repo_full_name }}</h3>
-          <div class="mt-1 text-secondary" style="font-size: 0.75rem;">
-            <span v-if="d.has_snapshot" class="text-green">Snapshot ready</span>
-            <span v-else class="text-dim">No snapshot</span>
-          </div>
-        </router-link>
-      </div>
-      <div v-else class="card mb-3" style="display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 3rem 2rem; text-align: center;">
-        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="margin-bottom: 1rem; opacity: 0.6;">
-          <path d="M3 7v10a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-6l-2-2H5a2 2 0 0 0-2 2z"/>
-        </svg>
-        <p style="font-size: 0.95rem; color: var(--text-secondary); margin: 0;">No repositories configured yet</p>
-        <router-link to="/setup" class="btn btn-sm btn-primary" style="display: inline-flex; margin-top: 1.25rem;">
-          Set up a repo
-        </router-link>
+        </div>
       </div>
 
-      <!-- Recent reviews -->
-      <h2 class="mb-2">Recent reviews</h2>
+      <!-- Recent executions -->
+      <template v-if="!isEmpty">
+      <h2 class="mb-2">Recent executions</h2>
       <div v-if="reviews.length">
-        <table class="data-table">
-          <thead>
-            <tr>
-              <th>Repo</th>
-              <th>Status</th>
-              <th>PR</th>
-              <th>Created</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="r in reviews" :key="r.slug + r.status">
-              <td class="text-secondary" style="font-size: 0.72rem;">{{ r.repo }}</td>
-              <td><span class="badge" :class="statusClass(r.status)">{{ r.status }}</span></td>
-              <td>
-                <a v-if="r.pr_url" :href="r.pr_url" target="_blank" class="text-bright">
-                  #{{ r.pr_number }}
-                </a>
-                <span v-else class="text-dim">&mdash;</span>
-              </td>
-              <td class="text-dim">{{ timeAgo(r.created_at) }}</td>
-            </tr>
-          </tbody>
-        </table>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Execution</th>
+                <th>Status</th>
+                <th>Repo</th>
+                <th>Started</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="r in reviews" :key="r.slug">
+                <td>
+                  <router-link :to="`/executions/${r.slug}`" class="text-bright">{{ r.slug }}</router-link>
+                </td>
+                <td class="text-dim">{{ r.status }}</td>
+                <td class="text-secondary" style="font-size: 0.72rem;">{{ r.repo }}</td>
+                <td class="text-dim">{{ timeAgo(r.created_at) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="mobile-cards">
+          <router-link
+            v-for="r in reviews"
+            :key="r.slug"
+            :to="`/executions/${r.slug}`"
+            class="mobile-card"
+          >
+            <div class="mobile-card-row">
+              <span class="mobile-card-primary">{{ r.slug }}</span>
+              <span class="mobile-card-dim">{{ r.status }}</span>
+            </div>
+            <div class="mobile-card-row">
+              <span class="mobile-card-secondary">{{ r.repo }}</span>
+              <span class="mobile-card-dim">{{ timeAgo(r.created_at) }}</span>
+            </div>
+          </router-link>
+        </div>
       </div>
       <div v-else class="empty-state">
-        No reviews yet. Reviews will appear here when PRs are opened on your configured repos.
+        No executions yet.
       </div>
+      </template>
     </template>
   </div>
 </template>
+

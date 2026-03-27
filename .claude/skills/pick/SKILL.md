@@ -15,7 +15,7 @@ The user wants to compare the solutions from a completed (or nearly completed) t
 
 ### 1. Identify the task
 
-The user may provide a task slug directly (`/pick burning-prelude`) or you may need to find it. Use `get_task` or `list_tasks` to get the task and its executions.
+The user may provide an execution slug directly (`/pick burning-prelude`) or you may need to find it. Use `get_execution` or `list_executions` to find executions.
 
 ### 2. Gather data for each execution
 
@@ -23,9 +23,9 @@ For every execution with status `running` or `completed` (skip `failed`), collec
 
 **a. Diff stats** -- call `get_execution_diff` for each. Summarize: files changed, lines added/removed. Note the branch name.
 
-**b. PR URL** -- from the task data. If the agent opened a PR, include the link.
+**b. PR URL** -- from the execution data. If the agent opened a PR, include the link.
 
-**c. Exposed services** -- from the task data. These are live URLs the user can visit (e.g. a leaderboard site, a dashboard). Include every URL.
+**c. Exposed services** -- from the execution data. These are live URLs the user can visit (e.g. a leaderboard site, a dashboard). Include every URL.
 
 **d. Recent activity** -- call `get_execution_activity` with `n=5` to see what the agent last did. This tells you if it finished, is still working, or got stuck.
 
@@ -75,7 +75,7 @@ Do not close PRs or merge anything until the user explicitly says which one they
 When the user picks a winner:
 
 1. Close all other PRs for the task using `gh pr close {pr_number}` with a comment explaining the decision.
-2. Optionally stop the losing executions if they're still running using `delete_task` or `stop_agent`.
+2. Optionally stop the losing executions if they're still running using `update_execution` (status="stopped") or `stop_agent`.
 3. Report the winner's PR URL so the user can merge it.
 
 Use a comment like:

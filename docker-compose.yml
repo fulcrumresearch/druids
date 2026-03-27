@@ -1,0 +1,10 @@
+version: '3.8'
+
+# Pulls the pre-built agent base image so it's available locally.
+# The server runs directly on the host (not in a container).
+# See scripts/setup.sh and QUICKSTART.md.
+
+services:
+  agent-base:
+    image: ghcr.io/fulcrumresearch/druids-base:latest
+    command: ["true"]

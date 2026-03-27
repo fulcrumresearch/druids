@@ -1,90 +1,149 @@
 """Fixtures for integration tests.
 
-Provides a real bridge subprocess and stub agent. No Morph VMs, no API keys.
+Provides an in-process stub agent communicating through the relay hub.
+No bridge subprocess, no Morph VMs, no API keys.
 
-- bridge_process (module): starts bridge.py, waits for /status, yields URL
-- bridge_with_stub (function): POSTs /start with stub_agent.py, yields URL, POSTs /stop
+- relay_stub (function): runs a stub ACP agent in-process via the relay hub, yields (bridge_id, bridge_token)
 """
 
-import socket
-import subprocess
-import sys
-import time
+import asyncio
+import json
+from uuid import uuid4
 
-import httpx
 import pytest
-from orpheus.paths import BRIDGE_DIR, STUB_AGENT_PATH
+from druids_server.lib.connection import bridge_relay_hub
 
 
-def _free_port() -> int:
-    """Find an available TCP port."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+async def _stub_agent_loop(bridge_id: str) -> None:
+    """Run stub ACP agent logic in-process via the relay hub.
 
-
-@pytest.fixture(scope="module")
-def bridge_port():
-    return _free_port()
-
-
-@pytest.fixture(scope="module")
-def bridge_process(bridge_port):
-    """Start the bridge as a subprocess and wait until it is ready."""
-    proc = subprocess.Popen(
-        [sys.executable, str(BRIDGE_DIR / "bridge.py"), "--port", str(bridge_port), "--host", "127.0.0.1"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-
-    url = f"http://127.0.0.1:{bridge_port}"
-
-    # Poll /status until the bridge is accepting connections
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
+    Reads JSON-RPC requests from the relay outgoing queue (server -> bridge)
+    and writes responses to the incoming queue (bridge -> server). Implements
+    the same protocol surface as stub_agent.py.
+    """
+    prompt_count = 0
+    while True:
         try:
-            resp = httpx.get(f"{url}/status", timeout=1)
-            if resp.status_code == 200:
-                break
-        except (httpx.ConnectError, httpx.ReadError):
-            pass
-        time.sleep(0.1)
-    else:
-        proc.kill()
-        stdout = proc.stdout.read().decode() if proc.stdout else ""
-        stderr = proc.stderr.read().decode() if proc.stderr else ""
-        raise RuntimeError(f"Bridge failed to start within 10s.\nstdout: {stdout}\nstderr: {stderr}")
+            items = await bridge_relay_hub.pull_input(bridge_id, max_items=10, timeout_seconds=0.5)
+        except (ConnectionError, asyncio.CancelledError):
+            return
 
-    yield url
+        for item in items:
+            for line in item.strip().split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                msg = json.loads(line)
+                method = msg.get("method")
+                request_id = msg.get("id")
+                params = msg.get("params", {})
 
-    proc.terminate()
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
+                if request_id is None:
+                    continue
+
+                responses: list[dict] = []
+                if method == "initialize":
+                    responses.append(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": request_id,
+                            "result": {"protocolVersion": 1, "capabilities": {}},
+                        }
+                    )
+                elif method == "session/new":
+                    responses.append(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": request_id,
+                            "result": {"sessionId": "stub-session-1"},
+                        }
+                    )
+                elif method == "session/prompt":
+                    prompt_count += 1
+                    session_id = params.get("sessionId", "stub-session-1")
+                    tool_call_id = f"tool-{prompt_count}"
+                    responses.extend(
+                        [
+                            {
+                                "jsonrpc": "2.0",
+                                "method": "session/update",
+                                "params": {
+                                    "sessionId": session_id,
+                                    "update": {
+                                        "sessionUpdate": "agent_message_chunk",
+                                        "content": {
+                                            "type": "text",
+                                            "text": f"Response to prompt {prompt_count}",
+                                        },
+                                    },
+                                },
+                            },
+                            {
+                                "jsonrpc": "2.0",
+                                "method": "session/update",
+                                "params": {
+                                    "sessionId": session_id,
+                                    "update": {
+                                        "sessionUpdate": "tool_call",
+                                        "title": "echo",
+                                        "toolCallId": tool_call_id,
+                                        "rawInput": {"message": "hello"},
+                                    },
+                                },
+                            },
+                            {
+                                "jsonrpc": "2.0",
+                                "method": "session/update",
+                                "params": {
+                                    "sessionId": session_id,
+                                    "update": {
+                                        "sessionUpdate": "tool_call_update",
+                                        "toolCallId": tool_call_id,
+                                        "status": "completed",
+                                        "rawOutput": {"result": "hello"},
+                                    },
+                                },
+                            },
+                            {
+                                "jsonrpc": "2.0",
+                                "id": request_id,
+                                "result": {"stopReason": "end_turn"},
+                            },
+                        ]
+                    )
+                else:
+                    responses.append({"jsonrpc": "2.0", "id": request_id, "result": None})
+
+                await bridge_relay_hub.push_output(bridge_id, [json.dumps(r, separators=(",", ":")) for r in responses])
 
 
 @pytest.fixture
-def bridge_with_stub(bridge_process):
-    """Start the stub agent on the bridge. Stops it on teardown."""
-    resp = httpx.post(
-        f"{bridge_process}/start",
-        json={"command": sys.executable, "args": [str(STUB_AGENT_PATH)]},
-        timeout=5,
-    )
-    assert resp.status_code == 200, f"Bridge /start failed: {resp.text}"
-    assert resp.json()["status"] == "started"
+async def relay_stub():
+    """Start an in-process stub agent communicating through the relay hub.
 
-    yield bridge_process
+    Yields (bridge_id, bridge_token). The stub processes ACP requests
+    (initialize, session/new, session/prompt) and sends back the same
+    responses as stub_agent.py.
+    """
+    bridge_id = f"test-bridge-{uuid4().hex[:8]}"
+    bridge_token = "test-token"
 
-    httpx.post(f"{bridge_process}/stop", timeout=5)
+    async def _run():
+        # Wait for AgentConnection.start() to register this bridge_id in the hub.
+        for _ in range(500):
+            if bridge_id in bridge_relay_hub._sessions:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            return
+        await bridge_relay_hub.mark_connected(bridge_id)
+        await _stub_agent_loop(bridge_id)
 
-
-@pytest.fixture(autouse=True)
-def _stop_bridge_agent(bridge_process):
-    """Safety net: stop any running agent after each test."""
-    yield
+    task = asyncio.create_task(_run())
+    yield bridge_id, bridge_token
+    task.cancel()
     try:
-        httpx.post(f"{bridge_process}/stop", timeout=2)
-    except Exception:
+        await task
+    except asyncio.CancelledError:
         pass
+    await bridge_relay_hub.unregister(bridge_id)

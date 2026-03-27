@@ -3,7 +3,7 @@
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from orpheus.lib.connection import AgentConnection
+from druids_server.lib.connection import AgentConnection
 
 
 @pytest.fixture

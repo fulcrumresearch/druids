@@ -1,65 +1,62 @@
-# Orpheus Server
+# Druids Server
 
-FastAPI application that orchestrates agents on MorphCloud VMs. Agents communicate through MCP tools served at `/mcp/` (all tools) and `/mcp/exec` (execution-scoped tools only).
+FastAPI application that orchestrates agents on MorphCloud VMs or Docker containers.
 
 ## Running
 
 ```
 cd server
 uv sync
-uv run orpheus-server
+uv run druids-server
 ```
 
-The server starts on port 8000. It requires a `.env` file in this directory (see [SETUP.md](../SETUP.md) for the full walkthrough).
+The server starts on port 8000. It requires a `.env` file in this directory (see [the root README](../README.md) for setup).
 
-## API structure
+## Server conventions
 
-Routes are organized into modules under `orpheus/api/routes/`:
+These supplement the shared Python conventions in [CLAUDE.md](../CLAUDE.md).
 
-- `auth` - GitHub OAuth login and token exchange
-- `setup` - Devbox provisioning endpoints
-- `programs` - List available agent programs
-- `tasks` - Create, list, stop, and inspect tasks
-- `executions` - Execution diffs and activity logs
-- `mcp` - MCP tools for agent-to-agent communication
-- `webhooks` - GitHub webhook receiver for PR feedback
+### Data modeling
 
-## MCP tools
+Domain objects use `@dataclass`. API models use Pydantic `BaseModel`. Database models use `SQLModel` with `table=True`.
 
-Agents call these tools through the MCP endpoint. Each requires an `execution_slug` parameter.
+Constraints that are not obvious from the code:
 
-- `send_message` - send a prompt to another agent
-- `get_file` - read a file from an agent's VM
-- `save_file` - write a file to an agent's VM
-- `spawn` - create a new agent from a constructor
-- `get_programs` - list running programs and their constructors
-- `stop_agent` - disconnect and remove an agent
-- `get_agent_ssh` - get SSH credentials for an agent's VM
-- `expose_port` - expose a port on an agent's VM as a public HTTPS URL
-- `submit` - mark execution as complete after creating a PR
+- No ORM relationship fields on database models. Use explicit joins.
+- Timestamps use `sa_column=sa.Column(sa.DateTime(timezone=True))`. Always timezone-aware.
+- Use `model_dump(by_alias=True)` when serializing for external APIs (e.g. MorphCloud). Plain `model_dump()` for internal use.
+- Configuration uses `BaseSettings` with `DRUIDS_` env prefix. External service keys use `validation_alias` to accept their standard env var names without the prefix.
 
-The `/mcp` mount includes driver-level tools (task management, program listing, execution diffs) in addition to the above. The `/mcp/exec` mount exposes only the execution-scoped tools listed above.
+### Error handling
 
-## Core types
+`HTTPException` messages must include the resource identifier so the caller knows what failed:
 
-The domain model lives in `orpheus/core/`.
+```python
+raise HTTPException(404, f"Execution {slug} not found")
+```
 
-`Program` is the base unit. It has a `name` and a `constructors` dict mapping names to factory functions that produce new programs.
+Validate inputs at API boundaries (route handlers). Trust inputs in internal code.
 
-`Agent` extends `Program` with an `ACPConfig` (command, env, working directory) and optional `user_prompt`. Use the `ClaudeAgent` or `CodexAgent` subclasses (in `orpheus/core/agents/`) rather than constructing `Agent` + `ACPConfig` manually. Each subclass creates its config and writes backend-specific files to the VM during `exec()`.
+### Module organization
 
-`Execution` is the runtime container. It holds all programs and their connections, keyed by name. Fields include `id: UUID`, `slug: str`, `user_id: str`, and references to the task and repo. When an agent calls `spawn`, the execution looks up the constructor, creates the new agent, and connects to it.
+Dependency flow: `config` -> `lib` / `db` -> `api`. Lower-level modules must not import higher-level modules. `lib/__init__.py` re-exports the public API with `__all__`.
 
-`AgentConnection` wraps the HTTP/SSE link to an agent's bridge process. It implements the ACP client protocol: session creation, prompt delivery, and auto-approval of tool permission requests.
-
-## Traces
-
-Execution traces are logged to `~/.orpheus/executions/{user_id}/{slug}.jsonl`. Each line is a JSON object with a timestamp, event type, agent name, and event-specific fields. The Streamlit viewer (`orpheus/viewer.py`) displays these logs.
-
-## Tests
+## Testing
 
 ```
 uv run pytest
 ```
 
-Integration tests in `tests/integration/` require a running server and MorphCloud VMs. They are skipped by default.
+Tests mirror source structure: `tests/lib/`, `tests/api/`, `tests/db/`, `tests/integration/`. Integration tests require a running server and sandbox VMs; they are skipped by default.
+
+Gotchas:
+
+- Prefer the shared API test helpers in `tests/api/conftest.py`: `make_api_app()`, `api_app`, `authed_app`, `authed_client`, `unauthed_client`, `execution_registry`, `make_mock_session()`, and `make_execution_record()`.
+- The execution registry (`_executions` in `deps.py`) is shared mutable state. Use the `execution_registry` fixture so it is cleared before and after each test.
+- Patch config through `tests.conftest.patch_settings(...)` or `make_settings(...)`, which override `druids_server.config.get_settings`. Do not patch module-local `settings` aliases.
+- Shared app fixtures clear `app.dependency_overrides` for you. If a test builds a custom app manually, it still needs to clear overrides in teardown.
+- Only tests that genuinely need a custom app should create their own `FastAPI()` instance. Most API tests should reuse the shared fixtures instead.
+
+## Traces
+
+Execution traces are logged to `~/.druids/executions/{user_id}/{slug}.jsonl`. Each line is a JSON object with timestamp, event type, agent name, and event-specific fields.
