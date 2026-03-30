@@ -5,6 +5,7 @@ from fastapi import APIRouter
 from druids_server.api.routes import (
     bridge,
     executions,
+    health,
     mcp,
     me,
     programs,
@@ -17,6 +18,7 @@ from druids_server.api.routes import (
 def create_router() -> APIRouter:
     """Build the combined API router."""
     router = APIRouter()
+    router.include_router(health.router)
     router.include_router(me.router)
     router.include_router(bridge.router)
     router.include_router(secrets.router)
