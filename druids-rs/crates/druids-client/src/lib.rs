@@ -1,1 +1,1 @@
-//! Druids client (placeholder).
+//! Druids client (placeholder - to be implemented).

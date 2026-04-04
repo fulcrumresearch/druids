@@ -5,8 +5,24 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
-repository.workspace = true
 
 [dependencies]
 druids-core = { path = "../druids-core" }
+
 sqlx.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+sha2.workspace = true
+aes-gcm = { workspace = true, features = ["std"] }
+base64.workspace = true
+tracing.workspace = true
+rand = "0.8"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+base64 = { workspace = true }

@@ -1,1 +1,1 @@
-//! Druids bridge (placeholder).
+//! Druids bridge (placeholder - to be implemented).

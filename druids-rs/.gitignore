@@ -1,19 +1,21 @@
-# Rust build artifacts
+# Rust
 /target/
-**/target/
+**/*.rs.bk
+*.pdb
 
-# Cargo lock file (workspace has it, but library crates don't)
+# Cargo
 Cargo.lock
 
-# IDE files
+# SQLx
+.sqlx/
+
+# Environment
+.env
+.env.local
+
+# IDEs
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
-
-# macOS
-.DS_Store
-
-# Environment
-.env

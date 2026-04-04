@@ -1,1 +1,1 @@
-//! Druids runtime (placeholder).
+//! Druids runtime (placeholder - to be implemented).

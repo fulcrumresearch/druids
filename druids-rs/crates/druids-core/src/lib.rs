@@ -11,7 +11,7 @@
 //! - **Agent types**: [`AgentInfo`], [`AgentState`], [`AgentConnection`], [`AgentType`]
 //! - **Event types**: [`TraceEvent`] for execution trace logging
 //! - **Common types**: [`ExecutionId`], [`UserId`], [`Slug`]
-//! - **Error types**: [`ExecutionError`], [`AgentError`], [`ConfigError`]
+//! - **Error types**: [`CoreError`], [`ExecutionError`], [`AgentError`], [`ConfigError`]
 //! - **Configuration**: [`SandboxType`] and config utilities from the config module
 //!
 //! ## Example
@@ -43,6 +43,6 @@ pub mod execution;
 pub use agent::{AgentConnection, AgentInfo, AgentState, AgentType};
 pub use common::{timestamp, ExecutionId, Slug, UserId};
 pub use config::SandboxType;
-pub use error::{AgentError, ConfigError, ExecutionError};
+pub use error::{AgentError, ConfigError, CoreError, ExecutionError};
 pub use events::TraceEvent;
 pub use execution::{ExecutionEdge, ExecutionMetadata, ExecutionRecord, ExecutionState};
