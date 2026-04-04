@@ -9,26 +9,23 @@ use axum::{
     Router,
 };
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::VecDeque,
-    sync::Arc,
-};
-use tokio::sync::RwLock;
+use std::{collections::VecDeque, sync::Arc};
+use tokio::sync::{mpsc, RwLock};
 
 /// Shared state across all handlers.
 #[derive(Clone)]
 pub struct BridgeState {
     pub process: Arc<RwLock<Option<ProcessHandle>>>,
-    pub stdout_buffer: Arc<RwLock<Vec<String>>>,
-    pub stdin_queue: Arc<RwLock<VecDeque<String>>>,
+    pub stdout_buffer: Arc<RwLock<VecDeque<String>>>,
+    pub stdin_sender: Arc<RwLock<Option<mpsc::UnboundedSender<String>>>>,
 }
 
 impl Default for BridgeState {
     fn default() -> Self {
         Self {
             process: Arc::new(RwLock::new(None)),
-            stdout_buffer: Arc::new(RwLock::new(Vec::new())),
-            stdin_queue: Arc::new(RwLock::new(VecDeque::new())),
+            stdout_buffer: Arc::new(RwLock::new(VecDeque::new())),
+            stdin_sender: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -71,6 +68,20 @@ pub struct StatusResponse {
     pub buffer_size: Option<usize>,
 }
 
+/// Request to write to stdin.
+#[derive(Debug, Deserialize)]
+pub struct StdinRequest {
+    pub data: String,
+}
+
+/// Response from stdin endpoint.
+#[derive(Debug, Serialize)]
+pub struct StdinResponse {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// Create the Axum router with all endpoints.
 pub fn create_app() -> Router {
     let state = BridgeState::default();
@@ -79,6 +90,7 @@ pub fn create_app() -> Router {
         .route("/start", post(start_process))
         .route("/stop", post(stop_process))
         .route("/status", get(process_status))
+        .route("/stdin", post(write_stdin))
         .with_state(state)
 }
 
@@ -99,9 +111,8 @@ async fn start_process(
     }
     drop(proc_guard);
 
-    // Clear buffers and queues
+    // Clear buffers
     state.stdout_buffer.write().await.clear();
-    state.stdin_queue.write().await.clear();
 
     // Build config
     let config = AcpConfig {
@@ -111,8 +122,9 @@ async fn start_process(
 
     // Spawn the process
     match crate::process::spawn_acp_process(config, state.clone()).await {
-        Ok(handle) => {
+        Ok((handle, stdin_sender)) => {
             let pid = handle.pid;
+            *state.stdin_sender.write().await = Some(stdin_sender);
             *state.process.write().await = Some(handle);
 
             Ok(Json(StartResponse {
@@ -139,6 +151,9 @@ async fn stop_process(
     let mut proc_guard = state.process.write().await;
 
     if let Some(mut handle) = proc_guard.take() {
+        // Drop stdin sender to close the channel
+        *state.stdin_sender.write().await = None;
+
         // Terminate the process
         if let Err(e) = handle.child.kill().await {
             tracing::warn!("Failed to kill process: {}", e);
@@ -149,6 +164,9 @@ async fn stop_process(
             task.abort();
         }
         if let Some(task) = handle.stdin_task {
+            task.abort();
+        }
+        if let Some(task) = handle.stderr_task {
             task.abort();
         }
 
@@ -186,6 +204,32 @@ async fn process_status(
             pid: None,
             uptime_seconds: None,
             buffer_size: None,
+        }))
+    }
+}
+
+/// POST /stdin - Write data to process stdin.
+async fn write_stdin(
+    State(state): State<BridgeState>,
+    Json(req): Json<StdinRequest>,
+) -> Result<Json<StdinResponse>, StatusCode> {
+    let sender_guard = state.stdin_sender.read().await;
+
+    if let Some(sender) = sender_guard.as_ref() {
+        match sender.send(req.data) {
+            Ok(_) => Ok(Json(StdinResponse {
+                status: "sent".to_string(),
+                error: None,
+            })),
+            Err(e) => Ok(Json(StdinResponse {
+                status: "error".to_string(),
+                error: Some(format!("Failed to send: {}", e)),
+            })),
+        }
+    } else {
+        Ok(Json(StdinResponse {
+            status: "error".to_string(),
+            error: Some("No process running".to_string()),
         }))
     }
 }

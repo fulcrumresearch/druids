@@ -3,8 +3,11 @@
 use crate::app::BridgeState;
 use anyhow::Result;
 use std::time::Instant;
-use tokio::process::{Child, Command};
-use tokio::task::JoinHandle;
+use tokio::{
+    process::{Child, Command},
+    sync::mpsc,
+    task::JoinHandle,
+};
 
 /// Configuration for spawning an ACP process.
 #[derive(Debug, Clone)]
@@ -20,10 +23,15 @@ pub struct ProcessHandle {
     pub started_at: Instant,
     pub stdout_task: Option<JoinHandle<()>>,
     pub stdin_task: Option<JoinHandle<()>>,
+    pub stderr_task: Option<JoinHandle<()>>,
 }
 
 /// Spawn an ACP process with stdout/stdin relay tasks.
-pub async fn spawn_acp_process(config: AcpConfig, state: BridgeState) -> Result<ProcessHandle> {
+/// Returns the process handle and the stdin sender channel.
+pub async fn spawn_acp_process(
+    config: AcpConfig,
+    state: BridgeState,
+) -> Result<(ProcessHandle, mpsc::UnboundedSender<String>)> {
     tracing::info!("Spawning process: {} {:?}", config.command, config.args);
 
     // Spawn the subprocess
@@ -41,7 +49,10 @@ pub async fn spawn_acp_process(config: AcpConfig, state: BridgeState) -> Result<
     // Take ownership of stdio handles
     let stdout = child.stdout.take().expect("Failed to capture stdout");
     let stdin = child.stdin.take().expect("Failed to capture stdin");
-    let _stderr = child.stderr.take(); // Drain stderr to prevent blocking
+    let stderr = child.stderr.take().expect("Failed to capture stderr");
+
+    // Create stdin channel
+    let (stdin_sender, stdin_receiver) = mpsc::unbounded_channel();
 
     // Spawn stdout relay task
     let stdout_task = tokio::spawn(crate::relay::relay_stdout_to_buffer(
@@ -50,16 +61,20 @@ pub async fn spawn_acp_process(config: AcpConfig, state: BridgeState) -> Result<
     ));
 
     // Spawn stdin relay task
-    let stdin_task = tokio::spawn(crate::relay::relay_stdin_from_queue(
-        stdin,
-        state.stdin_queue.clone(),
-    ));
+    let stdin_task = tokio::spawn(crate::relay::relay_stdin_from_channel(stdin, stdin_receiver));
 
-    Ok(ProcessHandle {
-        child,
-        pid,
-        started_at: Instant::now(),
-        stdout_task: Some(stdout_task),
-        stdin_task: Some(stdin_task),
-    })
+    // Spawn stderr drain task
+    let stderr_task = tokio::spawn(crate::relay::drain_stderr(stderr));
+
+    Ok((
+        ProcessHandle {
+            child,
+            pid,
+            started_at: Instant::now(),
+            stdout_task: Some(stdout_task),
+            stdin_task: Some(stdin_task),
+            stderr_task: Some(stderr_task),
+        },
+        stdin_sender,
+    ))
 }
