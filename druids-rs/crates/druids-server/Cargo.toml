@@ -1,0 +1,34 @@
+[package]
+name = "druids-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "druids-server"
+path = "src/main.rs"
+
+[dependencies]
+druids-core = { path = "../druids-core" }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Configuration
+dotenvy = { workspace = true }
+secrecy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Utilities
+url = { workspace = true }
+rand = "0.8"
+base64 = "0.22"
+
+[dev-dependencies]

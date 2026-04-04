@@ -1,0 +1,10 @@
+# Clippy configuration for strict linting
+
+# Deny common issues
+warn-on-all-wildcard-imports = true
+
+# Cognitive complexity threshold
+cognitive-complexity-threshold = 15
+
+# Maximum function length
+too-many-lines-threshold = 150
