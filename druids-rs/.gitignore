@@ -4,7 +4,7 @@
 *.pdb
 
 # Cargo
-Cargo.lock
+# Cargo.lock is tracked for binary crates
 
 # Environment
 .env

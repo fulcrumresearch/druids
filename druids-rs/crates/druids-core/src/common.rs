@@ -175,3 +175,26 @@ mod tests {
         assert!(diff < 1000);
     }
 }
+
+/// Git access mode for agents
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GitMode {
+    Read,
+    Write,
+    Post,
+}
+
+/// Result of executing a command on an agent VM
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecResult {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl ExecResult {
+    pub fn ok(&self) -> bool {
+        self.exit_code == 0
+    }
+}
