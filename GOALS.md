@@ -103,3 +103,6 @@ As work progresses, check off capabilities that have been verified working in th
 - [x] ServerConfig.validate() rejects API keys not starting with "sk-ant-" and Fernet keys != 44 chars
 - [x] Database URL password is masked in Display output (user:****@host format)
 - [x] ConfigError implements From<dotenvy::Error> routing IO errors to IoError and other variants to EnvFileError
+
+## Rust Core Types (druids-core)
+- [x] ExecutionRecordBuilder.build() fails with an error if `spec` is not provided — no silent empty-string fallback
