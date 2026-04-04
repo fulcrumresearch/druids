@@ -86,3 +86,12 @@ As work progresses, check off capabilities that have been verified working in th
 ## Build Quality Gates
 - [x] `cargo clippy --workspace --all-targets --all-features -- -D warnings` passes with no warnings
 - [x] druids-server/src/lib.rs uses `pub mod api` (no wildcard re-exports)
+
+## Configuration System
+- [x] Rust workspace compiles cleanly with 6 crates: druids-core, druids-server, druids-client, druids-runtime, druids-bridge, druids-db
+- [x] Secret<T> wrapper redacts sensitive values in Debug/Display while serializing correctly for config files
+- [x] ServerConfig.anthropic_api_key is Option<SecretString>; None is the true absent value; validation rejects None at startup
+- [x] ServerConfig loads from DRUIDS_-prefixed env vars, auto-generates secret_key and forwarding_token_secret when absent
+- [x] ClientConfig resolves settings in priority order: env vars > ~/.druids/config.json > defaults; saves config files with 600 permissions
+- [x] SandboxType enum supports Docker and MorphCloud variants with serde serialization and FromStr parsing
+- [x] generate_random_secret uses RandomState with multiple entropy sources; documented as non-cryptographic fallback
