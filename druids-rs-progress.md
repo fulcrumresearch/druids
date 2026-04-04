@@ -16,7 +16,7 @@ Translating the Druids multi-agent orchestration system from Python to Rust for 
 | Project Scaffold | worker-1 | ✅ Complete | factory/scaffold-1 | Cargo workspace, CI/CD, 6 crates created |
 | Core Types | worker-2 | ⏳ In Progress | - | Execution, Agent, Event types |
 | Database Layer | worker-3 | ⏳ In Progress | - | SQLx, migrations, models |
-| Config System | worker-4 | ⏳ In Progress | - | Server & client configuration |
+| Config System | worker-4 | ✅ Complete | factory/config-system-4 | ServerConfig, ClientConfig, Secret<T> wrapper |
 
 ### Completed Deliverables
 
@@ -26,6 +26,15 @@ Translating the Druids multi-agent orchestration system from Python to Rust for 
 - ✅ GitHub Actions CI/CD (test, clippy, fmt)
 - ✅ Strict clippy configuration
 - ✅ All quality gates passing
+
+**worker-4 (config-system)**:
+- ✅ `Secret<T>` wrapper with redacted Debug output
+- ✅ `ServerConfig` with DRUIDS_ env prefix loading
+- ✅ `ClientConfig` with ~/.druids/config.json support
+- ✅ Config priority resolution (env > file > defaults)
+- ✅ `SandboxType` enum for Docker/MorphCloud
+- ✅ No secrets in logs, secure memory handling
+- ✅ Improved entropy sources for secret generation
 
 ### Pending Work
 
@@ -42,12 +51,6 @@ Translating the Druids multi-agent orchestration system from Python to Rust for 
 - Database models for User, Execution, Devbox, Secret, Program
 - Connection pool management
 - Query builders
-
-**worker-4 (config-system)** - Expected deliverables:
-- ServerConfig with env var loading
-- ClientConfig with JSON file support
-- Config validation
-- Secrets management
 
 ## Next Phase Preparation
 

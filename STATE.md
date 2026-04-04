@@ -14,13 +14,12 @@ Translating Druids (Python multi-agent orchestration system) to Rust end-to-end.
 ## Active Work
 
 **Phase**: Phase 1 - Foundation
-**Active Workers**: 3
+**Active Workers**: 2
 
 - **worker-2 (core-types)**: Implementing shared types in `druids-core` (execution, agent, event models)
 - **worker-3 (database-layer)**: Building SQLx database layer in `druids-db` with migrations
-- **worker-4 (config-system)**: Configuration management for server and client
 
-Waiting for remaining workers to complete Phase 1 tasks before moving to Phase 2.
+Waiting for final 2 workers to complete Phase 1 before moving to Phase 2.
 
 ## Completed Work
 
@@ -30,6 +29,16 @@ Waiting for remaining workers to complete Phase 1 tasks before moving to Phase 2
 - Configured strict clippy linting
 - All build quality gates passing
 - Merged via PR from branch `factory/scaffold-1`
+
+### Phase 1.4 - Configuration System ✅
+- **worker-4**: Implemented configuration management
+- `Secret<T>` wrapper for sensitive data with redacted Debug
+- `ServerConfig` with environment variable loading and validation
+- `ClientConfig` with priority resolution (env > file > defaults)
+- `SandboxType` enum (Docker, MorphCloud)
+- Proper secret handling (no logging, secure memory)
+- Fixed fake defaults, improved entropy sources
+- Merged via PR from branch `factory/config-system-4`
 
 ## Architecture Analysis
 
