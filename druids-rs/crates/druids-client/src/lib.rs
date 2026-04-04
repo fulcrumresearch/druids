@@ -1,0 +1,1 @@
+//! Druids client (placeholder).
