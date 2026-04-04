@@ -1,215 +1,242 @@
-//! Server configuration
+//! Server configuration management.
 //!
-//! Configuration is loaded from environment variables with the DRUIDS_ prefix.
-//! Required settings must be provided, while optional settings have defaults.
+//! Configuration is loaded from environment variables with the `DRUIDS_` prefix.
+//! Settings can also be loaded from a `.env` file using dotenvy.
 
-use druids_core::config::secrets::SecretString;
-use druids_core::config::SandboxType;
-use druids_core::{Error, Result};
+use druids_core::{ConfigError, SandboxType};
+use secrecy::{ExposeSecret, SecretString};
 use std::env;
+use std::path::PathBuf;
+use std::str::FromStr;
+use url::Url;
 
-/// Server configuration
+/// Server configuration.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
-    // Server
+    /// Server host to bind to.
     pub host: String,
-    pub port: u16,
-    pub base_url: String,
 
-    // Database
+    /// Server port.
+    pub port: u16,
+
+    /// Base URL for the server (used in responses and redirects).
+    pub base_url: Url,
+
+    /// Database connection URL.
     pub database_url: String,
 
-    // Sandbox
+    /// Sandbox backend type.
     pub sandbox_type: SandboxType,
 
-    // Docker (when sandbox_type = Docker)
+    /// Docker image to use for agent sandboxes (when sandbox_type=Docker).
     pub docker_image: String,
+
+    /// Docker container ID to attach to (optional, for single-container mode).
     pub docker_container_id: Option<String>,
+
+    /// Docker host for SSH/HTTP access to containers.
     pub docker_host: String,
 
-    // Encryption (for secrets in database)
+    /// Encryption key for secrets stored in the database (Fernet-compatible).
     pub secret_key: SecretString,
 
-    // API Keys
-    pub anthropic_api_key: Option<SecretString>,
+    /// Anthropic API key.
+    pub anthropic_api_key: SecretString,
+
+    /// Token secret for forwarding tokens.
     pub forwarding_token_secret: SecretString,
+
+    /// OpenAI API key (optional).
     pub openai_api_key: Option<SecretString>,
+
+    /// GitHub PAT for cloning repos and pushing branches (optional).
     pub github_pat: Option<SecretString>,
 
-    // Execution limits
+    /// Maximum execution TTL in seconds (0 = no limit).
     pub max_execution_ttl: u64,
 }
 
 impl ServerConfig {
-    /// Load configuration from environment variables
-    pub fn from_env() -> Result<Self> {
-        // Load .env file if present
-        dotenvy::dotenv().ok();
+    /// Load server configuration from environment variables.
+    ///
+    /// Reads from environment variables with the `DRUIDS_` prefix.
+    /// Optionally loads from a `.env` file if `env_file` is provided.
+    pub fn load(env_file: Option<PathBuf>) -> Result<Self, ConfigError> {
+        // Load .env file if provided
+        if let Some(path) = env_file {
+            dotenvy::from_path(path)?;
+        } else {
+            // Try loading from default .env location
+            let _ = dotenvy::dotenv();
+        }
 
-        let config = ServerConfig {
-            // Server settings
-            host: env::var("DRUIDS_HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
-            port: env::var("DRUIDS_PORT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(8000),
-            base_url: env::var("DRUIDS_BASE_URL")
-                .unwrap_or_else(|_| "http://localhost:8000".to_string()),
+        // Required fields
+        let anthropic_api_key = get_secret_env("ANTHROPIC_API_KEY")
+            .ok_or_else(|| ConfigError::MissingRequired("ANTHROPIC_API_KEY".to_string()))?;
 
-            // Database
-            database_url: env::var("DRUIDS_DATABASE_URL")
-                .unwrap_or_else(|_| "sqlite://druids.db".to_string()),
+        // Optional fields with defaults
+        let host = get_env("DRUIDS_HOST").unwrap_or_else(|| "0.0.0.0".to_string());
+        let port = get_env("DRUIDS_PORT")
+            .map(|s| s.parse().map_err(|_| ConfigError::InvalidValue {
+                field: "DRUIDS_PORT".to_string(),
+                message: "must be a valid port number".to_string(),
+            }))
+            .transpose()?
+            .unwrap_or(8000);
 
-            // Sandbox
-            sandbox_type: env::var("DRUIDS_SANDBOX_TYPE")
-                .ok()
-                .map(|s| s.parse())
-                .transpose()?
-                .unwrap_or_default(),
+        let base_url = get_env("DRUIDS_BASE_URL")
+            .unwrap_or_else(|| "http://localhost:8000".to_string());
+        let base_url = Url::parse(&base_url).map_err(|e| ConfigError::InvalidValue {
+            field: "DRUIDS_BASE_URL".to_string(),
+            message: format!("invalid URL: {}", e),
+        })?;
 
-            // Docker
-            docker_image: env::var("DRUIDS_DOCKER_IMAGE").unwrap_or_else(|_| {
-                "ghcr.io/fulcrumresearch/druids-base:latest".to_string()
-            }),
-            docker_container_id: env::var("DRUIDS_DOCKER_CONTAINER_ID").ok(),
-            docker_host: env::var("DRUIDS_DOCKER_HOST")
-                .unwrap_or_else(|_| "localhost".to_string()),
+        let database_url = get_env("DRUIDS_DATABASE_URL")
+            .unwrap_or_else(|| "sqlite+aiosqlite:///druids.db".to_string());
 
-            // Secrets
-            secret_key: Self::load_or_generate_secret("DRUIDS_SECRET_KEY")?,
-            forwarding_token_secret: Self::load_or_generate_secret(
-                "DRUIDS_FORWARDING_TOKEN_SECRET",
-            )?,
+        let sandbox_type = get_env("DRUIDS_SANDBOX_TYPE")
+            .map(|s| SandboxType::from_str(&s))
+            .transpose()?
+            .unwrap_or(SandboxType::Docker);
 
-            // API Keys
-            anthropic_api_key: env::var("ANTHROPIC_API_KEY").ok().map(SecretString::new),
-            openai_api_key: env::var("OPENAI_API_KEY").ok().map(SecretString::new),
-            github_pat: env::var("GITHUB_PAT").ok().map(SecretString::new),
+        let docker_image = get_env("DRUIDS_DOCKER_IMAGE")
+            .unwrap_or_else(|| "ghcr.io/fulcrumresearch/druids-base:latest".to_string());
+        let docker_container_id = get_env("DRUIDS_DOCKER_CONTAINER_ID");
+        let docker_host = get_env("DRUIDS_DOCKER_HOST")
+            .unwrap_or_else(|| "localhost".to_string());
 
-            // Execution limits
-            max_execution_ttl: env::var("DRUIDS_MAX_EXECUTION_TTL")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(86400), // 24 hours
-        };
+        // Secrets with auto-generation
+        let secret_key = get_secret_env("DRUIDS_SECRET_KEY")
+            .unwrap_or_else(|| SecretString::new(generate_fernet_key()));
 
-        config.validate()?;
-        Ok(config)
-    }
+        let forwarding_token_secret = get_secret_env("FORWARDING_TOKEN_SECRET")
+            .unwrap_or_else(|| SecretString::new(generate_random_secret()));
 
-    /// Load a secret from env or generate a random one
-    fn load_or_generate_secret(env_var: &str) -> Result<SecretString> {
-        Ok(match env::var(env_var) {
-            Ok(val) => SecretString::new(val),
-            Err(_) => {
-                let secret = druids_core::config::loader::generate_random_secret();
-                tracing::warn!(
-                    "{} not set, generated random secret (will be different on restart)",
-                    env_var
-                );
-                SecretString::new(secret)
-            }
+        let openai_api_key = get_secret_env("OPENAI_API_KEY");
+        let github_pat = get_secret_env("GITHUB_PAT");
+
+        let max_execution_ttl = get_env("DRUIDS_MAX_EXECUTION_TTL")
+            .map(|s| s.parse().map_err(|_| ConfigError::InvalidValue {
+                field: "DRUIDS_MAX_EXECUTION_TTL".to_string(),
+                message: "must be a valid number of seconds".to_string(),
+            }))
+            .transpose()?
+            .unwrap_or(86400); // 24 hours
+
+        Ok(ServerConfig {
+            host,
+            port,
+            base_url,
+            database_url,
+            sandbox_type,
+            docker_image,
+            docker_container_id,
+            docker_host,
+            secret_key,
+            anthropic_api_key,
+            forwarding_token_secret,
+            openai_api_key,
+            github_pat,
+            max_execution_ttl,
         })
     }
 
-    /// Validate the configuration
-    fn validate(&self) -> Result<()> {
-        // Validate port
-        if self.port == 0 {
-            return Err(Error::validation("port must be non-zero"));
+    /// Validate the configuration.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        // Validate Anthropic API key format
+        let api_key = self.anthropic_api_key.expose_secret();
+        if !api_key.starts_with("sk-ant-") {
+            return Err(ConfigError::InvalidValue {
+                field: "ANTHROPIC_API_KEY".to_string(),
+                message: "must start with 'sk-ant-'".to_string(),
+            });
         }
 
-        // Validate database URL
-        if self.database_url.is_empty() {
-            return Err(Error::validation("database_url cannot be empty"));
-        }
-
-        // Validate base URL
-        if self.base_url.is_empty() {
-            return Err(Error::validation("base_url cannot be empty"));
-        }
-
-        // Validate required API key
-        if self.anthropic_api_key.is_none() {
-            return Err(Error::validation("ANTHROPIC_API_KEY is required"));
+        // Validate Fernet key format (must be 44 characters base64)
+        let secret_key = self.secret_key.expose_secret();
+        if secret_key.len() != 44 {
+            return Err(ConfigError::InvalidValue {
+                field: "DRUIDS_SECRET_KEY".to_string(),
+                message: "must be a valid Fernet key (44 base64 characters)".to_string(),
+            });
         }
 
         Ok(())
     }
 }
 
-impl Default for ServerConfig {
-    fn default() -> Self {
-        ServerConfig {
-            host: "0.0.0.0".to_string(),
-            port: 8000,
-            base_url: "http://localhost:8000".to_string(),
-            database_url: "sqlite://druids.db".to_string(),
-            sandbox_type: SandboxType::default(),
-            docker_image: "ghcr.io/fulcrumresearch/druids-base:latest".to_string(),
-            docker_container_id: None,
-            docker_host: "localhost".to_string(),
-            secret_key: SecretString::new(
-                druids_core::config::loader::generate_random_secret(),
-            ),
-            anthropic_api_key: None,
-            forwarding_token_secret: SecretString::new(
-                druids_core::config::loader::generate_random_secret(),
-            ),
-            openai_api_key: None,
-            github_pat: None,
-            max_execution_ttl: 86400,
+impl std::fmt::Display for ServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Server Configuration:")?;
+        writeln!(f, "  Host: {}", self.host)?;
+        writeln!(f, "  Port: {}", self.port)?;
+        writeln!(f, "  Base URL: {}", self.base_url)?;
+        writeln!(f, "  Database: {}", mask_database_url(&self.database_url))?;
+        writeln!(f, "  Sandbox Type: {}", self.sandbox_type)?;
+        writeln!(f, "  Docker Image: {}", self.docker_image)?;
+        if let Some(ref id) = self.docker_container_id {
+            writeln!(f, "  Docker Container ID: {}", id)?;
+        }
+        writeln!(f, "  Docker Host: {}", self.docker_host)?;
+        writeln!(f, "  Secret Key: [REDACTED]")?;
+        writeln!(f, "  Anthropic API Key: [REDACTED]")?;
+        writeln!(f, "  Forwarding Token Secret: [REDACTED]")?;
+        if self.openai_api_key.is_some() {
+            writeln!(f, "  OpenAI API Key: [REDACTED]")?;
+        }
+        if self.github_pat.is_some() {
+            writeln!(f, "  GitHub PAT: [REDACTED]")?;
+        }
+        writeln!(f, "  Max Execution TTL: {} seconds", self.max_execution_ttl)?;
+        Ok(())
+    }
+}
+
+/// Get an environment variable value.
+fn get_env(key: &str) -> Option<String> {
+    env::var(key).ok().filter(|s| !s.is_empty())
+}
+
+/// Get a secret environment variable as SecretString.
+fn get_secret_env(key: &str) -> Option<SecretString> {
+    get_env(key).map(SecretString::new)
+}
+
+/// Generate a random 32-byte hex secret.
+fn generate_random_secret() -> String {
+    use std::fmt::Write;
+    let bytes: [u8; 32] = rand::random();
+    let mut s = String::with_capacity(64);
+    for byte in &bytes {
+        write!(&mut s, "{:02x}", byte).unwrap();
+    }
+    s
+}
+
+/// Generate a Fernet-compatible encryption key.
+fn generate_fernet_key() -> String {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    let bytes: [u8; 32] = rand::random();
+    STANDARD.encode(bytes)
+}
+
+/// Mask password in database URL for safe display.
+fn mask_database_url(url: &str) -> String {
+    if let Some(idx) = url.find("://") {
+        let after_scheme = &url[idx + 3..];
+        if let Some(at_idx) = after_scheme.find('@') {
+            let before_at = &after_scheme[..at_idx];
+            if let Some(colon_idx) = before_at.find(':') {
+                let username = &before_at[..colon_idx];
+                let after_at = &after_scheme[at_idx..];
+                return format!("{}://{}:****{}", &url[..idx], username, after_at);
+            }
         }
     }
+    url.to_string()
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::env;
-
-    #[test]
-    fn test_default_config() {
-        let config = ServerConfig::default();
-        assert_eq!(config.host, "0.0.0.0");
-        assert_eq!(config.port, 8000);
-        assert_eq!(config.sandbox_type, SandboxType::Docker);
-    }
-
-    #[test]
-    fn test_load_from_env() {
-        env::set_var("DRUIDS_PORT", "9000");
-        env::set_var("ANTHROPIC_API_KEY", "test-key");
-
-        let config = ServerConfig::from_env().unwrap();
-        assert_eq!(config.port, 9000);
-        assert_eq!(
-            config.anthropic_api_key.as_ref().unwrap().expose(),
-            "test-key"
-        );
-
-        env::remove_var("DRUIDS_PORT");
-        env::remove_var("ANTHROPIC_API_KEY");
-    }
-
-    #[test]
-    fn test_validation_missing_anthropic_key() {
-        let mut config = ServerConfig::default();
-        config.anthropic_api_key = None;
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn test_validation_zero_port() {
-        let mut config = ServerConfig::default();
-        config.port = 0;
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn test_validation_empty_database_url() {
-        let mut config = ServerConfig::default();
-        config.database_url = String::new();
-        assert!(config.validate().is_err());
-    }
-}
+#[path = "config/tests.rs"]
+mod tests;

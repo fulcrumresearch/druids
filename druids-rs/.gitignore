@@ -2,7 +2,13 @@
 /target/
 **/*.rs.bk
 *.pdb
+
+# Cargo
 Cargo.lock
+
+# Environment
+.env
+.env.local
 
 # IDE
 .idea/

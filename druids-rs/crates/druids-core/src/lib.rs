@@ -1,4 +1,6 @@
-//! Core types and utilities shared across all Druids components.
+//! Druids core types and utilities.
+//!
+//! This crate contains shared types used across all Druids components.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -7,7 +9,7 @@ use uuid::Uuid;
 pub mod config;
 pub mod error;
 
-pub use config::SandboxType;
+pub use config::{ConfigError, SandboxType};
 pub use error::{Error, Result};
 
 /// Execution slug identifier.
