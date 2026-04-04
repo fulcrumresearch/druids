@@ -122,3 +122,6 @@ As work progresses, check off capabilities that have been verified working in th
 - [x] druids-bridge exposes POST /stdin accepting {"data": "string"} and routing through the mpsc channel
 - [x] druids-bridge ProcessHandle tracks stdout_task, stdin_task, and stderr_task; all three are aborted on stop
 - [x] druids-bridge stdin_sender is cleared (set to None) before killing the process on stop, closing the channel cleanly
+
+## HTTP Client (druids-client)
+- [x] druids-client has no wildcard imports anywhere: client.rs, tests.rs, and lib.rs all use explicit named imports/re-exports
