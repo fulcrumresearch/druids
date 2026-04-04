@@ -3,7 +3,6 @@
 #[cfg(test)]
 mod tests {
     use crate::client::DruidsClient;
-    use crate::types::*;
     use mockito::{Matcher, Server};
     use std::collections::HashMap;
     use url::Url;

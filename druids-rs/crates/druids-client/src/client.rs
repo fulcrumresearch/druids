@@ -4,7 +4,14 @@ use crate::config::ClientConfig;
 use crate::error::{ClientError, Result};
 use crate::retry::RetryPolicy;
 use crate::streaming::{stream_execution, ActivityEvent};
-use crate::types::*;
+use crate::types::{
+    CallToolRequest, CallToolResponse, ChatMessageRequest, ChatMessageResponse,
+    CreateExecutionRequest, CreateExecutionResponse, DeleteSecretRequest, DevboxSummary,
+    Execution, ExecutionActivityResponse, ExecutionDiffResponse, ExecutionSummary,
+    ListDevboxesResponse, ListExecutionsResponse, ListSecretsResponse, ListToolsResponse,
+    SecretInfo, SetSecretsRequest, SetSecretsResponse, SetupFinishRequest, SetupStartRequest,
+    SshCredentialsResponse, UpdateExecutionRequest,
+};
 use futures::stream::Stream;
 use reqwest::{Client, Method, RequestBuilder, Response, StatusCode};
 use serde::de::DeserializeOwned;
