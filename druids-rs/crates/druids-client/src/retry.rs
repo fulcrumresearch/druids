@@ -65,12 +65,16 @@ impl RetryPolicy {
         let mut attempts = 0;
         let max_retries = self.max_retries;
 
+        let mut last_error_message = String::new();
+
         let result = retry(backoff, || async {
             attempts += 1;
 
             match operation().await {
                 Ok(value) => Ok(value),
                 Err(e) => {
+                    last_error_message = e.to_string();
+
                     // Check if we should retry
                     if attempts >= max_retries {
                         return Err(backoff::Error::Permanent(e));
@@ -92,7 +96,17 @@ impl RetryPolicy {
 
         match result {
             Ok(value) => Ok(value),
-            Err(e) => Err(ClientError::Http(e)),
+            Err(e) => {
+                // If retries were exhausted (attempts >= max_retries), return RetryExhausted
+                if attempts >= max_retries {
+                    Err(ClientError::RetryExhausted {
+                        attempts,
+                        message: last_error_message,
+                    })
+                } else {
+                    Err(ClientError::Http(e))
+                }
+            }
         }
     }
 }

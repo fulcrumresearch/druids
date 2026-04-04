@@ -47,8 +47,9 @@ pub use error::{ClientError, Result};
 pub use streaming::{stream_execution, ActivityEvent};
 pub use types::{
     CallToolRequest, CallToolResponse, ChatMessageRequest, ChatMessageResponse,
-    CreateExecutionRequest, CreateExecutionResponse, DevboxSummary, Execution,
-    ExecutionActivityResponse, ExecutionDiffResponse, ExecutionSummary, ListDevboxesResponse,
+    CreateExecutionRequest, CreateExecutionResponse, DeleteSecretRequest, DevboxSummary,
+    Execution, ExecutionActivityResponse, ExecutionDiffResponse, ExecutionEdge,
+    ExecutionSummary, ExposedService, ListDevboxesResponse, ListExecutionsResponse,
     ListSecretsResponse, ListToolsResponse, SecretInfo, SetSecretsRequest, SetSecretsResponse,
     SetupFinishRequest, SetupStartRequest, SshCredentialsResponse, UpdateExecutionRequest,
 };

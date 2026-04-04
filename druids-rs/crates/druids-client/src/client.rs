@@ -79,15 +79,15 @@ impl DruidsClient {
     // ========================================================================
 
     /// Build a request with authorization header.
-    fn request(&self, method: Method, path: &str) -> RequestBuilder {
-        let url = self.base_url.join(path).unwrap();
+    fn request(&self, method: Method, path: &str) -> Result<RequestBuilder> {
+        let url = self.base_url.join(path).map_err(|e| ClientError::UrlParse(e))?;
         let mut req = self.client.request(method, url);
 
         if let Some(ref token) = self.user_access_token {
             req = req.header("Authorization", format!("Bearer {}", token));
         }
 
-        req
+        Ok(req)
     }
 
     /// Execute a request and handle errors.
@@ -156,13 +156,13 @@ impl DruidsClient {
             files,
         };
 
-        let req = self.request(Method::POST, "/api/executions").json(&body);
+        let req = self.request(Method::POST, "/api/executions")?.json(&body);
         self.execute_json(req).await
     }
 
     /// Get execution details by slug.
     pub async fn get_execution(&self, slug: &str) -> Result<Execution> {
-        let req = self.request(Method::GET, &format!("/api/executions/{}", slug));
+        let req = self.request(Method::GET, &format!("/api/executions/{}", slug))?;
 
         match self.execute_json(req).await {
             Ok(exec) => Ok(exec),
@@ -178,7 +178,7 @@ impl DruidsClient {
 
     /// List executions for the current user.
     pub async fn list_executions(&self, active_only: bool) -> Result<Vec<ExecutionSummary>> {
-        let mut req = self.request(Method::GET, "/api/executions");
+        let mut req = self.request(Method::GET, "/api/executions")?;
 
         if !active_only {
             req = req.query(&[("active_only", "false")]);
@@ -196,7 +196,7 @@ impl DruidsClient {
             reason: None,
         };
 
-        let req = self.request(Method::PATCH, &format!("/api/executions/{}", slug)).json(&body);
+        let req = self.request(Method::PATCH, &format!("/api/executions/{}", slug))?.json(&body);
 
         match self.execute_json(req).await {
             Ok(exec) => Ok(exec),
@@ -222,7 +222,7 @@ impl DruidsClient {
         let req = self.request(
             Method::POST,
             &format!("/api/executions/{}/agents/{}/message", execution_slug, agent_name),
-        ).json(&body);
+        )?.json(&body);
 
         match self.execute_json(req).await {
             Ok(resp) => Ok(resp),
@@ -243,7 +243,7 @@ impl DruidsClient {
         n: Option<usize>,
         compact: Option<bool>,
     ) -> Result<ExecutionActivityResponse> {
-        let mut req = self.request(Method::GET, &format!("/api/executions/{}/activity", slug));
+        let mut req = self.request(Method::GET, &format!("/api/executions/{}/activity", slug))?;
 
         if let Some(n) = n {
             req = req.query(&[("n", n.to_string())]);
@@ -270,7 +270,7 @@ impl DruidsClient {
         execution_slug: &str,
         agent: Option<&str>,
     ) -> Result<String> {
-        let mut req = self.request(Method::GET, &format!("/api/executions/{}/diff", execution_slug));
+        let mut req = self.request(Method::GET, &format!("/api/executions/{}/diff", execution_slug))?;
 
         if let Some(agent) = agent {
             req = req.query(&[("agent", agent)]);
@@ -296,7 +296,7 @@ impl DruidsClient {
         execution_slug: &str,
         agent: Option<&str>,
     ) -> Result<SshCredentialsResponse> {
-        let mut req = self.request(Method::GET, &format!("/api/executions/{}/ssh", execution_slug));
+        let mut req = self.request(Method::GET, &format!("/api/executions/{}/ssh", execution_slug))?;
 
         if let Some(agent) = agent {
             req = req.query(&[("agent", agent)]);
@@ -337,7 +337,7 @@ impl DruidsClient {
             disk_mb,
         };
 
-        let req = self.request(Method::POST, "/api/devbox/setup/start").json(&body);
+        let req = self.request(Method::POST, "/api/devbox/setup/start")?.json(&body);
         self.execute_json(req).await
     }
 
@@ -352,13 +352,13 @@ impl DruidsClient {
             repo_full_name,
         };
 
-        let req = self.request(Method::POST, "/api/devbox/setup/finish").json(&body);
+        let req = self.request(Method::POST, "/api/devbox/setup/finish")?.json(&body);
         self.execute_json(req).await
     }
 
     /// List all devboxes for the current user.
     pub async fn list_devboxes(&self) -> Result<Vec<DevboxSummary>> {
-        let req = self.request(Method::GET, "/api/devboxes");
+        let req = self.request(Method::GET, "/api/devboxes")?;
         let response: ListDevboxesResponse = self.execute_json(req).await?;
         Ok(response.devboxes)
     }
@@ -380,7 +380,7 @@ impl DruidsClient {
             secrets,
         };
 
-        let req = self.request(Method::POST, "/api/secrets").json(&body);
+        let req = self.request(Method::POST, "/api/secrets")?.json(&body);
         self.execute_json(req).await
     }
 
@@ -390,7 +390,7 @@ impl DruidsClient {
         devbox_name: Option<String>,
         repo_full_name: Option<String>,
     ) -> Result<Vec<SecretInfo>> {
-        let mut req = self.request(Method::GET, "/api/secrets");
+        let mut req = self.request(Method::GET, "/api/secrets")?;
 
         let mut params = Vec::new();
         if let Some(name) = devbox_name {
@@ -421,7 +421,7 @@ impl DruidsClient {
             name,
         };
 
-        let req = self.request(Method::DELETE, "/api/secrets").json(&body);
+        let req = self.request(Method::DELETE, "/api/secrets")?.json(&body);
         self.execute_json(req).await
     }
 
@@ -438,7 +438,7 @@ impl DruidsClient {
         let req = self.request(
             Method::GET,
             &format!("/api/executions/{}/agents/{}/tools", execution_slug, agent_name),
-        );
+        )?;
 
         let response: ListToolsResponse = match self.execute_json(req).await {
             Ok(resp) => resp,
@@ -470,7 +470,7 @@ impl DruidsClient {
                 "/api/executions/{}/agents/{}/tools/{}",
                 execution_slug, agent_name, tool_name
             ),
-        ).json(&body);
+        )?.json(&body);
 
         let response: CallToolResponse = match self.execute_json(req).await {
             Ok(resp) => resp,

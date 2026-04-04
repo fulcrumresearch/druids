@@ -29,28 +29,22 @@ pub fn stream_execution(
     raw: bool,
 ) -> Pin<Box<dyn Stream<Item = Result<ActivityEvent>> + Send>> {
     Box::pin(stream! {
-        let stream_url = base_url
+        // Build URL with optional raw parameter
+        let mut stream_url = base_url
             .join(&format!("/api/executions/{}/stream", execution_slug))
             .unwrap();
 
+        if raw {
+            stream_url.set_query(Some("raw=true"));
+        }
+
+        // Build SSE client with URL
         let mut client_builder = EventSourceClient::for_url(stream_url.as_str())
             .map_err(|e| ClientError::Stream(format!("failed to create SSE client: {}", e)))?;
 
         // Add authorization header if token is present
-        if let Some(token) = user_access_token {
+        if let Some(ref token) = user_access_token {
             client_builder = client_builder.header("Authorization", &format!("Bearer {}", token))?;
-        }
-
-        // Add raw parameter if requested
-        if raw {
-            let mut url_with_params = stream_url;
-            url_with_params.set_query(Some("raw=true"));
-            client_builder = EventSourceClient::for_url(url_with_params.as_str())
-                .map_err(|e| ClientError::Stream(format!("failed to create SSE client: {}", e)))?;
-
-            if let Some(token) = user_access_token {
-                client_builder = client_builder.header("Authorization", &format!("Bearer {}", token))?;
-            }
         }
 
         let mut stream = client_builder.build();
