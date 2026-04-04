@@ -1,0 +1,27 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+*.pdb
+
+# Cargo lock (libraries should not commit this)
+# We keep it for binaries (server, client, bridge)
+/crates/druids-core/Cargo.lock
+/crates/druids-db/Cargo.lock
+/crates/druids-runtime/Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Environment
+.env
+.env.local
+
+# SQLx offline mode
+.sqlx/
