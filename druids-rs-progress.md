@@ -14,7 +14,7 @@ Translating the Druids multi-agent orchestration system from Python to Rust for 
 | Task | Worker | Status | Branch | Notes |
 |------|--------|--------|--------|-------|
 | Project Scaffold | worker-1 | ✅ Complete | factory/scaffold-1 | Cargo workspace, CI/CD, 6 crates created |
-| Core Types | worker-2 | ⏳ In Progress | - | Execution, Agent, Event types |
+| Core Types | worker-2 | ✅ Complete | factory/core-types-2 | ExecutionRecord, AgentInfo, TraceEvent, errors |
 | Database Layer | worker-3 | ⏳ In Progress | - | SQLx, migrations, models |
 | Config System | worker-4 | ✅ Complete | factory/config-system-4 | ServerConfig, ClientConfig, Secret<T> wrapper |
 
@@ -27,6 +27,14 @@ Translating the Druids multi-agent orchestration system from Python to Rust for 
 - ✅ Strict clippy configuration
 - ✅ All quality gates passing
 
+**worker-2 (core-types)**:
+- ✅ `ExecutionRecord` with builder pattern
+- ✅ `AgentInfo`, `AgentState`, `AgentType` types
+- ✅ `TraceEvent` enum with all variants
+- ✅ Error types (`CoreError`, `ExecutionError`) with thiserror
+- ✅ Full serde serialization support
+- ✅ Builder validates required fields (no fake defaults)
+
 **worker-4 (config-system)**:
 - ✅ `Secret<T>` wrapper with redacted Debug output
 - ✅ `ServerConfig` with DRUIDS_ env prefix loading
@@ -37,13 +45,6 @@ Translating the Druids multi-agent orchestration system from Python to Rust for 
 - ✅ Improved entropy sources for secret generation
 
 ### Pending Work
-
-**worker-2 (core-types)** - Expected deliverables:
-- Execution types (ExecutionRecord, ExecutionState, etc.)
-- Agent types (AgentInfo, AgentState, AgentConnection)
-- Event types (TraceEvent enum with all variants)
-- Error types (thiserror-based)
-- Serialization support (serde)
 
 **worker-3 (database-layer)** - Expected deliverables:
 - SQLx-based database layer

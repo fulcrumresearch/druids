@@ -14,12 +14,11 @@ Translating Druids (Python multi-agent orchestration system) to Rust end-to-end.
 ## Active Work
 
 **Phase**: Phase 1 - Foundation
-**Active Workers**: 2
+**Active Workers**: 1
 
-- **worker-2 (core-types)**: Implementing shared types in `druids-core` (execution, agent, event models)
 - **worker-3 (database-layer)**: Building SQLx database layer in `druids-db` with migrations
 
-Waiting for final 2 workers to complete Phase 1 before moving to Phase 2.
+Waiting for final worker to complete Phase 1, then will spawn Phase 2 & 3 workers.
 
 ## Completed Work
 
@@ -29,6 +28,16 @@ Waiting for final 2 workers to complete Phase 1 before moving to Phase 2.
 - Configured strict clippy linting
 - All build quality gates passing
 - Merged via PR from branch `factory/scaffold-1`
+
+### Phase 1.2 - Core Types ✅
+- **worker-2**: Implemented comprehensive type system in `druids-core`
+- `ExecutionRecord` with builder pattern (validates required fields)
+- `AgentInfo`, `AgentState`, `AgentType` types
+- `TraceEvent` enum with all event variants
+- Error types using `thiserror` (`CoreError`, `ExecutionError`)
+- Full serde serialization support
+- Fixed fake defaults (builder validates required `spec` field)
+- Merged via PR from branch `factory/core-types-2`
 
 ### Phase 1.4 - Configuration System ✅
 - **worker-4**: Implemented configuration management
@@ -269,11 +278,11 @@ Waiting for final 2 workers to complete Phase 1 before moving to Phase 2.
 
 ## Trajectory
 
-**Current**: Phase 1 - Foundation (2 workers active)
+**Current**: Phase 1 - Foundation (1 worker active)
 - ✅ worker-1: Scaffold complete
-- ⏳ worker-2: Core types in progress
+- ✅ worker-2: Core types complete (ExecutionRecord, AgentInfo, TraceEvent, errors)
 - ⏳ worker-3: Database layer in progress
-- ✅ worker-4: Config system complete (fixed merge logic, all 11 tests passing)
+- ✅ worker-4: Config system complete
 
 **Next**: Phase 2 & 3 in parallel (specs ready in `specs/`)
 - Phase 2.1: HTTP Client Library
