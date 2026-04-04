@@ -106,3 +106,7 @@ As work progresses, check off capabilities that have been verified working in th
 
 ## Rust Core Types (druids-core)
 - [x] ExecutionRecordBuilder.build() fails with an error if `spec` is not provided — no silent empty-string fallback
+
+## Database Layer (druids-db)
+- [x] druids-db integration tests compile and pass against a real Postgres database (cargo test --package druids-db -- --ignored)
+- [x] druids-db encryption is documented as AES-256-GCM (not "Fernet-compatible" — Python Fernet uses AES-128-CBC+HMAC-SHA256 and the two formats are not interchangeable)
