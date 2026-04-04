@@ -269,11 +269,11 @@ Waiting for final 2 workers to complete Phase 1 before moving to Phase 2.
 
 ## Trajectory
 
-**Current**: Phase 1 - Foundation (3 workers active)
+**Current**: Phase 1 - Foundation (2 workers active)
 - ✅ worker-1: Scaffold complete
 - ⏳ worker-2: Core types in progress
 - ⏳ worker-3: Database layer in progress
-- ⏳ worker-4: Config system in progress
+- ✅ worker-4: Config system complete (fixed merge logic, all 11 tests passing)
 
 **Next**: Phase 2 & 3 in parallel (specs ready in `specs/`)
 - Phase 2.1: HTTP Client Library
