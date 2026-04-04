@@ -67,6 +67,15 @@ impl From<Error> for ConfigError {
     }
 }
 
+impl From<serde_json::Error> for ConfigError {
+    fn from(err: serde_json::Error) -> Self {
+        ConfigError::InvalidValue {
+            field: "json".to_string(),
+            message: err.to_string(),
+        }
+    }
+}
+
 impl Error {
     /// Create a configuration error
     pub fn config<S: Into<String>>(msg: S) -> Self {

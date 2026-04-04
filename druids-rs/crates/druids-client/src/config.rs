@@ -49,6 +49,7 @@ impl ClientConfig {
     /// 1. Environment variables
     /// 2. Config file (`~/.druids/config.json`)
     /// 3. Defaults
+    #[allow(dead_code)]
     pub fn load() -> Result<Self, ConfigError> {
         let mut config = Self::default();
 
@@ -92,6 +93,7 @@ impl ClientConfig {
     }
 
     /// Save configuration to `~/.druids/config.json`.
+    #[allow(dead_code)]
     pub fn save(&self) -> Result<(), ConfigError> {
         let config_path = get_config_path().ok_or_else(|| {
             ConfigError::InvalidValue {
@@ -127,6 +129,7 @@ impl ClientConfig {
     }
 
     /// Check if the configured server is a local instance.
+    #[allow(dead_code)]
     pub fn is_local_server(&self) -> bool {
         let url = self.base_url.as_str();
         url.contains("://localhost") || url.contains("://127.0.0.1")
@@ -169,6 +172,7 @@ fn get_config_path() -> Option<PathBuf> {
 }
 
 /// Get an environment variable value.
+#[allow(dead_code)]
 fn get_env(key: &str) -> Option<String> {
     env::var(key).ok().filter(|s| !s.is_empty())
 }
@@ -228,9 +232,11 @@ mod tests {
         let config_path = temp_dir.path().join("config.json");
 
         // Create a config
-        let mut config = ClientConfig::default();
-        config.base_url = Url::parse("http://test.example.com").unwrap();
-        config.user_access_token = Some("test-token".to_string());
+        let config = ClientConfig {
+            base_url: Url::parse("http://test.example.com").unwrap(),
+            user_access_token: Some("test-token".to_string()),
+            ..Default::default()
+        };
 
         // Save config
         let content = serde_json::to_string_pretty(&SavedConfig {
