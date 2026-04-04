@@ -185,3 +185,248 @@ Split when a function has distinct phases or when readability suffers. If you ad
 ### Error Handling
 
 Do not catch exceptions just to log and re-raise. `try`/`except` only when an error is an unmovable part of some API; do not use them superfluously. Broad `except Exception` only at true API boundaries and must include a comment. Do not use bare `assert` in production code. Never expose internal error details in HTTP responses; log server-side and return a generic message.
+
+
+---
+
+## Rust Translation Conventions
+
+This section applies to the Rust implementation being developed in parallel with the Python codebase.
+
+### Project Structure
+
+Use a Cargo workspace with separate crates for each component:
+
+```
+druids-rs/
+├── Cargo.toml              # workspace root
+├── crates/
+│   ├── druids-server/      # server binary
+│   ├── druids-client/      # CLI binary and client library
+│   ├── druids-runtime/     # program runtime SDK
+│   ├── druids-bridge/      # agent bridge
+│   ├── druids-core/        # shared types and utilities
+│   └── druids-db/          # database layer
+```
+
+### Rust Version
+
+Rust 2021 edition, MSRV 1.75+. Use modern idioms: `async`/`await`, `?` operator, pattern matching.
+
+### Dependencies
+
+**Core**:
+- `tokio` - async runtime (full features)
+- `serde` / `serde_json` - serialization
+- `anyhow` / `thiserror` - error handling
+- `tracing` / `tracing-subscriber` - structured logging
+
+**Server**:
+- `axum` - web framework
+- `sqlx` - database (async, compile-time checked queries)
+- `tower` / `tower-http` - middleware
+- `axum-extra` - SSE support
+
+**Client**:
+- `clap` - CLI parsing (derive API)
+- `reqwest` - HTTP client
+- `tokio-tungstenite` - WebSocket client
+
+**Database**:
+- `sqlx` with `postgres` feature
+- Migrations via `sqlx-cli`
+
+### Naming Conventions
+
+Follow Rust standard library conventions:
+- Types: `PascalCase` (e.g., `ExecutionState`, `AgentConnection`)
+- Functions/methods: `snake_case` (e.g., `create_execution`, `send_message`)
+- Constants: `SCREAMING_SNAKE_CASE` (e.g., `DEFAULT_PORT`)
+- Modules: `snake_case` (e.g., `execution_engine`, `sandbox_manager`)
+
+Use the same verb prefixes as Python:
+- `get_*` - retrieve existing, returns `Option<T>`
+- `create_*` - create and persist (async I/O)
+- `make_*` - construct in memory
+- `ensure_*` - get or create
+- `start_*` / `stop_*` - lifecycle management
+- `send_*` - transmit over connection
+- `is_*` / `has_*` - boolean predicates
+
+### Type Design
+
+**Error Handling**:
+- Use `Result<T, E>` for fallible operations
+- Define error types with `thiserror`:
+  ```rust
+  #[derive(Debug, thiserror::Error)]
+  pub enum ExecutionError {
+      #[error("execution {0} not found")]
+      NotFound(String),
+      #[error("database error: {0}")]
+      Database(#[from] sqlx::Error),
+  }
+  ```
+- Use `anyhow::Result` in application code (binaries), `Result<T, SpecificError>` in library code
+
+**Optional Values**:
+- Use `Option<T>` for values that may be absent
+- Never use sentinel values (empty strings, 0, etc.) to represent "not set"
+- Prefer explicit `None` over default values
+
+**Serialization**:
+- Use `serde` derive macros: `#[derive(Serialize, Deserialize)]`
+- Use `#[serde(rename_all = "snake_case")]` for consistent JSON
+- Use `#[serde(skip_serializing_if = "Option::is_none")]` for optional fields
+
+### Async Patterns
+
+**Runtime**:
+- Use `tokio` as the async runtime
+- Annotate async functions with `#[tokio::main]` (binaries) or `#[tokio::test]` (tests)
+
+**Concurrency**:
+- Use `tokio::spawn` for concurrent tasks
+- Use `tokio::select!` for multiplexing futures
+- Use `tokio::sync` primitives (Mutex, RwLock, mpsc) for coordination
+- Prefer message passing (channels) over shared state
+
+**Cancellation**:
+- Use `tokio::select!` with cancellation tokens
+- Implement `Drop` for cleanup when tasks are cancelled
+
+### Database Layer
+
+**SQLx**:
+- Use compile-time checked queries: `sqlx::query!` and `sqlx::query_as!`
+- Prepare database with `DATABASE_URL` env var and `sqlx db create && sqlx migrate run`
+- Store migrations in `crates/druids-db/migrations/`
+
+**Transactions**:
+```rust
+let mut tx = pool.begin().await?;
+// ... operations
+tx.commit().await?;
+```
+
+**Connection Pooling**:
+```rust
+let pool = sqlx::PgPool::connect(&database_url).await?;
+```
+
+### API Design (Axum)
+
+**Route Handlers**:
+```rust
+async fn create_execution(
+    State(state): State<AppState>,
+    Json(req): Json<CreateExecutionRequest>,
+) -> Result<Json<ExecutionResponse>, ExecutionError> {
+    // implementation
+}
+```
+
+**State Management**:
+```rust
+#[derive(Clone)]
+struct AppState {
+    db: PgPool,
+    config: Arc<Config>,
+}
+```
+
+**Error Responses**:
+- Implement `IntoResponse` for error types
+- Return appropriate HTTP status codes
+- Include resource identifiers in error messages
+
+### Configuration
+
+Use `config` crate or environment variables:
+```rust
+#[derive(serde::Deserialize)]
+struct Config {
+    #[serde(default = "default_port")]
+    port: u16,
+    database_url: String,
+    anthropic_api_key: String,
+}
+```
+
+### Testing
+
+**Unit Tests**:
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_create_execution() {
+        // test implementation
+    }
+}
+```
+
+**Integration Tests**:
+- Place in `tests/` directory
+- Use test fixtures for database setup
+- Clean up resources in test teardown
+
+### Documentation
+
+- Use `///` doc comments for public items
+- Use `//!` for module-level documentation
+- Include examples in doc comments:
+  ```rust
+  /// Creates a new execution.
+  ///
+  /// # Examples
+  ///
+  /// ```
+  /// let execution = create_execution(slug, user_id).await?;
+  /// ```
+  pub async fn create_execution(slug: String, user_id: String) -> Result<Execution> {
+      // implementation
+  }
+  ```
+
+### Code Organization
+
+**Module Privacy**:
+- Make items `pub` only when necessary
+- Use `pub(crate)` for internal APIs
+- Re-export public APIs through `mod.rs`
+
+**Imports**:
+- Group imports: std library, external crates, internal modules
+- Use `use` statements, not `fully::qualified::paths` in code
+
+### Performance
+
+- Use `Arc` for shared immutable state
+- Use `Cow` for potentially owned data
+- Avoid unnecessary clones; prefer references
+- Use `&str` in function signatures, `String` for owned data
+- Profile before optimizing
+
+### Common Patterns
+
+**Builder Pattern**:
+```rust
+let execution = Execution::builder()
+    .slug(slug)
+    .user_id(user_id)
+    .build()?;
+```
+
+**Newtype Pattern**:
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionSlug(String);
+```
+
+**Trait Objects**:
+```rust
+Box<dyn Sandbox>  // when you need dynamic dispatch
+```
