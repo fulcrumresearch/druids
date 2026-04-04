@@ -82,3 +82,7 @@ This file tracks capabilities that must continue working as the Python codebase 
 ---
 
 As work progresses, check off capabilities that have been verified working in the Rust implementation.
+
+## Build Quality Gates
+- [x] `cargo clippy --workspace --all-targets --all-features -- -D warnings` passes with no warnings
+- [x] druids-server/src/lib.rs uses `pub mod api` (no wildcard re-exports)
