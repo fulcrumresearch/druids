@@ -257,7 +257,7 @@ impl ExecutionRecordBuilder {
         let id = self.id.unwrap_or_default();
         let slug = self.slug.ok_or("slug is required")?;
         let user_id = self.user_id.ok_or("user_id is required")?;
-        let spec = self.spec.unwrap_or_default();
+        let spec = self.spec.ok_or("spec is required")?;
         let status = self.status.unwrap_or(ExecutionState::Starting);
         let started_at = self.started_at.unwrap_or_else(Utc::now);
 
