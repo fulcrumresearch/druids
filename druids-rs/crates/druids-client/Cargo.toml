@@ -11,6 +11,7 @@ name = "druids"
 path = "src/main.rs"
 
 [dependencies]
+# Core dependencies
 druids-core = { path = "../druids-core" }
 
 # Async runtime
@@ -18,22 +19,32 @@ tokio = { workspace = true }
 
 # HTTP client
 reqwest = { workspace = true }
+url = "2.5"
 
-# Configuration
+# Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# SSE streaming
+eventsource-client = "0.13"
+futures = "0.3"
+async-stream = "0.3"
+
+# Configuration
 dotenvy = { workspace = true }
+dirs = "5.0"
 
 # CLI
 clap = { workspace = true }
 
-# Error handling
-anyhow = { workspace = true }
-thiserror = { workspace = true }
-
-# Utilities
-url = { workspace = true }
-dirs = "5.0"
+# Retry logic
+backoff = { version = "0.4", features = ["tokio"] }
 
 [dev-dependencies]
-tempfile = "3.12"
+mockito = "1.5"
+tokio-test = "0.4"
+tempfile = "3.13"
