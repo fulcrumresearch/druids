@@ -2,11 +2,11 @@
 resolver = "2"
 members = [
     "crates/druids-core",
-    "crates/druids-db",
     "crates/druids-server",
     "crates/druids-client",
     "crates/druids-runtime",
     "crates/druids-bridge",
+    "crates/druids-db",
 ]
 
 [workspace.package]
@@ -17,8 +17,9 @@ authors = ["Druids Contributors"]
 license = "MIT"
 
 [workspace.dependencies]
-# Core async runtime
+# Async runtime
 tokio = { version = "1.41", features = ["full"] }
+tokio-util = "0.7"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -33,10 +34,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Web framework
-axum = "0.7"
-axum-extra = { version = "0.9", features = ["typed-header"] }
+axum = "0.8"
+axum-extra = { version = "0.10", features = ["typed-header"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["fs", "trace", "cors"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
 
 # HTTP client
 reqwest = { version = "0.12", features = ["json", "stream"] }
@@ -45,25 +46,32 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 tokio-tungstenite = "0.24"
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "migrate", "macros", "chrono", "uuid"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "migrate", "macros", "chrono", "uuid", "json"] }
 
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }
 
-# Utilities
-uuid = { version = "1.11", features = ["v4", "serde"] }
+# Configuration
+dotenvy = "0.15"
+config = "0.14"
+
+# Time
 chrono = { version = "0.4", features = ["serde"] }
+
+# UUID
+uuid = { version = "1.11", features = ["v4", "serde"] }
 
 # Internal crates
 druids-core = { path = "crates/druids-core" }
 druids-db = { path = "crates/druids-db" }
 druids-runtime = { path = "crates/druids-runtime" }
 
+[profile.dev]
+opt-level = 0
+debug = true
+
 [profile.release]
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-
-[profile.dev]
-opt-level = 0
-debug = true
+strip = true

@@ -3,17 +3,14 @@ name = "druids-runtime"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-authors.workspace = true
-license.workspace = true
 
 [dependencies]
+druids-core = { path = "../druids-core" }
+
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
-druids-core = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }

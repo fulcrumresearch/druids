@@ -3,25 +3,22 @@ name = "druids-client"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-authors.workspace = true
-license.workspace = true
 
 [[bin]]
 name = "druids"
 path = "src/main.rs"
 
 [dependencies]
+druids-core = { path = "../druids-core" }
+
 tokio = { workspace = true }
-clap = { workspace = true }
-reqwest = { workspace = true }
-tokio-tungstenite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-druids-core = { workspace = true }
+
+reqwest = { workspace = true }
+clap = { workspace = true }
+dotenvy = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }

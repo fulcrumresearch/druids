@@ -1,135 +1,101 @@
-# Druids Rust Implementation
+# Druids (Rust)
 
-This is the Rust implementation of Druids, a multi-agent orchestration system.
+Rust implementation of the Druids multi-agent orchestration system.
 
-## Structure
+## Project Structure
 
-This workspace contains the following crates:
+This is a Cargo workspace with the following crates:
 
-- **druids-core**: Shared types and utilities used across all components
-- **druids-db**: Database layer with SQLx integration and migrations
-- **druids-server**: HTTP server binary providing the Druids API
-- **druids-client**: CLI binary and client library for interacting with the server
-- **druids-runtime**: Runtime SDK for Druids programs
-- **druids-bridge**: Bridge binary connecting agent sandboxes to the server
-
-## Requirements
-
-- Rust 1.75 or later
-- PostgreSQL (for database features)
+- `druids-core` - Shared types and utilities
+- `druids-server` - HTTP server (Axum-based)
+- `druids-client` - CLI and client library
+- `druids-runtime` - Program runtime SDK
+- `druids-bridge` - Agent bridge component
+- `druids-db` - Database layer (SQLx-based)
 
 ## Building
 
-Build the entire workspace:
-
 ```bash
-cargo build --workspace
-```
-
-Build in release mode:
-
-```bash
-cargo build --workspace --release
-```
-
-Build a specific crate:
-
-```bash
-cargo build -p druids-server
+cargo build
 ```
 
 ## Testing
 
-Run all tests:
-
 ```bash
-cargo test --workspace
+cargo test
 ```
 
-Run tests for a specific crate:
+## Configuration
+
+### Server Configuration
+
+The server reads configuration from environment variables with the `DRUIDS_` prefix. Copy `example.env` to `.env` and update with your values:
 
 ```bash
-cargo test -p druids-core
+cp example.env .env
+# Edit .env with your settings
 ```
 
-## Code Quality
+Required environment variables:
+- `ANTHROPIC_API_KEY` - Anthropic API key for Claude
 
-Format code:
+Optional environment variables (with defaults):
+- `DRUIDS_HOST` (default: `0.0.0.0`)
+- `DRUIDS_PORT` (default: `8000`)
+- `DRUIDS_BASE_URL` (default: `http://localhost:8000`)
+- `DRUIDS_DATABASE_URL` (default: `sqlite://druids.db`)
+- `DRUIDS_SANDBOX_TYPE` (default: `docker`)
+- `DRUIDS_DOCKER_IMAGE` (default: `ghcr.io/fulcrumresearch/druids-base:latest`)
+- `DRUIDS_DOCKER_HOST` (default: `localhost`)
+- `DRUIDS_MAX_EXECUTION_TTL` (default: `86400` - 24 hours)
 
-```bash
-cargo fmt --all
-```
+Auto-generated if not provided:
+- `DRUIDS_SECRET_KEY` - Encryption key for secrets
+- `DRUIDS_FORWARDING_TOKEN_SECRET` - Token secret for forwarding
 
-Check formatting without modifying files:
+### Client Configuration
 
-```bash
-cargo fmt --all --check
-```
+The client reads configuration from:
+1. Environment variables (`DRUIDS_BASE_URL`, `DRUIDS_ACCESS_TOKEN`)
+2. `~/.druids/config.json`
+3. Built-in defaults
 
-Run clippy lints:
-
-```bash
-cargo clippy --workspace --all-targets --all-features
-```
-
-Fix clippy warnings automatically where possible:
-
-```bash
-cargo clippy --workspace --all-targets --all-features --fix
+Example `~/.druids/config.json`:
+```json
+{
+  "base_url": "http://localhost:8000",
+  "user_access_token": "your-token-here"
+}
 ```
 
 ## Running
 
-Start the server:
+### Server
 
 ```bash
-cargo run -p druids-server
+cargo run --bin druids-server
 ```
 
-Run the CLI:
+### Client
 
 ```bash
-cargo run -p druids-client -- --help
+cargo run --bin druids config  # Show current configuration
 ```
 
-Start the bridge:
+## Development Status
 
-```bash
-cargo run -p druids-bridge
-```
+This is an in-progress translation of the Python Druids implementation to Rust. Current status:
 
-## Development
+- [x] Project scaffold
+- [x] Configuration system
+- [ ] Core types
+- [ ] Database layer
+- [ ] Server API
+- [ ] Client CLI
+- [ ] Runtime SDK
+- [ ] Bridge component
 
-The workspace uses shared dependencies defined in the root `Cargo.toml`. When adding new dependencies:
-
-1. Add them to `[workspace.dependencies]` in the root `Cargo.toml`
-2. Reference them in individual crate `Cargo.toml` files using `{ workspace = true }`
-
-Example:
-
-```toml
-# In root Cargo.toml
-[workspace.dependencies]
-tokio = { version = "1.41", features = ["full"] }
-
-# In crate Cargo.toml
-[dependencies]
-tokio = { workspace = true }
-```
-
-## CI/CD
-
-The project uses GitHub Actions for continuous integration:
-
-- **CI workflow**: Runs on every push and pull request
-  - Tests all crates
-  - Runs clippy with strict lints
-  - Checks code formatting
-  - Builds in debug and release modes
-
-- **Release workflow**: Runs on version tags
-  - Builds release binaries for Linux and macOS
-  - Creates GitHub releases with compiled artifacts
+See `../GOALS.md` for the full feature parity checklist.
 
 ## License
 

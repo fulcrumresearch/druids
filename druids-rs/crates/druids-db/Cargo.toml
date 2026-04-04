@@ -3,16 +3,18 @@ name = "druids-db"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-authors.workspace = true
-license.workspace = true
 
 [dependencies]
-sqlx = { workspace = true }
+druids-core = { path = "../druids-core" }
+
+tokio = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
 thiserror = { workspace = true }
-chrono = { workspace = true }
+
+sqlx = { workspace = true }
 uuid = { workspace = true }
-druids-core = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }

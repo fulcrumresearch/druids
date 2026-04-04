@@ -1,24 +1,25 @@
-//! Druids server binary.
+//! Druids Server binary
 
-use axum::{routing::get, Router};
-use std::net::SocketAddr;
-use tracing::info;
+use druids_server::ServerConfig;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Initialize tracing
     tracing_subscriber::fmt::init();
 
-    let app = Router::new().route("/health", get(health_check));
+    // Load configuration
+    let config = ServerConfig::from_env()?;
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 8000));
-    info!("Starting server on {}", addr);
+    tracing::info!(
+        "Starting Druids server on {}:{}",
+        config.host,
+        config.port
+    );
+    tracing::info!("Sandbox type: {}", config.sandbox_type);
+    tracing::info!("Base URL: {}", config.base_url);
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    // TODO: Start the actual server
+    tracing::warn!("Server implementation not yet complete");
 
     Ok(())
-}
-
-async fn health_check() -> &'static str {
-    "OK"
 }

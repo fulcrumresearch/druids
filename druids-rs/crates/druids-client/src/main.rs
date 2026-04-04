@@ -1,55 +1,56 @@
-//! Druids CLI binary.
+//! Druids CLI binary
 
-use clap::{Parser, Subcommand};
+use clap::Parser;
+use druids_client::ClientConfig;
 
 #[derive(Parser)]
 #[command(name = "druids")]
-#[command(about = "Druids CLI", long_about = None)]
+#[command(about = "Druids multi-agent orchestration CLI")]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Command>,
 }
 
-#[derive(Subcommand)]
-enum Commands {
-    /// Execute a Druids program
-    Exec {
-        /// Program name
-        program: String,
-    },
-    /// Manage executions
-    Execution {
-        #[command(subcommand)]
-        subcommand: ExecutionCommands,
-    },
-}
-
-#[derive(Subcommand)]
-enum ExecutionCommands {
-    /// List executions
-    Ls,
-    /// Get execution status
-    Status { slug: String },
+#[derive(Parser)]
+enum Command {
+    /// Show configuration
+    Config,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
-
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Exec { program } => {
-            println!("Executing program: {}", program);
+        Some(Command::Config) => {
+            let config = ClientConfig::load()?;
+            println!("Base URL: {}", config.base_url);
+            println!(
+                "Access Token: {}",
+                config
+                    .user_access_token
+                    .as_ref()
+                    .map(|_| "[SET]")
+                    .unwrap_or("[NOT SET]")
+            );
+            println!(
+                "Execution Slug: {}",
+                config
+                    .execution_slug
+                    .as_ref()
+                    .unwrap_or(&"[NOT SET]".to_string())
+            );
+            println!(
+                "Agent Name: {}",
+                config
+                    .agent_name
+                    .as_ref()
+                    .unwrap_or(&"[NOT SET]".to_string())
+            );
         }
-        Commands::Execution { subcommand } => match subcommand {
-            ExecutionCommands::Ls => {
-                println!("Listing executions...");
-            }
-            ExecutionCommands::Status { slug } => {
-                println!("Getting status for: {}", slug);
-            }
-        },
+        None => {
+            println!("Druids CLI - use --help for available commands");
+        }
     }
 
     Ok(())

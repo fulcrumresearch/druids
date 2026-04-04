@@ -3,27 +3,30 @@ name = "druids-server"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-authors.workspace = true
-license.workspace = true
 
 [[bin]]
 name = "druids-server"
 path = "src/main.rs"
 
 [dependencies]
+druids-core = { path = "../druids-core" }
+druids-db = { path = "../druids-db" }
+
 tokio = { workspace = true }
-axum = { workspace = true }
-axum-extra = { workspace = true }
-tower = { workspace = true }
-tower-http = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-druids-core = { workspace = true }
-druids-db = { workspace = true }
+
+axum = { workspace = true }
+axum-extra = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+
+dotenvy = { workspace = true }
+config = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }

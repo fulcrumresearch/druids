@@ -4,6 +4,12 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use uuid::Uuid;
 
+pub mod config;
+pub mod error;
+
+pub use config::SandboxType;
+pub use error::{Error, Result};
+
 /// Execution slug identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ExecutionSlug(String);
