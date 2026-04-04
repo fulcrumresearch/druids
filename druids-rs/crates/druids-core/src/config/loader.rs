@@ -61,36 +61,59 @@ pub fn validate_required<T>(field: &Option<T>, field_name: &str) -> Result<()> {
 }
 
 /// Generate a random hex secret (32 bytes = 64 hex chars)
+///
+/// # Security Note
+///
+/// This function uses `std::collections::hash_map::DefaultHasher` with multiple
+/// entropy sources (system time, process ID, thread ID, stack address) to generate
+/// secrets. While better than a simple LCG, this is NOT cryptographically secure.
+///
+/// For production use with security-critical secrets (database encryption keys,
+/// token signing secrets), you should:
+/// 1. Set the secret explicitly via environment variables, OR
+/// 2. Add the `rand` crate and use `rand::thread_rng()` for cryptographically
+///    secure random number generation.
+///
+/// This implementation is a fallback to avoid adding dependencies while still
+/// providing reasonable unpredictability for development and testing scenarios.
 pub fn generate_random_secret() -> String {
+    use std::collections::hash_map::RandomState;
     use std::fmt::Write;
-    let mut rng = rand_simple();
-    let mut secret = String::with_capacity(64);
-    for _ in 0..32 {
-        write!(&mut secret, "{:02x}", rng.next_byte()).unwrap();
-    }
-    secret
-}
-
-// Simple pseudo-random number generator (no dependency on rand crate)
-struct SimpleRng {
-    state: u64,
-}
-
-impl SimpleRng {
-    fn next_byte(&mut self) -> u8 {
-        // Linear congruential generator
-        self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1);
-        (self.state >> 33) as u8
-    }
-}
-
-fn rand_simple() -> SimpleRng {
+    use std::hash::{BuildHasher, Hash, Hasher};
     use std::time::{SystemTime, UNIX_EPOCH};
-    let seed = SystemTime::now()
+
+    // Gather multiple entropy sources
+    let time_nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .as_nanos() as u64;
-    SimpleRng { state: seed }
+        .as_nanos();
+    let process_id = std::process::id();
+    let thread_id = std::thread::current().id();
+    let stack_addr = &time_nanos as *const u128 as usize;
+
+    // Use RandomState (which uses random keys on creation) to mix entropy
+    let random_state = RandomState::new();
+
+    let mut secret = String::with_capacity(64);
+
+    // Generate 4 hash values to get 32 bytes of output
+    for i in 0..4 {
+        let mut hasher = random_state.build_hasher();
+
+        // Hash all entropy sources plus iteration counter
+        time_nanos.hash(&mut hasher);
+        process_id.hash(&mut hasher);
+        thread_id.hash(&mut hasher);
+        stack_addr.hash(&mut hasher);
+        i.hash(&mut hasher);
+
+        let hash = hasher.finish();
+
+        // Convert hash (8 bytes) to 16 hex characters
+        write!(&mut secret, "{:016x}", hash).unwrap();
+    }
+
+    secret
 }
 
 #[cfg(test)]

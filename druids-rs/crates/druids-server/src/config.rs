@@ -31,7 +31,7 @@ pub struct ServerConfig {
     pub secret_key: SecretString,
 
     // API Keys
-    pub anthropic_api_key: SecretString,
+    pub anthropic_api_key: Option<SecretString>,
     pub forwarding_token_secret: SecretString,
     pub openai_api_key: Option<SecretString>,
     pub github_pat: Option<SecretString>,
@@ -82,9 +82,7 @@ impl ServerConfig {
             )?,
 
             // API Keys
-            anthropic_api_key: env::var("ANTHROPIC_API_KEY")
-                .map(SecretString::new)
-                .map_err(|_| Error::config("ANTHROPIC_API_KEY is required"))?,
+            anthropic_api_key: env::var("ANTHROPIC_API_KEY").ok().map(SecretString::new),
             openai_api_key: env::var("OPENAI_API_KEY").ok().map(SecretString::new),
             github_pat: env::var("GITHUB_PAT").ok().map(SecretString::new),
 
@@ -131,6 +129,11 @@ impl ServerConfig {
             return Err(Error::validation("base_url cannot be empty"));
         }
 
+        // Validate required API key
+        if self.anthropic_api_key.is_none() {
+            return Err(Error::validation("ANTHROPIC_API_KEY is required"));
+        }
+
         Ok(())
     }
 }
@@ -149,7 +152,7 @@ impl Default for ServerConfig {
             secret_key: SecretString::new(
                 druids_core::config::loader::generate_random_secret(),
             ),
-            anthropic_api_key: SecretString::new("".to_string()),
+            anthropic_api_key: None,
             forwarding_token_secret: SecretString::new(
                 druids_core::config::loader::generate_random_secret(),
             ),
@@ -180,10 +183,20 @@ mod tests {
 
         let config = ServerConfig::from_env().unwrap();
         assert_eq!(config.port, 9000);
-        assert_eq!(config.anthropic_api_key.expose(), "test-key");
+        assert_eq!(
+            config.anthropic_api_key.as_ref().unwrap().expose(),
+            "test-key"
+        );
 
         env::remove_var("DRUIDS_PORT");
         env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    fn test_validation_missing_anthropic_key() {
+        let mut config = ServerConfig::default();
+        config.anthropic_api_key = None;
+        assert!(config.validate().is_err());
     }
 
     #[test]
