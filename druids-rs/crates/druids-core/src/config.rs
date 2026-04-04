@@ -52,4 +52,16 @@ pub enum ConfigError {
 
     #[error("failed to parse config: {0}")]
     ParseError(#[from] serde_json::Error),
+
+    #[error("failed to load environment file: {0}")]
+    EnvFileError(String),
+}
+
+impl From<dotenvy::Error> for ConfigError {
+    fn from(err: dotenvy::Error) -> Self {
+        match err {
+            dotenvy::Error::Io(e) => ConfigError::IoError(e),
+            other => ConfigError::EnvFileError(other.to_string()),
+        }
+    }
 }

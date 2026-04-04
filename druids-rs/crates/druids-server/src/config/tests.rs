@@ -25,36 +25,44 @@ fn test_sandbox_type_deserialization() {
 
 #[test]
 fn test_config_load_with_env_vars() {
-    // Set required env vars
+    // Set all required env vars (including API key)
     env::set_var("ANTHROPIC_API_KEY", "sk-ant-test-key-12345678901234567890123456789012345678901234567890");
     env::set_var("DRUIDS_HOST", "127.0.0.1");
     env::set_var("DRUIDS_PORT", "9000");
     env::set_var("DRUIDS_SANDBOX_TYPE", "docker");
+    env::set_var("DRUIDS_SECRET_KEY", "dGVzdC1zZWNyZXQta2V5LXRoYXQtaXMtNDQtY2hhcmFjdGVy");
 
-    let config = ServerConfig::load(None).unwrap();
+    let config = ServerConfig::load(None);
 
-    assert_eq!(config.host, "127.0.0.1");
-    assert_eq!(config.port, 9000);
-    assert_eq!(config.sandbox_type, SandboxType::Docker);
-
-    // Clean up
+    // Clean up env vars first
     env::remove_var("ANTHROPIC_API_KEY");
     env::remove_var("DRUIDS_HOST");
     env::remove_var("DRUIDS_PORT");
     env::remove_var("DRUIDS_SANDBOX_TYPE");
+    env::remove_var("DRUIDS_SECRET_KEY");
+
+    // Now assert after cleanup to avoid test interference
+    let config = config.unwrap();
+    assert_eq!(config.host, "127.0.0.1");
+    assert_eq!(config.port, 9000);
+    assert_eq!(config.sandbox_type, SandboxType::Docker);
 }
 
 #[test]
 fn test_config_validation_invalid_api_key() {
     env::set_var("ANTHROPIC_API_KEY", "invalid-key");
+    env::set_var("DRUIDS_SECRET_KEY", "dGVzdC1zZWNyZXQta2V5LXRoYXQtaXMtNDQtY2hhcmFjdGVy");
 
-    let config = ServerConfig::load(None).unwrap();
+    let config = ServerConfig::load(None);
+
+    env::remove_var("ANTHROPIC_API_KEY");
+    env::remove_var("DRUIDS_SECRET_KEY");
+
+    let config = config.unwrap();
     let result = config.validate();
 
     assert!(result.is_err());
     assert!(matches!(result.unwrap_err(), ConfigError::InvalidValue { .. }));
-
-    env::remove_var("ANTHROPIC_API_KEY");
 }
 
 #[test]

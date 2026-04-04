@@ -56,14 +56,14 @@ impl ClientConfig {
         if let Some(config_path) = get_config_path() {
             if config_path.exists() {
                 let content = fs::read_to_string(&config_path)?;
-                let file_config: ClientConfig = serde_json::from_str(&content)?;
+                let file_config: SavedConfig = serde_json::from_str(&content)?;
 
-                // Merge with defaults
-                if file_config.base_url.as_str() != "https://druids.dev" {
-                    config.base_url = file_config.base_url;
+                // Merge with defaults - only override if explicitly set in file
+                if let Some(base_url) = file_config.base_url {
+                    config.base_url = base_url;
                 }
-                if file_config.user_access_token.is_some() {
-                    config.user_access_token = file_config.user_access_token;
+                if let Some(token) = file_config.user_access_token {
+                    config.user_access_token = Some(token);
                 }
             }
         }
@@ -107,7 +107,7 @@ impl ClientConfig {
 
         // Create a minimal config to save (only base_url and user_access_token)
         let save_config = SavedConfig {
-            base_url: self.base_url.clone(),
+            base_url: Some(self.base_url.clone()),
             user_access_token: self.user_access_token.clone(),
         };
 
@@ -152,10 +152,13 @@ impl std::fmt::Display for ClientConfig {
     }
 }
 
-/// Configuration structure for saving to disk (subset of ClientConfig).
+/// Configuration structure for saving/loading from disk.
+///
+/// All fields are optional so we can distinguish between "not set" and "set to default".
 #[derive(Serialize, Deserialize)]
 struct SavedConfig {
-    base_url: Url,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_url: Option<Url>,
     #[serde(skip_serializing_if = "Option::is_none")]
     user_access_token: Option<String>,
 }
@@ -178,7 +181,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = ClientConfig::default();
-        assert_eq!(config.base_url.as_str(), "https://druids.dev");
+        assert_eq!(config.base_url.as_str(), "https://druids.dev/");
         assert!(config.user_access_token.is_none());
         assert!(config.execution_slug.is_none());
         assert!(config.agent_name.is_none());
@@ -231,7 +234,7 @@ mod tests {
 
         // Save config
         let content = serde_json::to_string_pretty(&SavedConfig {
-            base_url: config.base_url.clone(),
+            base_url: Some(config.base_url.clone()),
             user_access_token: config.user_access_token.clone(),
         })
         .unwrap();
@@ -241,7 +244,31 @@ mod tests {
         let loaded_content = fs::read_to_string(&config_path).unwrap();
         let loaded: SavedConfig = serde_json::from_str(&loaded_content).unwrap();
 
-        assert_eq!(loaded.base_url, config.base_url);
+        assert_eq!(loaded.base_url, Some(config.base_url));
         assert_eq!(loaded.user_access_token, config.user_access_token);
+    }
+
+    #[test]
+    fn test_config_merge_respects_all_urls() {
+        use tempfile::TempDir;
+
+        // Create a temporary directory
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+
+        // Test that even the default URL is respected when explicitly set in file
+        let content = serde_json::to_string_pretty(&SavedConfig {
+            base_url: Some(Url::parse("https://druids.dev").unwrap()),
+            user_access_token: Some("test-token".to_string()),
+        })
+        .unwrap();
+        fs::write(&config_path, content).unwrap();
+
+        // Load from file without env vars
+        let loaded: SavedConfig = serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+
+        // The URL should be loaded even if it matches the default
+        assert_eq!(loaded.base_url, Some(Url::parse("https://druids.dev").unwrap()));
+        assert_eq!(loaded.user_access_token, Some("test-token".to_string()));
     }
 }
