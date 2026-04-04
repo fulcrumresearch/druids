@@ -91,12 +91,10 @@ async fn test_execution_lifecycle() {
     let updated = update_execution(
         &pool,
         execution.id,
-        Some("running"),
-        None,
-        None,
-        None,
-        None,
-        None,
+        UpdateExecution {
+            status: Some("running"),
+            ..Default::default()
+        },
     )
     .await
     .expect("Failed to update execution")

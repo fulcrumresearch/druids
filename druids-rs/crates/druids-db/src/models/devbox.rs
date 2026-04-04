@@ -16,8 +16,8 @@ use crate::Result;
 pub struct Devbox {
     pub id: Uuid,
     pub user_id: Uuid,
-    pub name: String,
-    pub repo_full_name: String,
+    pub name: Option<String>,
+    pub repo_full_name: Option<String>,
     pub instance_id: Option<String>,
     pub snapshot_id: Option<String>,
     pub setup_slug: Option<String>,
@@ -165,8 +165,8 @@ pub async fn get_or_create_devbox(
     )
     .bind(id)
     .bind(user_id)
-    .bind("") // empty name initially
-    .bind(repo_full_name)
+    .bind(None::<String>)
+    .bind(Some(repo_full_name))
     .bind(None::<String>)
     .bind(None::<String>)
     .bind(None::<String>)
@@ -182,8 +182,8 @@ pub async fn get_or_create_devbox(
     Ok(Devbox {
         id,
         user_id,
-        name: String::new(),
-        repo_full_name: repo_full_name.to_string(),
+        name: None,
+        repo_full_name: Some(repo_full_name.to_string()),
         instance_id: None,
         snapshot_id: None,
         setup_slug: None,

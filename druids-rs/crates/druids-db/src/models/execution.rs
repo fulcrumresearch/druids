@@ -224,49 +224,54 @@ pub async fn get_user_executions(
     Ok(records)
 }
 
+/// Fields that can be updated on an execution record.
+#[derive(Debug, Default)]
+pub struct UpdateExecution<'a> {
+    pub status: Option<&'a str>,
+    pub pr_number: Option<i32>,
+    pub pr_url: Option<&'a str>,
+    pub error: Option<&'a str>,
+    pub agents: Option<JsonValue>,
+    pub edges: Option<JsonValue>,
+}
+
 /// Updates mutable fields on an execution record.
-#[allow(clippy::too_many_arguments)]
 pub async fn update_execution(
     pool: &PgPool,
     execution_id: Uuid,
-    status: Option<&str>,
-    pr_number: Option<i32>,
-    pr_url: Option<&str>,
-    error: Option<&str>,
-    agents: Option<JsonValue>,
-    edges: Option<JsonValue>,
+    update: UpdateExecution<'_>,
 ) -> Result<Option<ExecutionRecord>> {
     // Build update query dynamically based on which fields are provided
     let mut updates = Vec::new();
     let mut param_index = 2; // $1 is execution_id
 
-    if status.is_some() {
+    if update.status.is_some() {
         updates.push(format!("status = ${}", param_index));
         param_index += 1;
     }
-    if pr_number.is_some() {
+    if update.pr_number.is_some() {
         updates.push(format!("pr_number = ${}", param_index));
         param_index += 1;
     }
-    if pr_url.is_some() {
+    if update.pr_url.is_some() {
         updates.push(format!("pr_url = ${}", param_index));
         param_index += 1;
     }
-    if error.is_some() {
+    if update.error.is_some() {
         updates.push(format!("error = ${}", param_index));
         param_index += 1;
     }
-    if agents.is_some() {
+    if update.agents.is_some() {
         updates.push(format!("agents = ${}", param_index));
         param_index += 1;
     }
-    if edges.is_some() {
+    if update.edges.is_some() {
         updates.push(format!("edges = ${}", param_index));
         param_index += 1;
     }
 
     // Handle stopped_at and completed_at based on status
-    if let Some(s) = status {
+    if let Some(s) = update.status {
         if matches!(s, "stopped" | "completed" | "failed") {
             updates.push(format!("stopped_at = ${}", param_index));
             param_index += 1;
@@ -287,27 +292,27 @@ pub async fn update_execution(
 
     let mut query = sqlx::query(&query_str).bind(execution_id);
 
-    if status.is_some() {
-        query = query.bind(status);
+    if update.status.is_some() {
+        query = query.bind(update.status);
     }
-    if pr_number.is_some() {
-        query = query.bind(pr_number);
+    if update.pr_number.is_some() {
+        query = query.bind(update.pr_number);
     }
-    if pr_url.is_some() {
-        query = query.bind(pr_url);
+    if update.pr_url.is_some() {
+        query = query.bind(update.pr_url);
     }
-    if error.is_some() {
-        query = query.bind(error);
+    if update.error.is_some() {
+        query = query.bind(update.error);
     }
-    if let Some(a) = agents {
+    if let Some(a) = update.agents {
         query = query.bind(a);
     }
-    if let Some(e) = edges {
+    if let Some(e) = update.edges {
         query = query.bind(e);
     }
 
     let now = Utc::now();
-    if let Some(s) = status {
+    if let Some(s) = update.status {
         if matches!(s, "stopped" | "completed" | "failed") {
             query = query.bind(now);
         }

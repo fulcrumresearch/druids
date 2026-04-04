@@ -43,8 +43,8 @@ CREATE INDEX ix_execution_status ON execution (status);
 CREATE TABLE devbox (
     id UUID PRIMARY KEY,
     user_id UUID NOT NULL REFERENCES "user"(id),
-    name VARCHAR NOT NULL,
-    repo_full_name VARCHAR NOT NULL,
+    name VARCHAR,
+    repo_full_name VARCHAR,
     instance_id VARCHAR,
     snapshot_id VARCHAR,
     setup_slug VARCHAR,
