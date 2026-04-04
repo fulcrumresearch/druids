@@ -1,77 +1,48 @@
-//! Druids core types and utilities.
+//! # druids-core
 //!
-//! This crate contains shared types used across all Druids components.
+//! Core types and utilities for the Druids multi-agent orchestration system.
+//!
+//! This crate provides shared type definitions that are used across all Druids components,
+//! including the server, client, runtime, and bridge.
+//!
+//! ## Features
+//!
+//! - **Execution types**: [`ExecutionRecord`], [`ExecutionState`], [`ExecutionMetadata`]
+//! - **Agent types**: [`AgentInfo`], [`AgentState`], [`AgentConnection`], [`AgentType`]
+//! - **Event types**: [`TraceEvent`] for execution trace logging
+//! - **Common types**: [`ExecutionId`], [`UserId`], [`Slug`]
+//! - **Error types**: [`ExecutionError`], [`AgentError`], [`ConfigError`]
+//! - **Configuration**: [`SandboxType`] and config utilities from the config module
+//!
+//! ## Example
+//!
+//! ```
+//! use druids_core::{ExecutionRecord, ExecutionState, UserId, Slug};
+//!
+//! let user_id = UserId::new();
+//! let record = ExecutionRecord::builder()
+//!     .slug("my-task")
+//!     .user_id(user_id)
+//!     .spec("implement feature X")
+//!     .status(ExecutionState::Running)
+//!     .build()
+//!     .unwrap();
+//!
+//! assert_eq!(record.slug.as_str(), "my-task");
+//! assert_eq!(record.status, ExecutionState::Running);
+//! ```
 
-use serde::{Deserialize, Serialize};
-use std::fmt;
-use uuid::Uuid;
-
+pub mod agent;
+pub mod common;
 pub mod config;
 pub mod error;
+pub mod events;
+pub mod execution;
 
-pub use config::{ConfigError, SandboxType};
-pub use error::{Error, Result};
-
-/// Execution slug identifier.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ExecutionSlug(String);
-
-impl ExecutionSlug {
-    /// Creates a new execution slug.
-    pub fn new(slug: impl Into<String>) -> Self {
-        Self(slug.into())
-    }
-
-    /// Returns the slug as a string slice.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for ExecutionSlug {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// User identifier.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct UserId(Uuid);
-
-impl UserId {
-    /// Creates a new user ID.
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-
-    /// Creates a user ID from a UUID.
-    pub fn from_uuid(id: Uuid) -> Self {
-        Self(id)
-    }
-}
-
-impl Default for UserId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_execution_slug() {
-        let slug = ExecutionSlug::new("test-execution");
-        assert_eq!(slug.as_str(), "test-execution");
-        assert_eq!(slug.to_string(), "test-execution");
-    }
-
-    #[test]
-    fn test_user_id() {
-        let user_id = UserId::new();
-        let json = serde_json::to_string(&user_id).unwrap();
-        let deserialized: UserId = serde_json::from_str(&json).unwrap();
-        assert_eq!(user_id, deserialized);
-    }
-}
+// Re-export commonly used types at the crate root
+pub use agent::{AgentConnection, AgentInfo, AgentState, AgentType};
+pub use common::{timestamp, ExecutionId, Slug, UserId};
+pub use config::SandboxType;
+pub use error::{AgentError, ConfigError, ExecutionError};
+pub use events::TraceEvent;
+pub use execution::{ExecutionEdge, ExecutionMetadata, ExecutionRecord, ExecutionState};

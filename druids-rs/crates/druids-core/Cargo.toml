@@ -2,15 +2,17 @@
 name = "druids-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
-rust-version.workspace = true
+repository.workspace = true
 
 [dependencies]
-serde = { workspace = true }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
-secrecy = { workspace = true }
-dotenvy = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
