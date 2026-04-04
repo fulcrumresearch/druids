@@ -103,6 +103,10 @@ As work progresses, check off capabilities that have been verified working in th
 - [x] ServerConfig.validate() rejects API keys not starting with "sk-ant-" and Fernet keys != 44 chars
 - [x] Database URL password is masked in Display output (user:****@host format)
 - [x] ConfigError implements From<dotenvy::Error> routing IO errors to IoError and other variants to EnvFileError
+- [x] `cargo clippy -p druids-core -p druids-server --all-targets --all-features -- -D warnings` passes with no warnings after SandboxType Default derive fix
+- [x] Config tests that mutate environment variables are marked `#[serial]` to prevent parallel-test races
+- [x] `generate_random_secret` in druids-server uses `rand::random()` (cryptographically secure), not the RandomState fallback
+- [x] `secrets.rs` custom Secret<T> type removed; `secrecy::SecretString` used consistently throughout druids-core and druids-server
 
 ## Rust Core Types (druids-core)
 - [x] ExecutionRecordBuilder.build() fails with an error if `spec` is not provided — no silent empty-string fallback
