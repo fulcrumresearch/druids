@@ -134,7 +134,7 @@ async fn test_devbox_lifecycle() {
         .expect("Failed to create devbox");
 
     assert_eq!(devbox.user_id, user.id);
-    assert_eq!(devbox.repo_full_name, repo);
+    assert_eq!(devbox.repo_full_name.as_deref(), Some(repo.as_str()));
 
     // Get same devbox
     let fetched = get_devbox(&pool, user.id, &repo)
