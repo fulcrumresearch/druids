@@ -60,62 +60,6 @@ pub fn validate_required<T>(field: &Option<T>, field_name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Generate a random hex secret (32 bytes = 64 hex chars)
-///
-/// # Security Note
-///
-/// This function uses `std::collections::hash_map::DefaultHasher` with multiple
-/// entropy sources (system time, process ID, thread ID, stack address) to generate
-/// secrets. While better than a simple LCG, this is NOT cryptographically secure.
-///
-/// For production use with security-critical secrets (database encryption keys,
-/// token signing secrets), you should:
-/// 1. Set the secret explicitly via environment variables, OR
-/// 2. Add the `rand` crate and use `rand::thread_rng()` for cryptographically
-///    secure random number generation.
-///
-/// This implementation is a fallback to avoid adding dependencies while still
-/// providing reasonable unpredictability for development and testing scenarios.
-pub fn generate_random_secret() -> String {
-    use std::collections::hash_map::RandomState;
-    use std::fmt::Write;
-    use std::hash::{BuildHasher, Hash, Hasher};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    // Gather multiple entropy sources
-    let time_nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let process_id = std::process::id();
-    let thread_id = std::thread::current().id();
-    let stack_addr = &time_nanos as *const u128 as usize;
-
-    // Use RandomState (which uses random keys on creation) to mix entropy
-    let random_state = RandomState::new();
-
-    let mut secret = String::with_capacity(64);
-
-    // Generate 4 hash values to get 32 bytes of output
-    for i in 0..4 {
-        let mut hasher = random_state.build_hasher();
-
-        // Hash all entropy sources plus iteration counter
-        time_nanos.hash(&mut hasher);
-        process_id.hash(&mut hasher);
-        thread_id.hash(&mut hasher);
-        stack_addr.hash(&mut hasher);
-        i.hash(&mut hasher);
-
-        let hash = hasher.finish();
-
-        // Convert hash (8 bytes) to 16 hex characters
-        write!(&mut secret, "{:016x}", hash).unwrap();
-    }
-
-    secret
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,21 +105,5 @@ mod tests {
     fn test_validate_required() {
         assert!(validate_required(&Some("value"), "field").is_ok());
         assert!(validate_required::<String>(&None, "field").is_err());
-    }
-
-    #[test]
-    fn test_generate_random_secret() {
-        let secret1 = generate_random_secret();
-        let secret2 = generate_random_secret();
-
-        // Should be 64 hex characters
-        assert_eq!(secret1.len(), 64);
-        assert_eq!(secret2.len(), 64);
-
-        // Should be different
-        assert_ne!(secret1, secret2);
-
-        // Should only contain hex characters
-        assert!(secret1.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }

@@ -1,130 +1,94 @@
-//! Error types for Druids operations.
+//! Error types for Druids
 
-use thiserror::Error;
+/// Result type alias for Druids operations
+pub type Result<T> = std::result::Result<T, Error>;
 
-/// Core error type for Druids operations.
-#[derive(Debug, Error)]
-pub enum CoreError {
-    #[error("serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
-
-    #[error("invalid UUID: {0}")]
-    InvalidUuid(#[from] uuid::Error),
-
-    #[error("{0}")]
-    Other(String),
-}
-
-/// Errors related to execution operations.
+/// Common error type for Druids
 #[derive(Debug, thiserror::Error)]
-pub enum ExecutionError {
-    /// Execution not found.
-    #[error("execution {0} not found")]
-    NotFound(String),
+pub enum Error {
+    #[error("configuration error: {0}")]
+    Config(String),
 
-    /// Invalid execution state transition.
-    #[error("invalid state transition from {from} to {to}")]
-    InvalidStateTransition {
-        /// Current state.
-        from: String,
-        /// Attempted new state.
-        to: String,
-    },
+    #[error("validation error: {0}")]
+    Validation(String),
 
-    /// Execution has already stopped.
-    #[error("execution {0} has already stopped")]
-    AlreadyStopped(String),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
 
-    /// Execution timeout.
-    #[error("execution {slug} timed out after {seconds}s")]
-    Timeout {
-        /// Execution slug.
-        slug: String,
-        /// Timeout duration in seconds.
-        seconds: u64,
-    },
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
 
-    /// Database error.
-    #[error("database error: {0}")]
-    Database(String),
-
-    /// Generic error.
     #[error("{0}")]
     Other(String),
 }
 
-/// Errors related to agent operations.
-#[derive(Debug, thiserror::Error)]
-pub enum AgentError {
-    /// Agent not found.
-    #[error("agent {0} not found")]
-    NotFound(String),
-
-    /// Agent connection failed.
-    #[error("failed to connect to agent {name}: {reason}")]
-    ConnectionFailed {
-        /// Agent name.
-        name: String,
-        /// Failure reason.
-        reason: String,
-    },
-
-    /// Agent disconnected unexpectedly.
-    #[error("agent {0} disconnected unexpectedly")]
-    Disconnected(String),
-
-    /// Invalid agent configuration.
-    #[error("invalid agent configuration: {0}")]
-    InvalidConfig(String),
-
-    /// Tool execution error.
-    #[error("tool {tool} failed: {reason}")]
-    ToolFailed {
-        /// Tool name.
-        tool: String,
-        /// Failure reason.
-        reason: String,
-    },
-
-    /// Generic error.
-    #[error("{0}")]
-    Other(String),
-}
-
-/// Errors related to configuration.
+/// Configuration error type
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    /// Missing required configuration.
     #[error("missing required configuration: {0}")]
     MissingRequired(String),
 
-    /// Invalid configuration value.
-    #[error("invalid configuration for {key}: {reason}")]
-    InvalidValue {
-        /// Configuration key.
-        key: String,
-        /// Reason why the value is invalid.
-        reason: String,
-    },
+    #[error("invalid value for {field}: {message}")]
+    InvalidValue { field: String, message: String },
 
-    /// Environment variable error.
-    #[error("environment variable {0} not set")]
-    EnvVarNotSet(String),
+    #[error("I/O error: {0}")]
+    IoError(#[from] std::io::Error),
 
-    /// File read error.
-    #[error("failed to read config file {path}: {reason}")]
-    FileRead {
-        /// File path.
-        path: String,
-        /// Failure reason.
-        reason: String,
-    },
+    #[error("environment file error: {0}")]
+    EnvFileError(String),
+}
 
-    /// Parse error.
-    #[error("failed to parse configuration: {0}")]
-    Parse(String),
+impl From<dotenvy::Error> for ConfigError {
+    fn from(err: dotenvy::Error) -> Self {
+        match err {
+            dotenvy::Error::Io(e) => ConfigError::IoError(e),
+            e => ConfigError::EnvFileError(e.to_string()),
+        }
+    }
+}
 
-    /// Generic error.
-    #[error("{0}")]
-    Other(String),
+impl From<Error> for ConfigError {
+    fn from(err: Error) -> Self {
+        match err {
+            Error::Config(msg) | Error::Validation(msg) => ConfigError::InvalidValue {
+                field: "unknown".to_string(),
+                message: msg,
+            },
+            Error::Io(e) => ConfigError::IoError(e),
+            Error::Json(e) => ConfigError::InvalidValue {
+                field: "json".to_string(),
+                message: e.to_string(),
+            },
+            Error::Other(msg) => ConfigError::InvalidValue {
+                field: "unknown".to_string(),
+                message: msg,
+            },
+        }
+    }
+}
+
+impl From<serde_json::Error> for ConfigError {
+    fn from(err: serde_json::Error) -> Self {
+        ConfigError::InvalidValue {
+            field: "json".to_string(),
+            message: err.to_string(),
+        }
+    }
+}
+
+impl Error {
+    /// Create a configuration error
+    pub fn config<S: Into<String>>(msg: S) -> Self {
+        Error::Config(msg.into())
+    }
+
+    /// Create a validation error
+    pub fn validation<S: Into<String>>(msg: S) -> Self {
+        Error::Validation(msg.into())
+    }
+
+    /// Create a generic error
+    pub fn other<S: Into<String>>(msg: S) -> Self {
+        Error::Other(msg.into())
+    }
 }

@@ -2,9 +2,38 @@
 name = "druids-client"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "druids"
+path = "src/main.rs"
 
 [dependencies]
-# Placeholder - will be implemented later
+druids-core = { path = "../druids-core" }
+
+# Async runtime
+tokio = { workspace = true }
+
+# HTTP client
+reqwest = { workspace = true }
+
+# Configuration
+serde = { workspace = true }
+serde_json = { workspace = true }
+dotenvy = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Utilities
+url = { workspace = true }
+dirs = "5.0"
+
+[dev-dependencies]
+tempfile = "3.12"

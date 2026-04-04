@@ -3,21 +3,15 @@
 use serde::{Deserialize, Serialize};
 
 pub mod loader;
-pub mod secrets;
 
 /// Sandbox backend type
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum SandboxType {
+    #[default]
     Docker,
     #[serde(rename = "morphcloud")]
     MorphCloud,
-}
-
-impl Default for SandboxType {
-    fn default() -> Self {
-        SandboxType::Docker
-    }
 }
 
 impl std::fmt::Display for SandboxType {

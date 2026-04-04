@@ -1,64 +1,70 @@
 [workspace]
+resolver = "2"
 members = [
     "crates/druids-core",
-    "crates/druids-db",
     "crates/druids-server",
     "crates/druids-client",
     "crates/druids-runtime",
     "crates/druids-bridge",
+    "crates/druids-db",
 ]
-resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
 authors = ["Druids Contributors"]
 license = "MIT"
+rust-version = "1.75"
 
 [workspace.dependencies]
-# Async runtime
+# Core dependencies
 tokio = { version = "1.41", features = ["full"] }
-
-# Serialization
+tokio-util = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-
-# Error handling
 anyhow = "1.0"
 thiserror = "2.0"
-
-# Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
-# Database (SQLx)
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json"] }
+# Server dependencies
+axum = "0.8"
+axum-extra = { version = "0.10", features = ["typed-header"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "migrate", "macros", "chrono", "uuid", "json"] }
 
-# Time
+# Client dependencies
+clap = { version = "4.5", features = ["derive", "env"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+tokio-tungstenite = "0.24"
+
+# Configuration
+dotenvy = "0.15"
+config = "0.14"
+secrecy = { version = "0.8", features = ["serde"] }
+
+# Utilities
 chrono = { version = "0.4", features = ["serde"] }
-
-# UUID
 uuid = { version = "1.11", features = ["v4", "serde"] }
+url = { version = "2.5", features = ["serde"] }
+sha2 = "0.10"
+base64 = "0.22"
 
 # Encryption
 aes-gcm = { version = "0.10", features = ["std"] }
-base64 = "0.22"
 
-# HTTP server
-axum = "0.7"
-axum-extra = { version = "0.9", features = ["typed-header"] }
-tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+# Internal crates
+druids-core = { path = "crates/druids-core" }
+druids-db = { path = "crates/druids-db" }
+druids-runtime = { path = "crates/druids-runtime" }
 
-# HTTP client
-reqwest = { version = "0.12", features = ["json", "stream"] }
+[profile.dev]
+opt-level = 0
+debug = true
 
-# CLI
-clap = { version = "4.5", features = ["derive", "env"] }
-
-# WebSocket
-tokio-tungstenite = "0.24"
-
-# Hashing
-sha2 = "0.10"
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

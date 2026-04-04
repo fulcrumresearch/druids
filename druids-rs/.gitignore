@@ -6,16 +6,17 @@
 # Cargo
 Cargo.lock
 
-# SQLx
-.sqlx/
-
 # Environment
 .env
 .env.local
 
-# IDEs
+# IDE
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
+
+# OS
+.DS_Store
+Thumbs.db

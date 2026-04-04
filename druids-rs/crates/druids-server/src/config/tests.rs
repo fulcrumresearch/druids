@@ -1,6 +1,7 @@
 //! Tests for server configuration.
 
 use super::*;
+use serial_test::serial;
 use std::env;
 
 #[test]
@@ -24,6 +25,7 @@ fn test_sandbox_type_deserialization() {
 }
 
 #[test]
+#[serial]
 fn test_config_load_with_env_vars() {
     // Set all required env vars (including API key)
     env::set_var("ANTHROPIC_API_KEY", "sk-ant-test-key-12345678901234567890123456789012345678901234567890");
@@ -49,6 +51,7 @@ fn test_config_load_with_env_vars() {
 }
 
 #[test]
+#[serial]
 fn test_config_validation_invalid_api_key() {
     env::set_var("ANTHROPIC_API_KEY", "invalid-key");
     env::set_var("DRUIDS_SECRET_KEY", "dGVzdC1zZWNyZXQta2V5LXRoYXQtaXMtNDQtY2hhcmFjdGVy");
@@ -66,6 +69,7 @@ fn test_config_validation_invalid_api_key() {
 }
 
 #[test]
+#[serial]
 fn test_config_missing_required() {
     env::remove_var("ANTHROPIC_API_KEY");
 

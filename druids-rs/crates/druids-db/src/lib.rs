@@ -1,11 +1,5 @@
-//! Database layer for Druids using SQLx.
+//! Druids Database Layer
 //!
-//! This crate provides compile-time verified database queries for Postgres.
+//! Database models and operations using SQLx
 
-pub mod error;
-pub mod models;
-pub mod pool;
-pub mod crypto;
-
-pub use error::{DatabaseError, Result};
-pub use pool::{create_pool, Pool};
+// TODO: Implement database layer

@@ -44,6 +44,7 @@ pub struct ServerConfig {
     pub anthropic_api_key: SecretString,
 
     /// Token secret for forwarding tokens.
+    #[allow(dead_code)]
     pub forwarding_token_secret: SecretString,
 
     /// OpenAI API key (optional).
