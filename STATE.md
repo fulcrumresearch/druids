@@ -260,12 +260,33 @@ Waiting for remaining workers to complete Phase 1 tasks before moving to Phase 2
 
 ## Trajectory
 
-**Current**: Phase 1 - Foundation setup
-**Next**: Spawn workers for Phase 1 tasks
-**Then**: Phase 2 (Client/CLI) in parallel with Phase 3 (Runtime)
-**Then**: Phase 4 (Server) depends on 1-3
-**Then**: Phase 5 (Sandbox) can be done in parallel with Phase 4
-**Finally**: Phase 6-8 (Bridge, Testing, Programs)
+**Current**: Phase 1 - Foundation (3 workers active)
+- ✅ worker-1: Scaffold complete
+- ⏳ worker-2: Core types in progress
+- ⏳ worker-3: Database layer in progress
+- ⏳ worker-4: Config system in progress
+
+**Next**: Phase 2 & 3 in parallel (specs ready in `specs/`)
+- Phase 2.1: HTTP Client Library
+- Phase 2.2: CLI Binary
+- Phase 3: Runtime SDK
+
+**Then**: Phase 4 (Server Core)
+- API Layer (Axum)
+- Execution Engine
+- Connection Management
+- Event System
+
+**Then**: Phase 5 (Sandbox Management) - parallel with Phase 4
+- Sandbox abstraction trait
+- Docker backend
+- MorphCloud backend
+- Setup sessions
+
+**Finally**: Phase 6-8
+- Bridge binary
+- Integration testing
+- Example programs
 
 ## Blockers
 
