@@ -1,33 +1,58 @@
-# v001: scaffold
+# v001: rust-bridge-skeleton
 
 ## What Changed
 
-Created the initial Rust workspace scaffold for the Druids rewrite:
+Implemented the initial Rust bridge component (`druids-bridge`) with proper async I/O and all HTTP endpoints.
 
-- **Workspace structure**: Established `druids-rs/` with 6 crates following the architecture outlined in CLAUDE.md
-  - `druids-core`: Shared types and utilities
-  - `druids-server`: HTTP API server (Axum-based)
-  - `druids-bridge`: Agent runtime bridge
-  - `druids-client`: CLI tool
-  - `druids-db`: Database layer (SQLx + PostgreSQL)
-  - `druids-runtime`: Program execution runtime
+### Key Improvements
 
-- **Build infrastructure**:
-  - Configured strict clippy linting (`clippy.toml` with `warn-on-all-wildcard-imports = true`)
-  - Set up CI/CD workflows for testing and releases
-  - Established Rust 1.85 toolchain baseline
-  - All workspace checks passing (build, test, clippy, fmt)
+1. **Non-blocking stdin relay**: Replaced polling-based stdin queue with `tokio::sync::mpsc::unbounded_channel`. The relay task now yields properly on `receiver.recv().await` instead of busy-waiting with 10ms sleep intervals.
 
-- **Code quality fix**: Removed wildcard re-export (`pub use api::*;`) from druids-server to comply with clippy rules
+2. **Stderr drainage**: Added dedicated `drain_stderr` task that continuously reads stderr lines and logs them. Prevents OS pipe buffers from filling up and blocking the child process.
+
+3. **O(1) buffer eviction**: Changed `stdout_buffer` from `Vec<String>` to `VecDeque<String>` with `pop_front()` eviction. Eliminates O(n) shift operations when the buffer exceeds `STDOUT_BUFFER_MAX_SIZE` (1000 lines).
+
+4. **Complete stdin endpoint**: Added `POST /stdin` endpoint accepting `{"data": "string"}` JSON payload. Routes data through the mpsc channel to the stdin relay task, completing the stdin infrastructure.
+
+5. **Clean process lifecycle**: `ProcessHandle` now tracks all three tasks (stdout, stdin, stderr) and aborts them on stop. The `stdin_sender` is cleared before killing the process to close the channel cleanly.
+
+### Implementation Details
+
+- `BridgeState.stdin_sender: Arc<RwLock<Option<mpsc::UnboundedSender<String>>>>`
+- `spawn_acp_process` returns `(ProcessHandle, UnboundedSender<String>)` tuple
+- `ProcessHandle` contains `stdout_task`, `stdin_task`, and `stderr_task` join handles
+- All tasks are properly aborted when the process stops
+
+### Files Changed
+
+- `druids-rs/crates/druids-bridge/src/main.rs` - Updated state and handlers
+- `druids-rs/crates/druids-bridge/src/relay.rs` - New module with channel-based relay functions
+- `druids-rs/crates/druids-bridge/Cargo.toml` - Removed unused reqwest dev-dependency
 
 ## Why
 
-This scaffold provides the foundation for translating the Python Druids implementation to Rust. The crate structure mirrors the logical separation of concerns (server, bridge, client, runtime) while ensuring strict code quality from day one.
+The original implementation had several structural issues that would cause problems in production:
+
+- Polling stdin queue with 10ms sleep wastes CPU cycles
+- Missing stderr drain could cause child process to block indefinitely
+- O(n) buffer trimming becomes expensive with high stdout volume
+- Incomplete stdin endpoint meant the relay infrastructure was dead code
+- Missing task cleanup could lead to dangling background tasks
+
+## Verification
+
+All endpoints tested with running `cat` process:
+- Status endpoint shows correct state and buffer size
+- Start endpoint spawns process successfully
+- Stdin endpoint sends data through the channel
+- Stop endpoint cleans up all tasks
+- Build succeeds with zero warnings
 
 ## New Goals
 
-Added build quality gates to GOALS.md:
-- `cargo clippy --workspace --all-targets --all-features -- -D warnings` passes with no warnings
-- druids-server/src/lib.rs uses `pub mod api` (no wildcard re-exports)
-
-These ensure the codebase maintains high standards as implementation work proceeds.
+- [x] druids-bridge stdin relay uses tokio::sync::mpsc::unbounded_channel; relay_stdin_from_channel yields on receiver.recv().await with no polling
+- [x] druids-bridge drains stderr via a dedicated drain_stderr task to prevent OS pipe buffer from blocking the child process
+- [x] druids-bridge stdout_buffer is Arc<RwLock<VecDeque<String>>> with O(1) pop_front eviction at STDOUT_BUFFER_MAX_SIZE (1000 lines)
+- [x] druids-bridge exposes POST /stdin accepting {"data": "string"} and routing through the mpsc channel
+- [x] druids-bridge ProcessHandle tracks stdout_task, stdin_task, and stderr_task; all three are aborted on stop
+- [x] druids-bridge stdin_sender is cleared (set to None) before killing the process on stop, closing the channel cleanly
