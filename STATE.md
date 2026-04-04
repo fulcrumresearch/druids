@@ -13,12 +13,10 @@ Translating Druids (Python multi-agent orchestration system) to Rust end-to-end.
 
 ## Active Work
 
-**Phase**: Phase 1 - Foundation
-**Active Workers**: 1
+**Phase**: Phase 2 & 3 - Client/CLI and Runtime
+**Active Workers**: 0 (about to spawn Phase 2 & 3 workers)
 
-- **worker-3 (database-layer)**: Building SQLx database layer in `druids-db` with migrations
-
-Waiting for final worker to complete Phase 1, then will spawn Phase 2 & 3 workers.
+Phase 1 is complete! Ready to spawn next wave of workers.
 
 ## Completed Work
 
@@ -38,6 +36,17 @@ Waiting for final worker to complete Phase 1, then will spawn Phase 2 & 3 worker
 - Full serde serialization support
 - Fixed fake defaults (builder validates required `spec` field)
 - Merged via PR from branch `factory/core-types-2`
+
+### Phase 1.3 - Database Layer ✅
+- **worker-3**: Implemented SQLx database layer in `druids-db`
+- PostgreSQL schema with all tables (User, Execution, Devbox, Secret, Program)
+- AES-256-GCM encryption for secrets
+- SQLx compile-time verified queries
+- Connection pool management
+- Database migrations
+- Integration tests passing
+- Fixed fake defaults for Devbox fields
+- Merged via PR from branch `factory/database-layer-3`
 
 ### Phase 1.4 - Configuration System ✅
 - **worker-4**: Implemented configuration management
@@ -278,10 +287,10 @@ Waiting for final worker to complete Phase 1, then will spawn Phase 2 & 3 worker
 
 ## Trajectory
 
-**Current**: Phase 1 - Foundation (1 worker active)
+**Current**: Phase 1 - Foundation ✅ COMPLETE
 - ✅ worker-1: Scaffold complete
-- ✅ worker-2: Core types complete (ExecutionRecord, AgentInfo, TraceEvent, errors)
-- ⏳ worker-3: Database layer in progress
+- ✅ worker-2: Core types complete
+- ✅ worker-3: Database layer complete (SQLx, PostgreSQL, AES-256-GCM encryption)
 - ✅ worker-4: Config system complete
 
 **Next**: Phase 2 & 3 in parallel (specs ready in `specs/`)
