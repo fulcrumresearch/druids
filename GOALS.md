@@ -110,3 +110,11 @@ As work progresses, check off capabilities that have been verified working in th
 ## Database Layer (druids-db)
 - [x] druids-db integration tests compile and pass against a real Postgres database (cargo test --package druids-db -- --ignored)
 - [x] druids-db encryption is documented as AES-256-GCM (not "Fernet-compatible" — Python Fernet uses AES-128-CBC+HMAC-SHA256 and the two formats are not interchangeable)
+
+## Bridge Component (druids-bridge)
+- [x] druids-bridge stdin relay uses tokio::sync::mpsc::unbounded_channel; relay_stdin_from_channel yields on receiver.recv().await with no polling
+- [x] druids-bridge drains stderr via a dedicated drain_stderr task to prevent OS pipe buffer from blocking the child process
+- [x] druids-bridge stdout_buffer is Arc<RwLock<VecDeque<String>>> with O(1) pop_front eviction at STDOUT_BUFFER_MAX_SIZE (1000 lines)
+- [x] druids-bridge exposes POST /stdin accepting {"data": "string"} and routing through the mpsc channel
+- [x] druids-bridge ProcessHandle tracks stdout_task, stdin_task, and stderr_task; all three are aborted on stop
+- [x] druids-bridge stdin_sender is cleared (set to None) before killing the process on stop, closing the channel cleanly
