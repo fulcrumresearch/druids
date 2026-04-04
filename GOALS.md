@@ -95,3 +95,11 @@ As work progresses, check off capabilities that have been verified working in th
 - [x] ClientConfig resolves settings in priority order: env vars > ~/.druids/config.json > defaults; saves config files with 600 permissions
 - [x] SandboxType enum supports Docker and MorphCloud variants with serde serialization and FromStr parsing
 - [x] generate_random_secret uses RandomState with multiple entropy sources; documented as non-cryptographic fallback
+- [x] Rust config system loads ServerConfig from environment variables with DRUIDS_ prefix (docker/morphcloud sandbox types, API keys, port, host, DB URL, TTL)
+- [x] Rust config system loads ClientConfig with priority: env vars > ~/.druids/config.json > defaults
+- [x] SavedConfig.base_url is Option<Url> so any explicitly configured URL (including the default) is honoured when loading from file
+- [x] Secrets (ANTHROPIC_API_KEY, DRUIDS_SECRET_KEY, FORWARDING_TOKEN_SECRET, OPENAI_API_KEY, GITHUB_PAT) are stored as SecretString and redacted in Display output
+- [x] SandboxType enum serializes to/from "docker" and "morphcloud" (lowercase)
+- [x] ServerConfig.validate() rejects API keys not starting with "sk-ant-" and Fernet keys != 44 chars
+- [x] Database URL password is masked in Display output (user:****@host format)
+- [x] ConfigError implements From<dotenvy::Error> routing IO errors to IoError and other variants to EnvFileError
