@@ -366,3 +366,51 @@ class TestPreambleRemoved:
         )
 
         assert config.system_prompt is None
+
+
+class TestForkAgentPreservesMCPServers:
+    @pytest.mark.asyncio
+    async def test_fork_preserves_source_mcp_servers(self):
+        """fork_agent passes source agent's mcp_servers to the new agent config."""
+        execution = _make_execution()
+        machine = _make_machine()
+        mock = _mock_conn()
+
+        source_config = AgentConfig(
+            name="source",
+            mcp_servers={"custom": {"url": "https://custom.mcp/sse"}},
+        )
+        source = Agent(
+            config=source_config,
+            machine=machine,
+            bridge_id="inst_1:7462",
+            bridge_token="tok",
+            session_id="sess-1",
+            connection=mock,
+        )
+        execution.agents["source"] = source
+
+        child_machine = _make_machine("child_1")
+
+        with (
+            patch("druids_server.lib.execution.Agent") as MockAgentCls,
+            patch("druids_server.lib.execution.agent_class", return_value=MockAgentCls),
+            patch.object(execution, "_bind_trace"),
+            patch.object(source.machine, "create_child", AsyncMock(return_value=child_machine)),
+            patch("druids_server.lib.execution.execution_trace"),
+        ):
+            mock_agent_instance = MagicMock()
+            mock_agent_instance._resume_session_id = None
+            mock_agent_instance.config = MagicMock()
+            MockAgentCls.create = AsyncMock(return_value=mock_agent_instance)
+
+            await execution.fork_agent(
+                source=source,
+                name="forked",
+            )
+
+            MockAgentCls.create.assert_called_once()
+            # config is arg[0], machine is arg[1] (both positional)
+            call_args = MockAgentCls.create.call_args
+            assert call_args[0][1] is child_machine  # machine arg
+
