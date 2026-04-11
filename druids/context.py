@@ -371,7 +371,8 @@ class Context:
         command = (
             f"{shlex.quote(tmux_command)} has-session -t {shlex.quote(session_name)} 2>/dev/null && "
             f"{shlex.quote(tmux_command)} kill-session -t {shlex.quote(session_name)}; "
-            f"{shlex.quote(tmux_command)} new-session -d -s {shlex.quote(session_name)} {shlex.quote(pi_invocation)}"
+            f"{shlex.quote(tmux_command)} new-session -d -s {shlex.quote(session_name)} "
+            f"/bin/bash -lc {shlex.quote(pi_invocation)}"
         )
         result = agent.machine.exec(command)
         if not result.ok:

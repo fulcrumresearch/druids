@@ -1,33 +1,48 @@
-/*
- * Druids pi extension.
- *
- * This file is intentionally self-contained so the Python runtime can deploy it
- * onto a machine with a single write. It mirrors the protocol described in
- * spec.md:
- *   - open an SSE stream
- *   - register with POST /agents/register
- *   - register tools dynamically with pi.registerTool()
- *   - forward tool calls to POST /agents/{agent_id}/tool_call
- *   - deliver pushed messages with pi.sendUserMessage()
- *   - append DRUIDS_SYSTEM_PROMPT during before_agent_start
- *
- * The exact runtime API surface of pi may vary by version, so this extension is
- * written defensively and prefers feature detection.
- */
+import { StringEnum, Type } from "@mariozechner/pi-ai";
+import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@mariozechner/pi-coding-agent";
 
 const serverUrl = process.env.DRUIDS_SERVER_URL;
 const executionId = process.env.DRUIDS_EXECUTION_ID;
 const agentId = process.env.DRUIDS_AGENT_ID;
-const systemPrompt = process.env.DRUIDS_SYSTEM_PROMPT || "";
+const appendedSystemPrompt = process.env.DRUIDS_SYSTEM_PROMPT || "";
 
-function assertEnv(name: string, value: string | undefined): string {
+type RemoteTool = {
+  name: string;
+  description?: string;
+  parameters?: Record<string, unknown>;
+};
+
+type SseEvent = {
+  event: string;
+  data: any;
+};
+
+function requireEnv(name: string, value: string | undefined): string {
   if (!value) throw new Error(`Missing ${name}`);
   return value;
 }
 
-const baseUrl = assertEnv("DRUIDS_SERVER_URL", serverUrl);
-const currentExecutionId = assertEnv("DRUIDS_EXECUTION_ID", executionId);
-const currentAgentId = assertEnv("DRUIDS_AGENT_ID", agentId);
+const baseUrl = requireEnv("DRUIDS_SERVER_URL", serverUrl);
+const currentExecutionId = requireEnv("DRUIDS_EXECUTION_ID", executionId);
+const currentAgentId = requireEnv("DRUIDS_AGENT_ID", agentId);
+
+function humanizeLabel(name: string): string {
+  return name
+    .split(/[_-]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ") || "Tool";
+}
+
+function formatToolResult(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value === null || value === undefined) return "";
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
 
 async function postJson(path: string, body: unknown): Promise<any> {
   const response = await fetch(`${baseUrl}${path}`, {
@@ -35,90 +50,207 @@ async function postJson(path: string, body: unknown): Promise<any> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  const data = await response.json();
+
+  let data: any = {};
+  try {
+    data = await response.json();
+  } catch {
+    data = {};
+  }
+
   if (!response.ok) {
     throw new Error(data?.error || `HTTP ${response.status}`);
   }
+
   return data;
 }
 
-function registerTool(pi: any, tool: any) {
-  if (!pi?.registerTool) return;
-  pi.registerTool({
+function schemaToTypeBox(schema: any): any {
+  if (!schema || typeof schema !== "object") {
+    return Type.String();
+  }
+
+  const options: Record<string, unknown> = {};
+  if (typeof schema.description === "string") options.description = schema.description;
+  if (schema.default !== undefined) options.default = schema.default;
+
+  if (Array.isArray(schema.enum) && schema.enum.every((value: unknown) => typeof value === "string")) {
+    return StringEnum(schema.enum as readonly string[], options);
+  }
+
+  switch (schema.type) {
+    case "object": {
+      const properties = schema.properties && typeof schema.properties === "object" ? schema.properties : {};
+      const required = new Set(Array.isArray(schema.required) ? schema.required : []);
+      const entries: Record<string, any> = {};
+
+      for (const [key, value] of Object.entries(properties)) {
+        const propertySchema = schemaToTypeBox(value);
+        entries[key] = required.has(key) ? propertySchema : Type.Optional(propertySchema);
+      }
+
+      if (
+        schema.additionalProperties &&
+        typeof schema.additionalProperties === "object" &&
+        Object.keys(properties).length === 0
+      ) {
+        return Type.Record(Type.String(), schemaToTypeBox(schema.additionalProperties), options);
+      }
+
+      if (schema.additionalProperties === false) {
+        options.additionalProperties = false;
+      }
+
+      return Type.Object(entries, options);
+    }
+    case "array":
+      return Type.Array(schemaToTypeBox(schema.items || { type: "string" }), options);
+    case "integer":
+      return Type.Integer(options);
+    case "number":
+      return Type.Number(options);
+    case "boolean":
+      return Type.Boolean(options);
+    case "string":
+    default:
+      return Type.String(options);
+  }
+}
+
+function registerRemoteTool(pi: ExtensionAPI, tool: RemoteTool, registeredTools: Set<string>) {
+  if (!tool?.name || registeredTools.has(tool.name)) {
+    return;
+  }
+
+  const definition: ToolDefinition<any, { remoteResult: unknown }> = {
     name: tool.name,
-    description: tool.description,
-    parameters: tool.parameters,
-    async execute(params: Record<string, unknown>) {
-      const result = await postJson(`/agents/${currentAgentId}/tool_call`, {
+    label: humanizeLabel(tool.name),
+    description: tool.description || "",
+    parameters: schemaToTypeBox(tool.parameters || { type: "object", properties: {}, required: [] }),
+    async execute(toolCallId, params, _signal, _onUpdate, _ctx) {
+      const response = await postJson(`/agents/${currentAgentId}/tool_call`, {
         tool: tool.name,
         params,
       });
-      return result.result;
+      return {
+        content: [{ type: "text", text: formatToolResult(response.result) }],
+        details: { remoteResult: response.result, toolCallId },
+      };
     },
-  });
+  };
+
+  pi.registerTool(definition);
+  registeredTools.add(tool.name);
 }
 
-async function startSse(pi: any) {
-  const response = await fetch(`${baseUrl}/agents/${currentAgentId}/events`, {
-    headers: { Accept: "text/event-stream" },
+async function deliverMessage(pi: ExtensionAPI, ctx: ExtensionContext, text: string) {
+  if (!text) return;
+  if (ctx.isIdle()) {
+    pi.sendUserMessage(text);
+  } else {
+    pi.sendUserMessage(text, { deliverAs: "steer" });
+  }
+}
+
+async function registerWithServer(pi: ExtensionAPI, registeredTools: Set<string>) {
+  const response = await postJson("/agents/register", {
+    agent_id: currentAgentId,
+    execution_id: currentExecutionId,
   });
-  if (!response.body) throw new Error("SSE stream missing body");
+
+  for (const tool of response.tools || []) {
+    registerRemoteTool(pi, tool, registeredTools);
+  }
+}
+
+async function* parseSseStream(response: Response): AsyncGenerator<SseEvent> {
+  if (!response.body) {
+    throw new Error("SSE stream missing response body");
+  }
 
   const decoder = new TextDecoder();
   const reader = response.body.getReader();
   let buffer = "";
-  let currentEvent = "message";
-  let currentData = "{}";
 
   while (true) {
     const chunk = await reader.read();
     if (chunk.done) return;
     buffer += decoder.decode(chunk.value, { stream: true });
 
-    while (buffer.includes("\n\n")) {
-      const index = buffer.indexOf("\n\n");
-      const rawEvent = buffer.slice(0, index);
-      buffer = buffer.slice(index + 2);
+    while (true) {
+      const boundary = buffer.indexOf("\n\n");
+      if (boundary === -1) break;
 
-      currentEvent = "message";
-      currentData = "{}";
+      const rawEvent = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+
+      let event = "message";
+      const dataLines: string[] = [];
 
       for (const line of rawEvent.split("\n")) {
         if (!line || line.startsWith(":")) continue;
-        if (line.startsWith("event:")) currentEvent = line.slice(6).trim();
-        if (line.startsWith("data:")) currentData = line.slice(5).trim();
+        if (line.startsWith("event:")) event = line.slice(6).trim();
+        if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
       }
 
-      const data = JSON.parse(currentData || "{}");
-      if (currentEvent === "message") {
-        await pi?.sendUserMessage?.(data.text || "");
-      } else if (currentEvent === "new_tool") {
-        registerTool(pi, data);
-      } else if (currentEvent === "shutdown") {
-        await pi?.shutdown?.();
-        return;
-      }
+      const payload = dataLines.join("\n");
+      yield { event, data: payload ? JSON.parse(payload) : {} };
     }
   }
 }
 
-export default function druidsExtension(pi: any) {
-  pi?.on?.("session_start", async () => {
-    const sseTask = startSse(pi);
-    const registration = await postJson("/agents/register", {
-      agent_id: currentAgentId,
-      execution_id: currentExecutionId,
-    });
-    for (const tool of registration.tools || []) registerTool(pi, tool);
-    await sseTask;
+async function runEventLoop(pi: ExtensionAPI, ctx: ExtensionContext, registeredTools: Set<string>) {
+  while (true) {
+    try {
+      await registerWithServer(pi, registeredTools);
+
+      const response = await fetch(`${baseUrl}/agents/${currentAgentId}/events`, {
+        headers: { Accept: "text/event-stream" },
+      });
+      if (!response.ok) {
+        throw new Error(`SSE connection failed with HTTP ${response.status}`);
+      }
+
+      for await (const event of parseSseStream(response)) {
+        if (event.event === "message") {
+          await deliverMessage(pi, ctx, String(event.data?.text || ""));
+        } else if (event.event === "new_tool") {
+          registerRemoteTool(pi, event.data, registeredTools);
+        } else if (event.event === "shutdown") {
+          ctx.shutdown();
+          return;
+        }
+      }
+    } catch (error) {
+      if (ctx.hasUI) {
+        const message = error instanceof Error ? error.message : String(error);
+        ctx.ui.notify(`druids extension disconnected: ${message}`, "warning");
+      }
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+}
+
+export default function druidsExtension(pi: ExtensionAPI) {
+  const registeredTools = new Set<string>();
+  let started = false;
+
+  pi.on("session_start", async (_event, ctx) => {
+    if (started) return;
+    started = true;
+    void runEventLoop(pi, ctx, registeredTools);
   });
 
-  pi?.on?.("before_agent_start", async (event: any) => {
-    if (!systemPrompt) return event;
-    const existing = event?.systemPrompt || "";
+  pi.on("before_agent_start", async (event) => {
+    if (!appendedSystemPrompt) {
+      return undefined;
+    }
+
     return {
-      ...event,
-      systemPrompt: existing ? `${existing}\n\n${systemPrompt}` : systemPrompt,
+      systemPrompt: event.systemPrompt
+        ? `${event.systemPrompt}\n\n${appendedSystemPrompt}`
+        : appendedSystemPrompt,
     };
   });
 }
