@@ -110,7 +110,7 @@ def create_agent_mcp_app() -> ASGIApp:
             try:
                 _caller.set(validate_token(auth[7:]))
             except Exception:
-                pass
+                logger.warning("MCP auth failed: invalid or expired token")
 
         scope = dict(scope, path="/")
         await _session_manager.handle_request(scope, receive, send)

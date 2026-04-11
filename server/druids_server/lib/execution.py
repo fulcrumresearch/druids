@@ -231,6 +231,10 @@ class Execution:
             result = await self._handle_message(agent_name, args)
         elif tool_name == "list_agents":
             result = self._handle_list_agents(agent_name)
+        elif tool_name == "send_file":
+            result = await self._handle_send_file(agent_name, args)
+        elif tool_name == "download_file":
+            result = await self._handle_download_file(agent_name, args)
         else:
             result = await self._dispatch_tool(agent_name, tool_name, args)
 
@@ -302,6 +306,60 @@ class Execution:
             ExposedService(instance_id=agent.machine.instance_id, service_name=service_name, port=port_int, url=url)
         )
         return url
+
+    async def _handle_send_file(self, sender_name: str, args: dict[str, Any]) -> str:
+        """Built-in: send a file from sender's sandbox to receiver's sandbox."""
+        receiver_name = args.get("receiver", "")
+        path = args.get("path", "")
+        dest_path = args.get("dest_path") or path
+
+        if not receiver_name:
+            return "Error: 'receiver' is required"
+        if not path:
+            return "Error: 'path' is required"
+
+        sender = self.agents.get(sender_name)
+        receiver = self.agents.get(receiver_name)
+        if not sender or not sender.machine or not sender.machine.sandbox:
+            return f"Error: sender '{sender_name}' has no sandbox"
+        if not receiver or not receiver.machine or not receiver.machine.sandbox:
+            return f"Error: receiver '{receiver_name}' has no sandbox"
+        if not self.is_connected(sender_name, receiver_name):
+            return f"Error: not connected to '{receiver_name}'"
+
+        try:
+            content = await sender.machine.sandbox.read_file(path)
+            await receiver.machine.sandbox.write_file(dest_path, content)
+            return f"File sent to {receiver_name}:{dest_path}"
+        except Exception as e:
+            return f"Error: failed to send file: {e}"
+
+    async def _handle_download_file(self, requester_name: str, args: dict[str, Any]) -> str:
+        """Built-in: download a file from another agent's sandbox to the requester's."""
+        sender_name = args.get("sender", "")
+        path = args.get("path", "")
+        dest_path = args.get("dest_path") or path
+
+        if not sender_name:
+            return "Error: 'sender' is required"
+        if not path:
+            return "Error: 'path' is required"
+
+        sender = self.agents.get(sender_name)
+        requester = self.agents.get(requester_name)
+        if not sender or not sender.machine or not sender.machine.sandbox:
+            return f"Error: sender '{sender_name}' has no sandbox"
+        if not requester or not requester.machine or not requester.machine.sandbox:
+            return f"Error: requester '{requester_name}' has no sandbox"
+        if not self.is_connected(requester_name, sender_name):
+            return f"Error: not connected to '{sender_name}'"
+
+        try:
+            content = await sender.machine.sandbox.read_file(path)
+            await requester.machine.sandbox.write_file(dest_path, content)
+            return f"File downloaded from {sender_name}:{path} to {dest_path}"
+        except Exception as e:
+            return f"Error: failed to download file: {e}"
 
     async def list_tools(self, agent_name: str) -> list[str]:
         """Return tool names available to an agent (built-in + program-defined)."""
@@ -592,6 +650,7 @@ class Execution:
             system_prompt=system_prompt if system_prompt is not None else source.config.system_prompt,
             git=git if git is not None else source.config.git,
             working_directory=source.config.working_directory,
+            mcp_servers=source.config.mcp_servers,
             slug=self.slug,
             user_id=self.user_id,
         )
