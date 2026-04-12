@@ -62,25 +62,24 @@ class _DruidsHTTPServer(ThreadingHTTPServer):
 
 
 class OrchestratorServer:
-    def __init__(self, ctx: Context, bind_host: str, bind_port: int, public_url: str):
+    """In-process HTTP server for agent registration, tool calls, and SSE."""
+
+    def __init__(self, ctx: Context, bind_host: str, bind_port: int):
         self.ctx = ctx
-        self.bind_host = bind_host
-        self.bind_port = bind_port
-        self.public_url = public_url
         self.httpd = _DruidsHTTPServer((bind_host, bind_port), _RequestHandler, ctx)
-        self.thread = threading.Thread(target=self.httpd.serve_forever, name="druids-server", daemon=True)
+        self._thread = threading.Thread(target=self.httpd.serve_forever, name="druids-server", daemon=True)
 
     @property
     def port(self) -> int:
         return int(self.httpd.server_address[1])
 
     def start(self) -> None:
-        self.thread.start()
+        self._thread.start()
 
     def stop(self) -> None:
         self.httpd.shutdown()
         self.httpd.server_close()
-        self.thread.join(timeout=5)
+        self._thread.join(timeout=5)
 
 
 class _RequestHandler(BaseHTTPRequestHandler):

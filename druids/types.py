@@ -39,9 +39,6 @@ class LaunchError(RuntimeError):
     """Raised when an agent process cannot be launched."""
 
 
-JsonValue = Any
-
-
 def to_jsonable(value: Any) -> Any:
     """Best-effort conversion for HTTP responses and log payloads."""
 

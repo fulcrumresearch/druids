@@ -108,7 +108,7 @@ def test_spawn_readiness_blocks_until_registered(tmp_path: Path, monkeypatch: py
         agent = Agent(
             name="test-agent",
             _ctx=ctx,
-            _machine=ctx._coerce_machine(None, None),
+            _machine=ctx._resolve_machine(None, None),
         )
         ctx._agents["test-agent"] = agent
         ctx._channels["test-agent"] = ctx._channels.get("test-agent", __import__("druids.server", fromlist=["AgentChannel"]).AgentChannel())

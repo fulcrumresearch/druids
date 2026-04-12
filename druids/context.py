@@ -72,18 +72,6 @@ def _builtin_tools() -> list[dict[str, Any]]:
     ]
 
 
-class _ConcreteImage(Image):
-    def __init__(self, machine: Machine):
-        self.machine = machine
-        self._used = False
-
-    def spawn(self) -> Machine:
-        if self._used:
-            return self.machine
-        self._used = True
-        return self.machine
-
-
 @dataclass
 class Agent:
     name: str
@@ -101,19 +89,23 @@ class Agent:
         return self._machine
 
     def on(self, tool_name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        """Register a tool handler for this agent."""
+
         def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
             self._handlers[tool_name] = fn
-            self._ctx._handle_tool_registered(self, tool_name, fn)
+            self._ctx._on_tool_registered(self, tool_name, fn)
             return fn
 
         return decorator
 
     def send(self, message: str) -> None:
+        """Send a message to this agent. Blocks until queued."""
         self._ctx._ensure_running()
-        self._ctx._send_message_to_agent(self.name, message)
+        self._ctx._send_message(self.name, message)
 
-    def exec(self, command: str, *, user: str = "agent", timeout: int | None = None):
-        self._ctx._ensure_agent_spawned(self)
+    def exec(self, command: str, *, user: str = "agent", timeout: int | None = None) -> ExecResult:
+        """Run a shell command on this agent's machine."""
+        self._ctx._ensure_spawned(self)
         return self._machine.exec(command, user=user, timeout=timeout)
 
 
@@ -148,7 +140,6 @@ class Context:
         self._server_stop_event = threading.Event()
         self._active_tool_calls = 0
         self._active_tool_calls_condition = threading.Condition(self._lock)
-        self._handler_local = threading.local()
 
         self._tool_executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix="druids-tool")
         self._server: OrchestratorServer | None = None
@@ -182,10 +173,14 @@ class Context:
         machine: Machine | None = None,
         image: Image | None = None,
     ) -> Agent:
+        """Create an agent.
+
+        Before run(): records intent. Inside a handler: spawns immediately.
+        """
         with self._lock:
             if name in self._agents:
                 raise ValueError(f"Agent '{name}' already exists")
-            machine_ref = self._coerce_machine(machine, image)
+            machine_ref = self._resolve_machine(machine, image)
             agent = Agent(
                 name=name,
                 _ctx=self,
@@ -261,14 +256,14 @@ class Context:
         finally:
             self._shutdown()
 
-    def _coerce_machine(self, machine: Machine | None, image: Image | None) -> ManagedMachine:
+    def _resolve_machine(self, machine: Machine | None, image: Image | None) -> ManagedMachine:
+        """Normalize machine/image arguments into a ManagedMachine."""
         if machine is not None and image is not None:
             raise ValueError("Pass either machine= or image=, not both")
         if isinstance(machine, ManagedMachine):
             return machine
         if machine is not None:
-            managed = ManagedMachine(_ConcreteImage(machine))
-            managed.ensure_started()
+            managed = ManagedMachine(backend=machine)
             self._machines.append(managed)
             return managed
         managed = ManagedMachine(image or self.image)
@@ -301,36 +296,31 @@ class Context:
             self._log_handle.flush()
 
     def _start_server(self) -> None:
-        bind_host, bind_port, public_url = self._resolve_server_binding()
-        self._server = OrchestratorServer(self, bind_host, bind_port, public_url)
+        bind_host, bind_port = self._resolve_server_binding()
+        self._server = OrchestratorServer(self, bind_host, bind_port)
         self._server.start()
         if self._configured_server_url is None:
             self.server_url = f"http://127.0.0.1:{self._server.port}"
         else:
             self.server_url = self._configured_server_url
-        self._log_event("server_started", bind_host=bind_host, bind_port=self._server.port, public_url=self.server_url)
+        self._log_event("server_started", url=self.server_url)
 
-    def _resolve_server_binding(self) -> tuple[str, int, str]:
+    def _resolve_server_binding(self) -> tuple[str, int]:
+        """Determine host and port for the HTTP server."""
         if self._configured_server_url is None:
-            return ("127.0.0.1", 0, "")
-
+            return ("127.0.0.1", 0)
         parsed = urlparse(self._configured_server_url)
         hostname = parsed.hostname or "0.0.0.0"
         if hostname not in {"127.0.0.1", "0.0.0.0", "localhost"}:
             hostname = "0.0.0.0"
-        if parsed.port is not None:
-            port = parsed.port
-        elif parsed.scheme == "https":
-            port = 443
-        else:
-            port = 80
-        return (hostname, port, self._configured_server_url)
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        return (hostname, port)
 
     def _ensure_running(self) -> None:
         if not self._running:
             raise RuntimeError("Context is not running. Call ctx.run() first.")
 
-    def _ensure_agent_spawned(self, agent: Agent) -> None:
+    def _ensure_spawned(self, agent: Agent) -> None:
         if not agent._spawned:
             self._spawn_agent(agent)
 
@@ -341,7 +331,7 @@ class Context:
             agent._machine.ensure_started()
             agent._spawned = True
             self._log_event("agent_spawned", agent=agent.name)
-        launched = self._maybe_launch_agent_process(agent)
+        launched = self._launch_agent(agent)
         if launched:
             channel = self._channels[agent.name]
             if not channel.registered.wait(timeout=120):
@@ -350,8 +340,8 @@ class Context:
                     f"Check tmux session: druids-{self.execution_id}-{agent.name}"
                 )
 
-    def _maybe_launch_agent_process(self, agent: Agent) -> bool:
-        """Launch the agent's pi process. Returns True if launched."""
+    def _launch_agent(self, agent: Agent) -> bool:
+        """Start pi in a tmux pane for this agent. Returns True if launched."""
         if self.launch_mode == "manual":
             self._log_event("agent_launch_skipped", agent=agent.name, reason="manual_mode")
             return False
@@ -395,7 +385,8 @@ class Context:
             return f"http://host.docker.internal:{self._server.port if self._server else 0}"
         return self.server_url or ""
 
-    def _handle_tool_registered(self, agent: Agent, tool_name: str, handler: Callable[..., Any]) -> None:
+    def _on_tool_registered(self, agent: Agent, tool_name: str, handler: Callable[..., Any]) -> None:
+        """Called when @agent.on() registers a new tool."""
         if self._running and agent._registered:
             self._push_event(agent.name, "new_tool", build_tool_definition(tool_name, handler))
         self._log_event("tool_registered", agent=agent.name, tool=tool_name)
@@ -406,7 +397,8 @@ class Context:
             raise ToolCallError(f"Unknown agent '{agent_name}'", status_code=404)
         channel.publish(SSEEvent(event=event, data=data))
 
-    def _send_message_to_agent(self, agent_name: str, message: str) -> None:
+    def _send_message(self, agent_name: str, message: str) -> None:
+        """Push a message event to an agent's SSE channel."""
         if agent_name not in self._agents:
             raise ToolCallError(f"Unknown agent '{agent_name}'", status_code=404)
         self._push_event(agent_name, "message", {"text": message})
@@ -425,7 +417,7 @@ class Context:
 
         if agent.prompt is not None and not agent._initial_prompt_sent:
             agent._initial_prompt_sent = True
-            self._send_message_to_agent(agent_id, agent.prompt)
+            self._send_message(agent_id, agent.prompt)
         return tools
 
     def _subscribe_events(self, agent_id: str):
@@ -461,18 +453,14 @@ class Context:
                 self._active_tool_calls_condition.notify_all()
 
     def _invoke_handler(self, agent: Agent, tool_name: str, params: dict[str, Any]) -> Any:
+        """Run a program-defined tool handler in the thread pool."""
         handler = agent._handlers.get(tool_name)
         if handler is None:
             raise ToolCallError(f"Unknown tool '{tool_name}' for agent '{agent.name}'", status_code=404)
-
-        self._handler_local.in_handler = True
-        try:
-            bound_params = dict(params)
-            if "caller" in inspect.signature(handler).parameters:
-                bound_params["caller"] = agent
-            return handler(**bound_params)
-        finally:
-            self._handler_local.in_handler = False
+        bound_params = dict(params)
+        if "caller" in inspect.signature(handler).parameters:
+            bound_params["caller"] = agent
+        return handler(**bound_params)
 
     def _run_builtin_tool(self, caller_name: str, tool_name: str, params: dict[str, Any]) -> Any:
         if tool_name == "list_agents":
@@ -483,7 +471,7 @@ class Context:
             message = str(params.get("message", ""))
             self._require_agent(receiver)
             self._require_connection(caller_name, receiver)
-            self._send_message_to_agent(receiver, f"[From: {caller_name}] {message}")
+            self._send_message(receiver, f"[From: {caller_name}] {message}")
             self._log_event("message_routed", sender=caller_name, receiver=receiver, text=message)
             return f"Message sent to {receiver}."
 

@@ -206,27 +206,30 @@ class DockerImage(Image):
 
 
 class ManagedMachine(Machine):
-    """Lazy machine handle used by the context and agents."""
+    """Thread-safe lazy machine handle.
 
-    def __init__(self, image: Image):
-        self.image = image
-        self._backend: Machine | None = None
+    Wraps an Image and spawns the real Machine on first use, or wraps
+    an already-started Machine when ``backend`` is provided.
+    """
+
+    def __init__(self, image: Image | None = None, *, backend: Machine | None = None):
+        self._image = image
+        self._backend = backend
         self._lock = threading.Lock()
 
     @property
     def backend(self) -> Machine | None:
         return self._backend
 
-    @property
-    def started(self) -> bool:
-        return self._backend is not None
-
     def ensure_started(self) -> Machine:
+        """Spawn the machine if not already running."""
         if self._backend is not None:
             return self._backend
         with self._lock:
             if self._backend is None:
-                self._backend = self.image.spawn()
+                if self._image is None:
+                    raise RuntimeError("ManagedMachine has no image and no backend")
+                self._backend = self._image.spawn()
             return self._backend
 
     def exec(self, command: str, *, user: str = "agent", timeout: int | None = None) -> ExecResult:
@@ -239,7 +242,5 @@ class ManagedMachine(Machine):
         return self.ensure_started().read_file(path)
 
     def stop(self) -> None:
-        backend = self._backend
-        if backend is None:
-            return
-        backend.stop()
+        if self._backend is not None:
+            self._backend.stop()
