@@ -8,7 +8,10 @@ version = "0.1.0"
 description = "A simpler in-process multi-agent orchestration runtime"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "starlette>=0.40",
+    "uvicorn>=0.30",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["druids"]

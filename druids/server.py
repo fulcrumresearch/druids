@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import queue
-import re
 import threading
 from collections import deque
 from dataclasses import dataclass
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlparse
+
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse, StreamingResponse
+from starlette.routing import Route
 
 from druids.types import ToolCallError, to_jsonable
 
@@ -24,6 +26,8 @@ class SSEEvent:
 
 
 class AgentChannel:
+    """Per-agent SSE event queue with backlog for pre-connection events."""
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._backlog: deque[SSEEvent] = deque()
@@ -52,148 +56,128 @@ class AgentChannel:
             self._subscribers.discard(subscriber)
 
 
-class _DruidsHTTPServer(ThreadingHTTPServer):
-    daemon_threads = True
-    allow_reuse_address = True
+def _make_app(ctx: Context) -> Starlette:
+    """Build the Starlette app with all routes."""
 
-    def __init__(self, server_address: tuple[str, int], handler_class: type[BaseHTTPRequestHandler], ctx: Context):
-        super().__init__(server_address, handler_class)
-        self.ctx = ctx
+    async def health(req: Request) -> JSONResponse:
+        return JSONResponse({"status": "ok"})
+
+    async def register(req: Request) -> JSONResponse:
+        payload = await req.json()
+        agent_id = str(payload.get("agent_id", ""))
+        execution_id = str(payload.get("execution_id", ""))
+        try:
+            tools = ctx._register_agent(agent_id, execution_id)
+        except ToolCallError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=exc.status_code)
+        return JSONResponse({"tools": to_jsonable(tools)})
+
+    async def tool_call(req: Request) -> JSONResponse:
+        agent_id = req.path_params["agent_id"]
+        payload = await req.json()
+        tool = str(payload.get("tool", ""))
+        params = payload.get("params", {}) or {}
+        try:
+            result = ctx._handle_tool_call_request(agent_id, tool, params)
+        except ToolCallError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=exc.status_code)
+        except Exception as exc:  # broad catch at API boundary
+            return JSONResponse({"error": str(exc)}, status_code=500)
+        return JSONResponse({"result": to_jsonable(result)})
+
+    async def events(req: Request) -> Response:
+        agent_id = req.path_params["agent_id"]
+        try:
+            subscription = ctx._subscribe_events(agent_id)
+        except ToolCallError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=exc.status_code)
+
+        ctx._log_event("agent_connected", agent=agent_id)
+
+        async def stream():
+            try:
+                loop = asyncio.get_event_loop()
+                while not ctx._server_stop_event.is_set():
+                    try:
+                        event = await asyncio.wait_for(
+                            loop.run_in_executor(None, subscription.get, True, 10),
+                            timeout=15,
+                        )
+                    except (asyncio.TimeoutError, queue.Empty):
+                        yield ": keepalive\n\n"
+                        continue
+                    payload = json.dumps(to_jsonable(event.data))
+                    yield f"event: {event.event}\ndata: {payload}\n\n"
+                    if event.event == "shutdown":
+                        return
+            except asyncio.CancelledError:
+                return
+            finally:
+                ctx._unsubscribe_events(agent_id, subscription)
+                ctx._log_event("agent_disconnected", agent=agent_id)
+
+        return StreamingResponse(
+            content=stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    return Starlette(routes=[
+        Route("/health", health),
+        Route("/agents/register", register, methods=["POST"]),
+        Route("/agents/{agent_id}/tool_call", tool_call, methods=["POST"]),
+        Route("/agents/{agent_id}/events", events),
+    ])
 
 
 class OrchestratorServer:
-    """In-process HTTP server for agent registration, tool calls, and SSE."""
+    """In-process HTTP server for agent communication."""
 
     def __init__(self, ctx: Context, bind_host: str, bind_port: int):
         self.ctx = ctx
-        self.httpd = _DruidsHTTPServer((bind_host, bind_port), _RequestHandler, ctx)
-        self._thread = threading.Thread(target=self.httpd.serve_forever, name="druids-server", daemon=True)
+        self._host = bind_host
+        self._port = bind_port
+        self._thread: threading.Thread | None = None
+        self._started = threading.Event()
+        self._actual_port: int | None = None
 
     @property
     def port(self) -> int:
-        return int(self.httpd.server_address[1])
+        return self._actual_port or self._port
 
     def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="druids-server", daemon=True)
         self._thread.start()
+        self._started.wait(timeout=10)
 
     def stop(self) -> None:
-        self.httpd.shutdown()
-        self.httpd.server_close()
-        self._thread.join(timeout=5)
+        if self._server is not None:
+            self._server.should_exit = True
+        if self._thread is not None:
+            self._thread.join(timeout=5)
 
+    def _run(self) -> None:
+        import uvicorn
 
-class _RequestHandler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
+        app = _make_app(self.ctx)
+        config = uvicorn.Config(
+            app,
+            host=self._host,
+            port=self._port,
+            log_level="warning",
+        )
+        self._server = uvicorn.Server(config)
 
-    def log_message(self, format: str, *args: object) -> None:
-        return None
+        # Capture the actual port after bind (when port=0)
+        original_startup = self._server.startup
 
-    def do_GET(self) -> None:  # noqa: N802
-        parsed = urlparse(self.path)
-        if parsed.path == "/health":
-            self._write_json(HTTPStatus.OK, {"status": "ok"})
-            return
+        async def _startup_and_signal(**kwargs: Any):
+            await original_startup(**kwargs)
+            for server in self._server.servers:
+                for sock in server.sockets:
+                    self._actual_port = sock.getsockname()[1]
+                    break
+            self._started.set()
 
-        match = re.fullmatch(r"/agents/([^/]+)/events", parsed.path)
-        if match:
-            self._handle_events(match.group(1))
-            return
-
-        self._write_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
-
-    def do_POST(self) -> None:  # noqa: N802
-        parsed = urlparse(self.path)
-        if parsed.path == "/agents/register":
-            self._handle_register()
-            return
-
-        match = re.fullmatch(r"/agents/([^/]+)/tool_call", parsed.path)
-        if match:
-            self._handle_tool_call(match.group(1))
-            return
-
-        self._write_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
-
-    @property
-    def ctx(self) -> Context:
-        return self.server.ctx  # type: ignore[attr-defined]
-
-    def _read_json(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length", "0"))
-        raw = self.rfile.read(length) if length else b"{}"
-        if not raw:
-            return {}
-        return json.loads(raw.decode("utf-8"))
-
-    def _write_json(self, status: int | HTTPStatus, body: dict[str, Any]) -> None:
-        payload = json.dumps(to_jsonable(body)).encode("utf-8")
-        self.send_response(int(status))
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(payload)))
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def _handle_register(self) -> None:
-        payload = self._read_json()
-        agent_id = str(payload.get("agent_id", ""))
-        execution_id = str(payload.get("execution_id", ""))
-
-        try:
-            tools = self.ctx._register_agent(agent_id, execution_id)
-        except ToolCallError as exc:
-            self._write_json(exc.status_code, {"error": str(exc)})
-            return
-
-        self._write_json(HTTPStatus.OK, {"tools": tools})
-
-    def _handle_tool_call(self, agent_id: str) -> None:
-        payload = self._read_json()
-        tool = str(payload.get("tool", ""))
-        params = payload.get("params", {}) or {}
-
-        try:
-            result = self.ctx._handle_tool_call_request(agent_id, tool, params)
-        except ToolCallError as exc:
-            self._write_json(exc.status_code, {"error": str(exc)})
-            return
-        except Exception as exc:  # pragma: no cover - safety net
-            self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
-            return
-
-        self._write_json(HTTPStatus.OK, {"result": result})
-
-    def _handle_events(self, agent_id: str) -> None:
-        try:
-            subscription = self.ctx._subscribe_events(agent_id)
-        except ToolCallError as exc:
-            self._write_json(exc.status_code, {"error": str(exc)})
-            return
-
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.end_headers()
-        self.wfile.flush()
-
-        self.ctx._log_event("agent_connected", agent=agent_id)
-        try:
-            while not self.ctx._server_stop_event.is_set():
-                try:
-                    event = subscription.get(timeout=10)
-                except queue.Empty:
-                    self.wfile.write(b": keepalive\n\n")
-                    self.wfile.flush()
-                    continue
-                payload = json.dumps(to_jsonable(event.data))
-                chunk = f"event: {event.event}\ndata: {payload}\n\n".encode("utf-8")
-                self.wfile.write(chunk)
-                self.wfile.flush()
-                if event.event == "shutdown":
-                    return
-        except (BrokenPipeError, ConnectionResetError):
-            return
-        finally:
-            self.ctx._unsubscribe_events(agent_id, subscription)
-            self.ctx._log_event("agent_disconnected", agent=agent_id)
+        self._server.startup = _startup_and_signal
+        self._server.run()
