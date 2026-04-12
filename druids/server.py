@@ -28,6 +28,7 @@ class AgentChannel:
         self._lock = threading.Lock()
         self._backlog: deque[SSEEvent] = deque()
         self._subscribers: set[queue.Queue[SSEEvent]] = set()
+        self.registered = threading.Event()
 
     def publish(self, event: SSEEvent) -> None:
         with self._lock:

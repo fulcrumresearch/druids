@@ -341,12 +341,20 @@ class Context:
             agent._machine.ensure_started()
             agent._spawned = True
             self._log_event("agent_spawned", agent=agent.name)
-        self._maybe_launch_agent_process(agent)
+        launched = self._maybe_launch_agent_process(agent)
+        if launched:
+            channel = self._channels[agent.name]
+            if not channel.registered.wait(timeout=120):
+                raise LaunchError(
+                    f"Agent '{agent.name}' did not register within 120s. "
+                    f"Check tmux session: druids-{self.execution_id}-{agent.name}"
+                )
 
-    def _maybe_launch_agent_process(self, agent: Agent) -> None:
+    def _maybe_launch_agent_process(self, agent: Agent) -> bool:
+        """Launch the agent's pi process. Returns True if launched."""
         if self.launch_mode == "manual":
             self._log_event("agent_launch_skipped", agent=agent.name, reason="manual_mode")
-            return
+            return False
 
         pi_command = shutil.which("pi")
         tmux_command = shutil.which("tmux")
@@ -354,7 +362,7 @@ class Context:
             if self.launch_mode == "always":
                 raise LaunchError("pi and tmux must both be available to launch agents")
             self._log_event("agent_launch_skipped", agent=agent.name, reason="missing_pi_or_tmux")
-            return
+            return False
 
         extension_path = f"/tmp/druids-extension-{self.execution_id}-{agent.name}.ts"
         agent.machine.write_file(extension_path, extension_source())
@@ -378,6 +386,7 @@ class Context:
         if not result.ok:
             raise LaunchError(result.stderr.strip() or result.stdout.strip() or f"Failed to launch agent '{agent.name}'")
         self._log_event("agent_process_started", agent=agent.name, tmux_session=session_name)
+        return True
 
     def _agent_server_url(self, machine: Machine) -> str:
         if self._configured_server_url:
@@ -410,6 +419,7 @@ class Context:
             raise ToolCallError(f"Unknown agent '{agent_id}'", status_code=404)
 
         agent._registered = True
+        self._channels[agent_id].registered.set()
         tools = _builtin_tools() + [build_tool_definition(name, handler) for name, handler in agent._handlers.items()]
         self._log_event("agent_registered", agent=agent_id, tool_count=len(tools))
 
@@ -530,6 +540,14 @@ class Context:
         if self._server is not None:
             self._server.stop()
             self._server = None
+
+        # Kill tmux sessions
+        for agent in self._agents.values():
+            session_name = f"druids-{self.execution_id}-{agent.name}"
+            try:
+                agent.machine.exec(f"tmux kill-session -t {shlex.quote(session_name)} 2>/dev/null || true", timeout=5)
+            except Exception:
+                pass
 
         seen: set[int] = set()
         for machine in self._machines:
