@@ -20,7 +20,7 @@ class ExecResult:
 
 
 class ExecutionFailed(RuntimeError):
-    """Raised when a context ends via ``ctx.fail(...)``."""
+    """Raised when a runtime ends via ``runtime.fail(...)``."""
 
     def __init__(self, reason: str):
         super().__init__(reason)

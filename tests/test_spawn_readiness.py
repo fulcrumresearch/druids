@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from druids import Context, LocalImage
+from druids import Runtime, LocalImage
 from tests.helpers import FakeAgentClient, disable_agent_launch, wait_for_server
 
 
@@ -16,7 +16,7 @@ def test_registered_event_set_on_register(tmp_path: Path, monkeypatch: pytest.Mo
     async def run() -> None:
         monkeypatch.chdir(tmp_path)
 
-        ctx = Context(image=LocalImage(tmp_path / "agent"))
+        ctx = Runtime(image=LocalImage(tmp_path / "agent"))
         await ctx.start()
         try:
             disable_agent_launch(ctx, monkeypatch)
@@ -49,7 +49,7 @@ def test_dynamic_agent_in_handler_is_usable(tmp_path: Path, monkeypatch: pytest.
     async def run() -> None:
         monkeypatch.chdir(tmp_path)
 
-        ctx = Context(image=LocalImage(tmp_path / "shared"))
+        ctx = Runtime(image=LocalImage(tmp_path / "shared"))
         await ctx.start()
         try:
             disable_agent_launch(ctx, monkeypatch)
@@ -83,7 +83,7 @@ def test_spawn_readiness_blocks_until_registered(tmp_path: Path, monkeypatch: py
     async def run() -> None:
         monkeypatch.chdir(tmp_path)
 
-        ctx = Context(image=LocalImage(tmp_path / "agent"))
+        ctx = Runtime(image=LocalImage(tmp_path / "agent"))
         await ctx.start()
         try:
             async def fake_launch(agent):

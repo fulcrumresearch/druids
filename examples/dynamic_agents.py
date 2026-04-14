@@ -3,7 +3,7 @@
 A finder agent discovers tasks and spawns implementation agents for each one.
 Demonstrates:
   - Dynamic agent creation inside handlers
-  - ctx.connect() at runtime
+  - Ambient runtime helpers
   - Multiple agents sharing work
 """
 
@@ -11,14 +11,15 @@ from __future__ import annotations
 
 import asyncio
 
-from druids import Context, LocalImage
+from druids import LocalImage, agent, agent_runtime, exit, wait
 
 
 task_count = 0
 
 
-async def setup(ctx: Context) -> None:
-    finder = await ctx.agent("finder")
+@agent_runtime(image=LocalImage())
+async def main() -> None:
+    finder = await agent("finder")
 
     @finder.on("spawn_task")
     async def on_spawn(name: str = "", spec: str = "") -> str:
@@ -26,7 +27,7 @@ async def setup(ctx: Context) -> None:
         global task_count
         task_count += 1
         agent_name = f"impl-{task_count}"
-        impl = await ctx.agent(agent_name)
+        impl = await agent(agent_name)
 
         @impl.on("task_complete")
         async def on_task_complete(summary: str = "") -> str:
@@ -42,7 +43,7 @@ async def setup(ctx: Context) -> None:
     @finder.on("all_done")
     async def on_all_done() -> str:
         """Signal all tasks have been spawned and completed."""
-        ctx.exit(f"Completed {task_count} tasks.")
+        exit(f"Completed {task_count} tasks.")
         return "Finishing."
 
     await finder.send(
@@ -52,10 +53,7 @@ async def setup(ctx: Context) -> None:
         "After spawning both, call all_done."
     )
 
-
-async def main() -> None:
-    ctx = Context(image=LocalImage())
-    print(await ctx.run(setup))
+    print(await wait())
 
 
 if __name__ == "__main__":

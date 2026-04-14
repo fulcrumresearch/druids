@@ -9,7 +9,7 @@ import urllib.request
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from druids.context import Context
+    from druids.runtime import Runtime
 
 
 class FakeAgentClient:
@@ -95,11 +95,11 @@ class FakeAgentClient:
                 return data
 
 
-def disable_agent_launch(ctx: Context, monkeypatch) -> None:
+def disable_agent_launch(runtime: Runtime, monkeypatch) -> None:
     async def fake_launch(agent):
         return False
 
-    monkeypatch.setattr(ctx, "_launch_agent", fake_launch)
+    monkeypatch.setattr(runtime, "_launch_agent", fake_launch)
 
 
 def wait_for_server(base_url: str, timeout: float = 5) -> None:

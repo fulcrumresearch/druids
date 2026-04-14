@@ -7,7 +7,16 @@ from pathlib import Path
 
 import pytest
 
-from druids import Context, ExecutionFailed, LocalImage
+from druids import (
+    ExecutionFailed,
+    LocalImage,
+    Runtime,
+    agent,
+    agent_runtime,
+    current_runtime,
+    exit,
+    wait,
+)
 from tests.helpers import FakeAgentClient, disable_agent_launch, wait_for_server
 
 
@@ -15,17 +24,17 @@ def test_run_starts_waits_and_closes(tmp_path: Path, monkeypatch: pytest.MonkeyP
     async def run() -> None:
         monkeypatch.chdir(tmp_path)
 
-        ctx = Context(image=LocalImage(tmp_path / "builder"))
+        ctx = Runtime(image=LocalImage(tmp_path / "builder"))
         disable_agent_launch(ctx, monkeypatch)
         created: dict[str, object] = {}
 
-        async def setup(active_ctx: Context) -> None:
-            builder = await active_ctx.agent("builder")
+        async def setup() -> None:
+            builder = await agent("builder")
             created["builder"] = builder
 
             @builder.on("submit")
             async def submit(summary: str = "") -> str:
-                active_ctx.exit(summary)
+                exit(summary)
                 return "submitted"
 
         run_task = asyncio.create_task(ctx.run(setup, timeout=5))
@@ -53,11 +62,44 @@ def test_run_starts_waits_and_closes(tmp_path: Path, monkeypatch: pytest.MonkeyP
     asyncio.run(run())
 
 
+def test_agent_runtime_decorator(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run() -> None:
+        monkeypatch.chdir(tmp_path)
+
+        @agent_runtime(image=LocalImage(tmp_path / "builder"))
+        async def program() -> str:
+            runtime = current_runtime()
+            disable_agent_launch(runtime, monkeypatch)
+            builder = await agent("builder")
+
+            @builder.on("submit")
+            async def submit(summary: str = "") -> str:
+                exit(summary)
+                return "submitted"
+
+            assert runtime.server_url is not None
+            await asyncio.to_thread(wait_for_server, runtime.server_url)
+
+            client = FakeAgentClient(runtime.server_url, runtime.execution_id or "", "builder")
+            client.start_events()
+            await asyncio.to_thread(client.register)
+            await builder.send("Implement the thing")
+            assert await asyncio.to_thread(client.next_event, "message") == {"text": "Implement the thing"}
+            assert await asyncio.to_thread(client.tool_call, "submit", {"summary": "done"}) == "submitted"
+            return await wait(timeout=5)
+
+        assert await program() == "done"
+        with pytest.raises(RuntimeError, match="No active runtime"):
+            current_runtime()
+
+    asyncio.run(run())
+
+
 def test_register_and_submit_flow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     async def run() -> None:
         monkeypatch.chdir(tmp_path)
 
-        ctx = Context(image=LocalImage(tmp_path / "builder"))
+        ctx = Runtime(image=LocalImage(tmp_path / "builder"))
         await ctx.start()
         try:
             disable_agent_launch(ctx, monkeypatch)
@@ -94,7 +136,7 @@ def test_dynamic_tool_registration_pushes_new_tool_event(tmp_path: Path, monkeyp
     async def run() -> None:
         monkeypatch.chdir(tmp_path)
 
-        ctx = Context(image=LocalImage(tmp_path / "builder"))
+        ctx = Runtime(image=LocalImage(tmp_path / "builder"))
         await ctx.start()
         try:
             disable_agent_launch(ctx, monkeypatch)
@@ -133,7 +175,7 @@ def test_builtin_message_and_file_transfer(tmp_path: Path, monkeypatch: pytest.M
     async def run() -> None:
         monkeypatch.chdir(tmp_path)
 
-        ctx = Context()
+        ctx = Runtime()
         await ctx.start()
         try:
             disable_agent_launch(ctx, monkeypatch)
@@ -194,7 +236,7 @@ def test_connection_enforcement_returns_http_error(tmp_path: Path, monkeypatch: 
     async def run() -> None:
         monkeypatch.chdir(tmp_path)
 
-        ctx = Context()
+        ctx = Runtime()
         await ctx.start()
         try:
             disable_agent_launch(ctx, monkeypatch)
@@ -237,7 +279,7 @@ def test_dynamic_agent_creation_inside_handler_is_immediate(tmp_path: Path, monk
     async def run() -> None:
         monkeypatch.chdir(tmp_path)
 
-        ctx = Context(image=LocalImage(tmp_path / "shared"))
+        ctx = Runtime(image=LocalImage(tmp_path / "shared"))
         await ctx.start()
         try:
             disable_agent_launch(ctx, monkeypatch)
@@ -272,7 +314,7 @@ def test_ctx_fail_raises_execution_failed(tmp_path: Path, monkeypatch: pytest.Mo
     async def run() -> None:
         monkeypatch.chdir(tmp_path)
 
-        ctx = Context(image=LocalImage(tmp_path / "builder"))
+        ctx = Runtime(image=LocalImage(tmp_path / "builder"))
         await ctx.start()
         try:
             disable_agent_launch(ctx, monkeypatch)
@@ -304,7 +346,7 @@ def test_duplicate_agent_names_are_rejected(tmp_path: Path, monkeypatch: pytest.
     async def run() -> None:
         monkeypatch.chdir(tmp_path)
 
-        ctx = Context(image=LocalImage(tmp_path / "builder"))
+        ctx = Runtime(image=LocalImage(tmp_path / "builder"))
         await ctx.start()
         try:
             disable_agent_launch(ctx, monkeypatch)
@@ -321,7 +363,7 @@ def test_register_validates_execution_id(tmp_path: Path, monkeypatch: pytest.Mon
     async def run() -> None:
         monkeypatch.chdir(tmp_path)
 
-        ctx = Context(image=LocalImage(tmp_path / "builder"))
+        ctx = Runtime(image=LocalImage(tmp_path / "builder"))
         await ctx.start()
         try:
             disable_agent_launch(ctx, monkeypatch)

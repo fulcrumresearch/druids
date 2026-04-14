@@ -12,14 +12,15 @@ from __future__ import annotations
 
 import asyncio
 
-from druids import Context, LocalImage
+from druids import LocalImage, agent, agent_runtime, connect, exit, wait
 
 
-async def setup(ctx: Context) -> None:
-    builder = await ctx.agent("builder")
-    auditor = await ctx.agent("auditor")
+@agent_runtime(image=LocalImage())
+async def main() -> None:
+    builder = await agent("builder")
+    auditor = await agent("auditor")
 
-    ctx.connect(builder, auditor)
+    connect(builder, auditor)
 
     @builder.on("submit")
     async def on_submit(summary: str = "") -> str:
@@ -30,7 +31,7 @@ async def setup(ctx: Context) -> None:
     @auditor.on("approve")
     async def on_approve(summary: str = "") -> str:
         """Approve the build."""
-        ctx.exit(summary)
+        exit(summary)
         return "Done."
 
     @auditor.on("reject")
@@ -42,10 +43,7 @@ async def setup(ctx: Context) -> None:
     await builder.send("Implement the feature described in the spec.")
     await auditor.send("You audit the builder's work.")
 
-
-async def main() -> None:
-    ctx = Context(image=LocalImage())
-    print(await ctx.run(setup))
+    print(await wait())
 
 
 if __name__ == "__main__":
