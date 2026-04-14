@@ -16,13 +16,15 @@ def test_registered_event_set_on_register(tmp_path: Path, monkeypatch: pytest.Mo
     async def run() -> None:
         monkeypatch.chdir(tmp_path)
 
-        async with Context(image=LocalImage(tmp_path / "agent")) as ctx:
+        ctx = Context(image=LocalImage(tmp_path / "agent"))
+        await ctx.start()
+        try:
             disable_agent_launch(ctx, monkeypatch)
             agent = await ctx.agent("worker")
 
             @agent.on("finish")
             async def finish() -> str:
-                await ctx.done("ok")
+                ctx.exit("ok")
                 return "ok"
 
             assert not agent._channel.registered.is_set()
@@ -37,6 +39,8 @@ def test_registered_event_set_on_register(tmp_path: Path, monkeypatch: pytest.Mo
             assert agent._channel.registered.is_set()
             assert await asyncio.to_thread(client.tool_call, "finish") == "ok"
             assert await ctx.wait(timeout=5) == "ok"
+        finally:
+            await ctx.close()
 
     asyncio.run(run())
 
@@ -45,7 +49,9 @@ def test_dynamic_agent_in_handler_is_usable(tmp_path: Path, monkeypatch: pytest.
     async def run() -> None:
         monkeypatch.chdir(tmp_path)
 
-        async with Context(image=LocalImage(tmp_path / "shared")) as ctx:
+        ctx = Context(image=LocalImage(tmp_path / "shared"))
+        await ctx.start()
+        try:
             disable_agent_launch(ctx, monkeypatch)
             finder = await ctx.agent("finder")
             created_agents: dict[str, object] = {}
@@ -54,7 +60,7 @@ def test_dynamic_agent_in_handler_is_usable(tmp_path: Path, monkeypatch: pytest.
             async def spawn() -> str:
                 worker = await ctx.agent("worker", machine=finder.machine)
                 created_agents["worker"] = worker
-                await ctx.done("spawned")
+                ctx.exit("spawned")
                 return worker.name
 
             assert ctx.server_url is not None
@@ -67,6 +73,8 @@ def test_dynamic_agent_in_handler_is_usable(tmp_path: Path, monkeypatch: pytest.
 
             assert await ctx.wait(timeout=5) == "spawned"
             assert created_agents["worker"].machine is finder.machine
+        finally:
+            await ctx.close()
 
     asyncio.run(run())
 
@@ -75,7 +83,9 @@ def test_spawn_readiness_blocks_until_registered(tmp_path: Path, monkeypatch: py
     async def run() -> None:
         monkeypatch.chdir(tmp_path)
 
-        async with Context(image=LocalImage(tmp_path / "agent")) as ctx:
+        ctx = Context(image=LocalImage(tmp_path / "agent"))
+        await ctx.start()
+        try:
             async def fake_launch(agent):
                 async def delayed_register() -> None:
                     await asyncio.sleep(0.3)
@@ -93,5 +103,7 @@ def test_spawn_readiness_blocks_until_registered(tmp_path: Path, monkeypatch: py
             assert agent.name == "test-agent"
             assert agent._channel.registered.is_set()
             assert elapsed >= 0.25
+        finally:
+            await ctx.close()
 
     asyncio.run(run())

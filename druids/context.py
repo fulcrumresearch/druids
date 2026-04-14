@@ -81,7 +81,7 @@ class Agent:
                 raise TypeError("'caller' injection is not supported")
             self._handlers[tool_name] = fn
             if (
-                self._ctx._entered
+                self._ctx._running
                 and self._channel.registered.is_set()
                 and not self._ctx._shutting_down
             ):
@@ -93,13 +93,13 @@ class Agent:
         return decorator
 
     async def send(self, message: str) -> None:
-        self._ctx._ensure_entered()
+        self._ctx._ensure_running()
         self._ctx._send_message(self.name, message)
 
     async def exec(
         self, command: str, *, user: str = "agent", timeout: int | None = None
     ) -> ExecResult:
-        self._ctx._ensure_entered()
+        self._ctx._ensure_running()
         return await self.machine.exec(command, user=user, timeout=timeout)
 
 
@@ -114,27 +114,47 @@ class Context:
         self._machines: list[Machine] = []
         self._edges: set[tuple[str, str]] = set()
 
-        self._entered = False
+        self._running = False
         self._shutting_down = False
         self._server: OrchestratorServer | None = None
-        self._completion_future: asyncio.Future[tuple[str, Any]] | None = None
+        self._outcome_future: asyncio.Future[tuple[str, Any]] | None = None
 
-    async def __aenter__(self) -> Context:
-        if self._entered:
+    async def start(self) -> None:
+        if self._running:
             raise RuntimeError("Context is already running")
 
         self.execution_id = str(uuid.uuid4())
-        self._completion_future = asyncio.get_running_loop().create_future()
-        self._entered = True
+        self._outcome_future = asyncio.get_running_loop().create_future()
         self._shutting_down = False
 
         self._server = OrchestratorServer(self)
-        await self._server.start()
-        self.server_url = f"http://127.0.0.1:{self._server.port}"
-        return self
+        try:
+            await self._server.start()
+        except Exception:
+            self._server = None
+            self.server_url = None
+            self._outcome_future = None
+            raise
 
-    async def __aexit__(self, exc_type, exc, tb) -> None:
+        self.server_url = f"http://127.0.0.1:{self._server.port}"
+        self._running = True
+
+    async def close(self) -> None:
         await self._shutdown()
+
+    async def run(
+        self,
+        setup: Callable[[Context], Awaitable[None]] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> Any:
+        await self.start()
+        try:
+            if setup is not None:
+                await setup(self)
+            return await self.wait(timeout=timeout)
+        finally:
+            await self.close()
 
     async def agent(
         self,
@@ -144,7 +164,7 @@ class Context:
         image: Image | None = None,
         machine: Machine | None = None,
     ) -> Agent:
-        self._ensure_entered()
+        self._ensure_running()
         if name in self._agents:
             raise ValueError(f"Agent '{name}' already exists")
 
@@ -159,7 +179,7 @@ class Context:
         return agent
 
     async def machine(self, image: Image | None = None) -> Machine:
-        self._ensure_entered()
+        self._ensure_running()
         machine = await (image or self.image).spawn()
         self._machines.append(machine)
         return machine
@@ -171,27 +191,22 @@ class Context:
         if direction == "both":
             self._edges.add((b.name, a.name))
 
-    async def done(self, result: Any = None) -> None:
-        self._ensure_entered()
-        if self._completion_future is None or self._completion_future.done():
-            return
-        self._completion_future.set_result(("done", result))
+    def exit(self, result: Any = None) -> None:
+        future = self._require_outcome_future()
+        if not future.done():
+            future.set_result(("done", result))
 
-    async def fail(self, reason: str) -> None:
-        self._ensure_entered()
-        if self._completion_future is None or self._completion_future.done():
-            return
-        self._completion_future.set_result(("failed", reason))
+    def fail(self, reason: str) -> None:
+        future = self._require_outcome_future()
+        if not future.done():
+            future.set_result(("failed", reason))
 
     async def wait(self, *, timeout: float | None = None) -> Any:
-        self._ensure_entered()
-        if self._completion_future is None:
-            raise RuntimeError("Context is not running")
-
+        future = self._require_outcome_future()
         outcome, value = await (
-            asyncio.wait_for(asyncio.shield(self._completion_future), timeout=timeout)
+            asyncio.wait_for(asyncio.shield(future), timeout=timeout)
             if timeout is not None
-            else asyncio.shield(self._completion_future)
+            else asyncio.shield(future)
         )
         if outcome == "failed":
             raise ExecutionFailed(str(value))
@@ -209,11 +224,18 @@ class Context:
         self._machines.append(machine)
         return machine
 
-    def _ensure_entered(self) -> None:
-        if not self._entered:
+    def _ensure_running(self) -> None:
+        if not self._running:
             raise RuntimeError(
-                "Context is not running. Use 'async with Context(...) as ctx'."
+                "Context is not running. Use 'await ctx.run(...)' or 'await ctx.start()'."
             )
+
+    def _require_outcome_future(self) -> asyncio.Future[tuple[str, Any]]:
+        self._ensure_running()
+        future = self._outcome_future
+        if future is None:
+            raise RuntimeError("Internal error: missing run outcome future")
+        return future
 
     async def _spawn_agent(self, agent: Agent) -> None:
         if not await self._launch_agent(agent):
@@ -364,7 +386,7 @@ class Context:
             )
 
     async def _shutdown(self) -> None:
-        if not self._entered:
+        if not self._running:
             return
 
         self._shutting_down = True
@@ -401,4 +423,6 @@ class Context:
             except Exception:
                 pass
 
-        self._entered = False
+        self.server_url = None
+        self._outcome_future = None
+        self._running = False

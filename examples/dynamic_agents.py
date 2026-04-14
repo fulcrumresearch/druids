@@ -17,42 +17,45 @@ from druids import Context, LocalImage
 task_count = 0
 
 
-async def main() -> None:
-    async with Context(image=LocalImage()) as ctx:
-        finder = await ctx.agent("finder")
+async def setup(ctx: Context) -> None:
+    finder = await ctx.agent("finder")
 
-        @finder.on("spawn_task")
-        async def on_spawn(name: str = "", spec: str = "") -> str:
-            """Spawn an implementation agent for a task."""
-            global task_count
-            task_count += 1
-            agent_name = f"impl-{task_count}"
-            impl = await ctx.agent(agent_name)
+    @finder.on("spawn_task")
+    async def on_spawn(name: str = "", spec: str = "") -> str:
+        """Spawn an implementation agent for a task."""
+        global task_count
+        task_count += 1
+        agent_name = f"impl-{task_count}"
+        impl = await ctx.agent(agent_name)
 
-            @impl.on("task_complete")
-            async def on_task_complete(summary: str = "") -> str:
-                """Signal that the task is complete."""
-                await finder.send(f"Task '{name}' completed: {summary}")
-                return "Noted."
+        @impl.on("task_complete")
+        async def on_task_complete(summary: str = "") -> str:
+            """Signal that the task is complete."""
+            await finder.send(f"Task '{name}' completed: {summary}")
+            return "Noted."
 
-            await impl.send(
-                f"Complete this task: {spec}\nWhen done, call task_complete with a summary."
-            )
-            return f"Spawned {agent_name} for task '{name}'."
-
-        @finder.on("all_done")
-        async def on_all_done() -> str:
-            """Signal all tasks have been spawned and completed."""
-            await ctx.done(f"Completed {task_count} tasks.")
-            return "Finishing."
-
-        await finder.send(
-            "You are a task finder. Spawn exactly 2 tasks:\n"
-            "1. Call spawn_task with name='hello' and spec='Write a file /tmp/hello.txt containing Hello World'\n"
-            "2. Call spawn_task with name='goodbye' and spec='Write a file /tmp/goodbye.txt containing Goodbye World'\n"
-            "After spawning both, call all_done."
+        await impl.send(
+            f"Complete this task: {spec}\nWhen done, call task_complete with a summary."
         )
-        print(await ctx.wait())
+        return f"Spawned {agent_name} for task '{name}'."
+
+    @finder.on("all_done")
+    async def on_all_done() -> str:
+        """Signal all tasks have been spawned and completed."""
+        ctx.exit(f"Completed {task_count} tasks.")
+        return "Finishing."
+
+    await finder.send(
+        "You are a task finder. Spawn exactly 2 tasks:\n"
+        "1. Call spawn_task with name='hello' and spec='Write a file /tmp/hello.txt containing Hello World'\n"
+        "2. Call spawn_task with name='goodbye' and spec='Write a file /tmp/goodbye.txt containing Goodbye World'\n"
+        "After spawning both, call all_done."
+    )
+
+
+async def main() -> None:
+    ctx = Context(image=LocalImage())
+    print(await ctx.run(setup))
 
 
 if __name__ == "__main__":

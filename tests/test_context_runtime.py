@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import urllib.error
 from pathlib import Path
 
@@ -10,17 +11,61 @@ from druids import Context, ExecutionFailed, LocalImage
 from tests.helpers import FakeAgentClient, disable_agent_launch, wait_for_server
 
 
+def test_run_starts_waits_and_closes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run() -> None:
+        monkeypatch.chdir(tmp_path)
+
+        ctx = Context(image=LocalImage(tmp_path / "builder"))
+        disable_agent_launch(ctx, monkeypatch)
+        created: dict[str, object] = {}
+
+        async def setup(active_ctx: Context) -> None:
+            builder = await active_ctx.agent("builder")
+            created["builder"] = builder
+
+            @builder.on("submit")
+            async def submit(summary: str = "") -> str:
+                active_ctx.exit(summary)
+                return "submitted"
+
+        run_task = asyncio.create_task(ctx.run(setup, timeout=5))
+        try:
+            while ctx.server_url is None or "builder" not in created:
+                if run_task.done():
+                    await run_task
+                await asyncio.sleep(0.01)
+
+            assert ctx.server_url is not None
+            await asyncio.to_thread(wait_for_server, ctx.server_url)
+
+            client = FakeAgentClient(ctx.server_url, ctx.execution_id or "", "builder")
+            client.start_events()
+            await asyncio.to_thread(client.register)
+            assert await asyncio.to_thread(client.tool_call, "submit", {"summary": "done"}) == "submitted"
+            assert await run_task == "done"
+            assert ctx.server_url is None
+        finally:
+            if not run_task.done():
+                run_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await run_task
+
+    asyncio.run(run())
+
+
 def test_register_and_submit_flow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     async def run() -> None:
         monkeypatch.chdir(tmp_path)
 
-        async with Context(image=LocalImage(tmp_path / "builder")) as ctx:
+        ctx = Context(image=LocalImage(tmp_path / "builder"))
+        await ctx.start()
+        try:
             disable_agent_launch(ctx, monkeypatch)
             builder = await ctx.agent("builder")
 
             @builder.on("submit")
             async def submit(summary: str = "") -> str:
-                await ctx.done(summary)
+                ctx.exit(summary)
                 return "submitted"
 
             assert ctx.server_url is not None
@@ -39,6 +84,8 @@ def test_register_and_submit_flow(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
 
             assert await asyncio.to_thread(client.tool_call, "submit", {"summary": "done"}) == "submitted"
             assert await ctx.wait(timeout=5) == "done"
+        finally:
+            await ctx.close()
 
     asyncio.run(run())
 
@@ -47,13 +94,15 @@ def test_dynamic_tool_registration_pushes_new_tool_event(tmp_path: Path, monkeyp
     async def run() -> None:
         monkeypatch.chdir(tmp_path)
 
-        async with Context(image=LocalImage(tmp_path / "builder")) as ctx:
+        ctx = Context(image=LocalImage(tmp_path / "builder"))
+        await ctx.start()
+        try:
             disable_agent_launch(ctx, monkeypatch)
             builder = await ctx.agent("builder")
 
             @builder.on("finish")
             async def finish() -> str:
-                await ctx.done("ok")
+                ctx.exit("ok")
                 return "ok"
 
             assert ctx.server_url is not None
@@ -74,6 +123,8 @@ def test_dynamic_tool_registration_pushes_new_tool_event(tmp_path: Path, monkeyp
             assert await asyncio.to_thread(client.tool_call, "late_tool", {"message": "hello"}) == "HELLO"
             assert await asyncio.to_thread(client.tool_call, "finish") == "ok"
             assert await ctx.wait(timeout=5) == "ok"
+        finally:
+            await ctx.close()
 
     asyncio.run(run())
 
@@ -82,7 +133,9 @@ def test_builtin_message_and_file_transfer(tmp_path: Path, monkeypatch: pytest.M
     async def run() -> None:
         monkeypatch.chdir(tmp_path)
 
-        async with Context() as ctx:
+        ctx = Context()
+        await ctx.start()
+        try:
             disable_agent_launch(ctx, monkeypatch)
             builder = await ctx.agent("builder", image=LocalImage(tmp_path / "builder"))
             reviewer = await ctx.agent("reviewer", image=LocalImage(tmp_path / "reviewer"))
@@ -90,7 +143,7 @@ def test_builtin_message_and_file_transfer(tmp_path: Path, monkeypatch: pytest.M
 
             @builder.on("finish")
             async def finish() -> str:
-                await ctx.done("complete")
+                ctx.exit("complete")
                 return "complete"
 
             assert ctx.server_url is not None
@@ -131,6 +184,8 @@ def test_builtin_message_and_file_transfer(tmp_path: Path, monkeypatch: pytest.M
 
             assert await asyncio.to_thread(builder_client.tool_call, "finish") == "complete"
             assert await ctx.wait(timeout=5) == "complete"
+        finally:
+            await ctx.close()
 
     asyncio.run(run())
 
@@ -139,7 +194,9 @@ def test_connection_enforcement_returns_http_error(tmp_path: Path, monkeypatch: 
     async def run() -> None:
         monkeypatch.chdir(tmp_path)
 
-        async with Context() as ctx:
+        ctx = Context()
+        await ctx.start()
+        try:
             disable_agent_launch(ctx, monkeypatch)
             builder = await ctx.agent("builder", image=LocalImage(tmp_path / "builder"))
             reviewer = await ctx.agent("reviewer", image=LocalImage(tmp_path / "reviewer"))
@@ -147,7 +204,7 @@ def test_connection_enforcement_returns_http_error(tmp_path: Path, monkeypatch: 
 
             @builder.on("finish")
             async def finish() -> str:
-                await ctx.done("ok")
+                ctx.exit("ok")
                 return "ok"
 
             assert ctx.server_url is not None
@@ -170,6 +227,8 @@ def test_connection_enforcement_returns_http_error(tmp_path: Path, monkeypatch: 
 
             assert await asyncio.to_thread(builder_client.tool_call, "finish") == "ok"
             assert await ctx.wait(timeout=5) == "ok"
+        finally:
+            await ctx.close()
 
     asyncio.run(run())
 
@@ -178,7 +237,9 @@ def test_dynamic_agent_creation_inside_handler_is_immediate(tmp_path: Path, monk
     async def run() -> None:
         monkeypatch.chdir(tmp_path)
 
-        async with Context(image=LocalImage(tmp_path / "shared")) as ctx:
+        ctx = Context(image=LocalImage(tmp_path / "shared"))
+        await ctx.start()
+        try:
             disable_agent_launch(ctx, monkeypatch)
             builder = await ctx.agent("builder")
             created: dict[str, object] = {}
@@ -187,7 +248,7 @@ def test_dynamic_agent_creation_inside_handler_is_immediate(tmp_path: Path, monk
             async def spawn() -> str:
                 reviewer = await ctx.agent("reviewer", machine=builder.machine)
                 created["reviewer"] = reviewer
-                await ctx.done("spawned")
+                ctx.exit("spawned")
                 return reviewer.name
 
             assert ctx.server_url is not None
@@ -201,6 +262,8 @@ def test_dynamic_agent_creation_inside_handler_is_immediate(tmp_path: Path, monk
             assert await ctx.wait(timeout=5) == "spawned"
             reviewer = created["reviewer"]
             assert reviewer.machine is builder.machine
+        finally:
+            await ctx.close()
 
     asyncio.run(run())
 
@@ -209,26 +272,30 @@ def test_ctx_fail_raises_execution_failed(tmp_path: Path, monkeypatch: pytest.Mo
     async def run() -> None:
         monkeypatch.chdir(tmp_path)
 
-        with pytest.raises(ExecutionFailed) as exc_info:
-            async with Context(image=LocalImage(tmp_path / "builder")) as ctx:
-                disable_agent_launch(ctx, monkeypatch)
-                builder = await ctx.agent("builder")
+        ctx = Context(image=LocalImage(tmp_path / "builder"))
+        await ctx.start()
+        try:
+            disable_agent_launch(ctx, monkeypatch)
+            builder = await ctx.agent("builder")
 
-                @builder.on("reject")
-                async def reject(reason: str = "") -> str:
-                    await ctx.fail(reason)
-                    return "rejected"
+            @builder.on("reject")
+            async def reject(reason: str = "") -> str:
+                ctx.fail(reason)
+                return "rejected"
 
-                assert ctx.server_url is not None
-                await asyncio.to_thread(wait_for_server, ctx.server_url)
+            assert ctx.server_url is not None
+            await asyncio.to_thread(wait_for_server, ctx.server_url)
 
-                client = FakeAgentClient(ctx.server_url, ctx.execution_id or "", "builder")
-                client.start_events()
-                await asyncio.to_thread(client.register)
-                assert await asyncio.to_thread(client.tool_call, "reject", {"reason": "bad build"}) == "rejected"
+            client = FakeAgentClient(ctx.server_url, ctx.execution_id or "", "builder")
+            client.start_events()
+            await asyncio.to_thread(client.register)
+            assert await asyncio.to_thread(client.tool_call, "reject", {"reason": "bad build"}) == "rejected"
+
+            with pytest.raises(ExecutionFailed) as exc_info:
                 await ctx.wait(timeout=5)
-
-        assert exc_info.value.reason == "bad build"
+            assert exc_info.value.reason == "bad build"
+        finally:
+            await ctx.close()
 
     asyncio.run(run())
 
@@ -237,11 +304,15 @@ def test_duplicate_agent_names_are_rejected(tmp_path: Path, monkeypatch: pytest.
     async def run() -> None:
         monkeypatch.chdir(tmp_path)
 
-        async with Context(image=LocalImage(tmp_path / "builder")) as ctx:
+        ctx = Context(image=LocalImage(tmp_path / "builder"))
+        await ctx.start()
+        try:
             disable_agent_launch(ctx, monkeypatch)
             await ctx.agent("builder")
             with pytest.raises(ValueError, match="already exists"):
                 await ctx.agent("builder")
+        finally:
+            await ctx.close()
 
     asyncio.run(run())
 
@@ -250,7 +321,9 @@ def test_register_validates_execution_id(tmp_path: Path, monkeypatch: pytest.Mon
     async def run() -> None:
         monkeypatch.chdir(tmp_path)
 
-        async with Context(image=LocalImage(tmp_path / "builder")) as ctx:
+        ctx = Context(image=LocalImage(tmp_path / "builder"))
+        await ctx.start()
+        try:
             disable_agent_launch(ctx, monkeypatch)
             await ctx.agent("builder")
 
@@ -265,5 +338,7 @@ def test_register_validates_execution_id(tmp_path: Path, monkeypatch: pytest.Mon
             assert exc_info.value.code == 400
             body = exc_info.value.read().decode("utf-8")
             assert "Execution ID mismatch" in body
+        finally:
+            await ctx.close()
 
     asyncio.run(run())
