@@ -11,14 +11,14 @@ from __future__ import annotations
 
 import asyncio
 
-from druids import LocalImage, agent, agent_runtime, exit, wait
+from druids import LocalImage, agent, agent_runtime, exit
 
 
 task_count = 0
 
 
 @agent_runtime(image=LocalImage())
-async def main() -> None:
+async def run_agents() -> str:
     finder = await agent("finder")
 
     @finder.on("spawn_task")
@@ -53,7 +53,9 @@ async def main() -> None:
         "After spawning both, call all_done."
     )
 
-    print(await wait())
+
+async def main() -> None:
+    print(await run_agents())
 
 
 if __name__ == "__main__":

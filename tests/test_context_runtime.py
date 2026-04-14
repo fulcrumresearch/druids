@@ -15,7 +15,6 @@ from druids import (
     agent_runtime,
     current_runtime,
     exit,
-    wait,
 )
 from tests.helpers import FakeAgentClient, disable_agent_launch, wait_for_server
 
@@ -66,7 +65,7 @@ def test_agent_runtime_decorator(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     async def run() -> None:
         monkeypatch.chdir(tmp_path)
 
-        @agent_runtime(image=LocalImage(tmp_path / "builder"))
+        @agent_runtime(image=LocalImage(tmp_path / "builder"), timeout=5)
         async def program() -> str:
             runtime = current_runtime()
             disable_agent_launch(runtime, monkeypatch)
@@ -86,11 +85,61 @@ def test_agent_runtime_decorator(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
             await builder.send("Implement the thing")
             assert await asyncio.to_thread(client.next_event, "message") == {"text": "Implement the thing"}
             assert await asyncio.to_thread(client.tool_call, "submit", {"summary": "done"}) == "submitted"
-            return await wait(timeout=5)
 
         assert await program() == "done"
         with pytest.raises(RuntimeError, match="No active runtime"):
             current_runtime()
+
+    asyncio.run(run())
+
+
+def test_exit_cancels_decorated_program(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run() -> None:
+        monkeypatch.chdir(tmp_path)
+        state: dict[str, object] = {}
+
+        @agent_runtime(image=LocalImage(tmp_path / "builder"), timeout=5)
+        async def program() -> str:
+            runtime = current_runtime()
+            disable_agent_launch(runtime, monkeypatch)
+            builder = await agent("builder")
+
+            @builder.on("submit")
+            async def submit(summary: str = "") -> str:
+                exit(summary)
+                return "submitted"
+
+            assert runtime.server_url is not None
+            await asyncio.to_thread(wait_for_server, runtime.server_url)
+
+            client = FakeAgentClient(runtime.server_url, runtime.execution_id or "", "builder")
+            client.start_events()
+            await asyncio.to_thread(client.register)
+            state["client"] = client
+
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                state["cancelled"] = True
+                raise
+
+        program_task = asyncio.create_task(program())
+        try:
+            while "client" not in state:
+                if program_task.done():
+                    await program_task
+                await asyncio.sleep(0.01)
+
+            client = state["client"]
+            assert isinstance(client, FakeAgentClient)
+            assert await asyncio.to_thread(client.tool_call, "submit", {"summary": "done"}) == "submitted"
+            assert await program_task == "done"
+            assert state["cancelled"] is True
+        finally:
+            if not program_task.done():
+                program_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await program_task
 
     asyncio.run(run())
 

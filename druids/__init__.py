@@ -11,7 +11,6 @@ from druids.runtime import (
     exit,
     fail,
     machine,
-    wait,
 )
 from druids.types import ExecResult, ExecutionFailed
 
@@ -33,5 +32,4 @@ __all__ = [
     "exit",
     "fail",
     "machine",
-    "wait",
 ]

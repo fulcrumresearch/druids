@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import shlex
 import shutil
@@ -23,6 +24,36 @@ _CURRENT_RUNTIME: ContextVar[Runtime | None] = ContextVar(
 
 P = ParamSpec("P")
 R = TypeVar("R")
+
+
+async def _run_until_exit(body: Awaitable[Any] | None, *, timeout: float | None) -> Any:
+    if body is None:
+        return await current_runtime().wait(timeout=timeout)
+
+    body_task = asyncio.create_task(body)
+    exit_task = asyncio.create_task(current_runtime().wait(timeout=timeout))
+    try:
+        done, _ = await asyncio.wait(
+            {body_task, exit_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if body_task in done:
+            await body_task
+            return await exit_task
+
+        result = await exit_task
+        body_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await body_task
+        return result
+    finally:
+        if not body_task.done():
+            body_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await body_task
+        if not exit_task.done():
+            exit_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await exit_task
 
 
 def _builtin_tools() -> list[dict[str, Any]]:
@@ -121,13 +152,8 @@ class Agent:
                 raise TypeError("'caller' injection is not supported")
             self._handlers[tool_name] = fn
 
-            runtime = _CURRENT_RUNTIME.get()
-            if (
-                runtime is not None
-                and runtime.execution is not None
-                and self._channel.registered.is_set()
-                and not runtime._shutting_down
-            ):
+            runtime = current_runtime()
+            if self._channel.registered.is_set() and not runtime._shutting_down:
                 runtime._push_event(
                     self.name, "new_tool", build_tool_definition(tool_name, fn)
                 )
@@ -211,14 +237,15 @@ class Runtime:
 
     async def run(
         self,
-        setup: Callable[[], Awaitable[None]] | None = None,
+        body: Callable[[], Awaitable[Any]] | None = None,
         *,
         timeout: float | None = None,
     ) -> Any:
         async with self:
-            if setup is not None:
-                await setup()
-            return await self.wait(timeout=timeout)
+            return await _run_until_exit(
+                None if body is None else body(),
+                timeout=timeout,
+            )
 
     async def agent(
         self,
@@ -493,6 +520,12 @@ def current_runtime() -> Runtime:
         raise RuntimeError(
             "No active runtime. Use @agent_runtime, 'async with Runtime(...)', or 'await runtime.start()'."
         )
+
+    execution = runtime.execution
+    if execution is None or execution.outcome.done():
+        raise RuntimeError(
+            "No active runtime. Use @agent_runtime, 'async with Runtime(...)', or 'await runtime.start()'."
+        )
     return runtime
 
 
@@ -531,23 +564,23 @@ def fail(reason: str) -> None:
     current_runtime().fail(reason)
 
 
-async def wait(*, timeout: float | None = None) -> Any:
-    return await current_runtime().wait(timeout=timeout)
-
-
 def agent_runtime(
     fn: Callable[P, Awaitable[R]] | None = None,
     *,
     image: Image | None = None,
-) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]] | Callable[P, Awaitable[R]]:
+    timeout: float | None = None,
+) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]] | Callable[P, Awaitable[Any]]:
     def decorate(coro_fn: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
         if not inspect.iscoroutinefunction(coro_fn):
             raise TypeError("@agent_runtime requires an async function")
 
         @wraps(coro_fn)
-        async def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+        async def wrapped(*args: P.args, **kwargs: P.kwargs) -> Any:
             async with Runtime(image=image):
-                return await coro_fn(*args, **kwargs)
+                return await _run_until_exit(
+                    coro_fn(*args, **kwargs),
+                    timeout=timeout,
+                )
 
         return wrapped
 

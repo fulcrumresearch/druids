@@ -12,11 +12,11 @@ from __future__ import annotations
 
 import asyncio
 
-from druids import LocalImage, agent, agent_runtime, connect, exit, wait
+from druids import LocalImage, agent, agent_runtime, connect, exit
 
 
 @agent_runtime(image=LocalImage())
-async def main() -> None:
+async def run_agents() -> str:
     builder = await agent("builder")
     auditor = await agent("auditor")
 
@@ -43,7 +43,9 @@ async def main() -> None:
     await builder.send("Implement the feature described in the spec.")
     await auditor.send("You audit the builder's work.")
 
-    print(await wait())
+
+async def main() -> None:
+    print(await run_agents())
 
 
 if __name__ == "__main__":

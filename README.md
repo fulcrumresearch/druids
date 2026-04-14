@@ -4,11 +4,11 @@ A small async in-process multi-agent orchestration runtime.
 
 ```python
 import asyncio
-from druids import LocalImage, agent, agent_runtime, exit, wait
+from druids import LocalImage, agent, agent_runtime, exit
 
 
-@agent_runtime(image=LocalImage())
-async def main():
+@agent_runtime(image=LocalImage(), timeout=30)
+async def run_agents():
     builder = await agent("builder")
 
     @builder.on("submit")
@@ -17,7 +17,10 @@ async def main():
         return "done"
 
     await builder.send("Say hello, then call submit with summary='hello'.")
-    print(await wait(timeout=30))
+
+
+async def main():
+    print(await run_agents())
 
 
 asyncio.run(main())
@@ -43,8 +46,8 @@ asyncio.run(main())
 ## Notes
 
 - The primary lifecycle is `@agent_runtime(...)`; `async with Runtime(...)` is the low-level alternative.
-- `exit(result)` / `fail(reason)` signal completion.
-- `await wait()` blocks until `exit(...)` or `fail(...)` is called.
+- `exit(result)` / `fail(reason)` end the active runtime execution.
+- `@agent_runtime(...)` returns the value from `exit(...)`, or raises from `fail(...)`.
 - First instructions are sent explicitly with `await agent.send(...)` after your tools and connections are in place.
 - Tool handlers must be `async def`.
 - The public API always launches real `pi` agents in `tmux`.

@@ -31,10 +31,10 @@ import asyncio
 import logging, sys
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 
-from druids import LocalImage, agent, agent_runtime, exit, wait
+from druids import LocalImage, agent, agent_runtime, exit
 
-@agent_runtime(image=LocalImage())
-async def main():
+@agent_runtime(image=LocalImage(), timeout=60)
+async def run_agents():
     worker = await agent("worker")
 
     @worker.on("finish")
@@ -46,7 +46,9 @@ async def main():
     await worker.send(
         "Call the finish tool with result='hello-druids'. Do not say anything else, just call the tool immediately."
     )
-    result = await wait(timeout=60)
+
+async def main():
+    result = await run_agents()
     print(f"RESULT:{result}")
 
 asyncio.run(main())
@@ -65,10 +67,10 @@ import asyncio
 import logging, sys
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 
-from druids import LocalImage, agent, agent_runtime, connect, exit, wait
+from druids import LocalImage, agent, agent_runtime, connect, exit
 
-@agent_runtime(image=LocalImage())
-async def main():
+@agent_runtime(image=LocalImage(), timeout=90)
+async def run_agents():
     sender = await agent("sender")
     receiver = await agent("receiver")
     connect(sender, receiver)
@@ -92,7 +94,8 @@ async def main():
         "Call the notify tool with text='ping-from-sender'. Do nothing else, just call the tool."
     )
 
-    result = await wait(timeout=90)
+async def main():
+    result = await run_agents()
     print(f"RESULT:{result}")
 
 asyncio.run(main())
@@ -113,10 +116,10 @@ import asyncio
 import logging, sys
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 
-from druids import ExecutionFailed, LocalImage, agent, agent_runtime, fail, wait
+from druids import ExecutionFailed, LocalImage, agent, agent_runtime, fail
 
-@agent_runtime(image=LocalImage())
-async def main():
+@agent_runtime(image=LocalImage(), timeout=60)
+async def run_agents():
     worker = await agent("worker")
 
     @worker.on("abort")
@@ -127,8 +130,9 @@ async def main():
 
     await worker.send("Call the abort tool immediately. Do nothing else.")
 
+async def main():
     try:
-        await wait(timeout=60)
+        await run_agents()
         print("ERROR:no-exception")
     except ExecutionFailed as e:
         print(f"CAUGHT:{e.reason}")
@@ -138,7 +142,7 @@ asyncio.run(main())
 
 
 def test_fail_raises_execution_failed():
-    """fail() causes wait() to raise ExecutionFailed."""
+    """fail() causes the decorated runtime entrypoint to raise ExecutionFailed."""
     proc = _run_program(FAIL_TEST, timeout=90)
     assert proc.returncode == 0, f"Failed:\nSTDOUT: {proc.stdout}\nSTDERR: {proc.stderr}"
     assert "CAUGHT:" in proc.stdout, f"Expected ExecutionFailed.\nSTDOUT: {proc.stdout}\nSTDERR: {proc.stderr}"
