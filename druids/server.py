@@ -1,16 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
-import queue
-import threading
+import socket
 from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse, StreamingResponse
+from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from druids.types import ToolCallError, to_jsonable
@@ -26,34 +26,98 @@ class SSEEvent:
 
 
 class AgentChannel:
-    """Per-agent SSE event queue with backlog for pre-connection events."""
+    """Per-agent async event channel with backlog for disconnected clients."""
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
         self._backlog: deque[SSEEvent] = deque()
-        self._subscribers: set[queue.Queue[SSEEvent]] = set()
-        self.registered = threading.Event()
+        self._subscribers: set[asyncio.Queue[SSEEvent]] = set()
+        self.registered = asyncio.Event()
 
     def publish(self, event: SSEEvent) -> None:
-        with self._lock:
-            if not self._subscribers:
-                self._backlog.append(event)
-                return
-            subscribers = list(self._subscribers)
-        for subscriber in subscribers:
-            subscriber.put(event)
+        if not self._subscribers:
+            self._backlog.append(event)
+            return
+        for subscriber in list(self._subscribers):
+            subscriber.put_nowait(event)
 
-    def subscribe(self) -> queue.Queue[SSEEvent]:
-        subscriber: queue.Queue[SSEEvent] = queue.Queue()
-        with self._lock:
-            self._subscribers.add(subscriber)
-            while self._backlog:
-                subscriber.put(self._backlog.popleft())
+    def subscribe(self) -> asyncio.Queue[SSEEvent]:
+        subscriber: asyncio.Queue[SSEEvent] = asyncio.Queue()
+        self._subscribers.add(subscriber)
+        while self._backlog:
+            subscriber.put_nowait(self._backlog.popleft())
         return subscriber
 
-    def unsubscribe(self, subscriber: queue.Queue[SSEEvent]) -> None:
-        with self._lock:
-            self._subscribers.discard(subscriber)
+    def unsubscribe(self, subscriber: asyncio.Queue[SSEEvent]) -> None:
+        self._subscribers.discard(subscriber)
+
+
+class OrchestratorServer:
+    """Async in-process HTTP server for agent communication."""
+
+    def __init__(self, ctx: Context, bind_host: str, bind_port: int):
+        self.ctx = ctx
+        self._host = bind_host
+        self._port = bind_port
+        self._server = None
+        self._socket: socket.socket | None = None
+        self._task: asyncio.Task[None] | None = None
+        self._actual_port: int | None = None
+
+    @property
+    def port(self) -> int:
+        return self._actual_port or self._port
+
+    async def start(self) -> None:
+        import uvicorn
+
+        app = _make_app(self.ctx)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((self._host, self._port))
+        sock.listen(2048)
+        sock.setblocking(False)
+
+        self._socket = sock
+        self._actual_port = sock.getsockname()[1]
+
+        config = uvicorn.Config(
+            app,
+            host=self._host,
+            port=self._port,
+            log_level="warning",
+            access_log=False,
+            lifespan="off",
+        )
+        self._server = uvicorn.Server(config)
+        self._server.install_signal_handlers = lambda: None
+        self._task = asyncio.create_task(self._server.serve(sockets=[sock]))
+
+        deadline = asyncio.get_running_loop().time() + 10
+        while True:
+            if self._server.started:
+                return
+            if self._task.done():
+                await self._task
+                raise RuntimeError("Server exited before startup completed")
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError("Timed out starting orchestrator server")
+            await asyncio.sleep(0.01)
+
+    async def stop(self) -> None:
+        if self._server is not None:
+            self._server.should_exit = True
+        if self._task is not None:
+            try:
+                await asyncio.wait_for(self._task, timeout=10)
+            except asyncio.TimeoutError:
+                self._task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._task
+            self._task = None
+        if self._socket is not None:
+            self._socket.close()
+            self._socket = None
+        self._server = None
 
 
 def _make_app(ctx: Context) -> Starlette:
@@ -78,10 +142,10 @@ def _make_app(ctx: Context) -> Starlette:
         tool = str(payload.get("tool", ""))
         params = payload.get("params", {}) or {}
         try:
-            result = ctx._handle_tool_call_request(agent_id, tool, params)
+            result = await ctx._handle_tool_call_request(agent_id, tool, params)
         except ToolCallError as exc:
             return JSONResponse({"error": str(exc)}, status_code=exc.status_code)
-        except Exception as exc:  # broad catch at API boundary
+        except Exception as exc:  # pragma: no cover - API boundary safety net
             return JSONResponse({"error": str(exc)}, status_code=500)
         return JSONResponse({"result": to_jsonable(result)})
 
@@ -96,16 +160,15 @@ def _make_app(ctx: Context) -> Starlette:
 
         async def stream():
             try:
-                loop = asyncio.get_event_loop()
                 while not ctx._server_stop_event.is_set():
                     try:
-                        event = await asyncio.wait_for(
-                            loop.run_in_executor(None, subscription.get, True, 10),
-                            timeout=15,
-                        )
-                    except (asyncio.TimeoutError, queue.Empty):
+                        event = await asyncio.wait_for(subscription.get(), timeout=10)
+                    except asyncio.TimeoutError:
+                        if await req.is_disconnected():
+                            return
                         yield ": keepalive\n\n"
                         continue
+
                     payload = json.dumps(to_jsonable(event.data))
                     yield f"event: {event.event}\ndata: {payload}\n\n"
                     if event.event == "shutdown":
@@ -122,62 +185,11 @@ def _make_app(ctx: Context) -> Starlette:
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    return Starlette(routes=[
-        Route("/health", health),
-        Route("/agents/register", register, methods=["POST"]),
-        Route("/agents/{agent_id}/tool_call", tool_call, methods=["POST"]),
-        Route("/agents/{agent_id}/events", events),
-    ])
-
-
-class OrchestratorServer:
-    """In-process HTTP server for agent communication."""
-
-    def __init__(self, ctx: Context, bind_host: str, bind_port: int):
-        self.ctx = ctx
-        self._host = bind_host
-        self._port = bind_port
-        self._thread: threading.Thread | None = None
-        self._started = threading.Event()
-        self._actual_port: int | None = None
-
-    @property
-    def port(self) -> int:
-        return self._actual_port or self._port
-
-    def start(self) -> None:
-        self._thread = threading.Thread(target=self._run, name="druids-server", daemon=True)
-        self._thread.start()
-        self._started.wait(timeout=10)
-
-    def stop(self) -> None:
-        if self._server is not None:
-            self._server.should_exit = True
-        if self._thread is not None:
-            self._thread.join(timeout=5)
-
-    def _run(self) -> None:
-        import uvicorn
-
-        app = _make_app(self.ctx)
-        config = uvicorn.Config(
-            app,
-            host=self._host,
-            port=self._port,
-            log_level="warning",
-        )
-        self._server = uvicorn.Server(config)
-
-        # Capture the actual port after bind (when port=0)
-        original_startup = self._server.startup
-
-        async def _startup_and_signal(**kwargs: Any):
-            await original_startup(**kwargs)
-            for server in self._server.servers:
-                for sock in server.sockets:
-                    self._actual_port = sock.getsockname()[1]
-                    break
-            self._started.set()
-
-        self._server.startup = _startup_and_signal
-        self._server.run()
+    return Starlette(
+        routes=[
+            Route("/health", health),
+            Route("/agents/register", register, methods=["POST"]),
+            Route("/agents/{agent_id}/tool_call", tool_call, methods=["POST"]),
+            Route("/agents/{agent_id}/events", events),
+        ]
+    )
