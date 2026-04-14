@@ -9,7 +9,7 @@ import uuid
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from functools import wraps
-from typing import Any, Awaitable, Callable, Literal, ParamSpec, TypeVar
+from typing import Any, Awaitable, Callable, ParamSpec, TypeVar
 
 from druids.extension import extension_source
 from druids.machines import Image, LocalImage, Machine
@@ -24,6 +24,10 @@ _CURRENT_RUNTIME: ContextVar[Runtime | None] = ContextVar(
 
 P = ParamSpec("P")
 R = TypeVar("R")
+
+_NO_ACTIVE_RUNTIME_ERROR = (
+    "No active runtime. Use @agent_runtime, 'async with Runtime(...)', or 'await runtime.start()'."
+)
 
 
 async def _run_until_exit(body: Awaitable[Any] | None, *, timeout: float | None) -> Any:
@@ -100,37 +104,6 @@ def _builtin_tools() -> list[dict[str, Any]]:
 
 
 @dataclass
-class ExecutionState:
-    id: str
-    outcome: asyncio.Future[tuple[str, Any]]
-
-    @property
-    def status(self) -> Literal["running", "done", "failed"]:
-        if not self.outcome.done():
-            return "running"
-        outcome, _ = self.outcome.result()
-        return outcome
-
-    def exit(self, result: Any = None) -> None:
-        if not self.outcome.done():
-            self.outcome.set_result(("done", result))
-
-    def fail(self, reason: str) -> None:
-        if not self.outcome.done():
-            self.outcome.set_result(("failed", reason))
-
-    async def wait(self, *, timeout: float | None = None) -> Any:
-        outcome, value = await (
-            asyncio.wait_for(asyncio.shield(self.outcome), timeout=timeout)
-            if timeout is not None
-            else asyncio.shield(self.outcome)
-        )
-        if outcome == "failed":
-            raise ExecutionFailed(str(value))
-        return value
-
-
-@dataclass
 class Agent:
     name: str
     machine: Machine
@@ -180,7 +153,8 @@ class Runtime:
     def __init__(self, *, image: Image | None = None):
         self.image = image or LocalImage()
 
-        self.execution: ExecutionState | None = None
+        self._execution_id: str | None = None
+        self._outcome: asyncio.Future[tuple[str, Any]] | None = None
         self.server_url: str | None = None
 
         self._agents: dict[str, Agent] = {}
@@ -195,8 +169,7 @@ class Runtime:
 
     @property
     def execution_id(self) -> str | None:
-        execution = self.execution
-        return execution.id if execution is not None else None
+        return self._execution_id
 
     async def __aenter__(self) -> Runtime:
         await self.start()
@@ -206,7 +179,7 @@ class Runtime:
         await self.close()
 
     async def start(self) -> None:
-        if self.execution is not None:
+        if self._outcome is not None:
             raise RuntimeError("Runtime is already running")
         if self._started:
             raise RuntimeError(
@@ -217,10 +190,8 @@ class Runtime:
 
         self._started = True
         self._runtime_token = _CURRENT_RUNTIME.set(self)
-        self.execution = ExecutionState(
-            id=str(uuid.uuid4()),
-            outcome=asyncio.get_running_loop().create_future(),
-        )
+        self._execution_id = str(uuid.uuid4())
+        self._outcome = asyncio.get_running_loop().create_future()
         self._shutting_down = False
         self._server = OrchestratorServer(self)
 
@@ -229,7 +200,8 @@ class Runtime:
         except Exception:
             self._server = None
             self.server_url = None
-            self.execution = None
+            self._execution_id = None
+            self._outcome = None
             self._deactivate()
             raise
 
@@ -249,7 +221,7 @@ class Runtime:
         image: Image | None = None,
         machine: Machine | None = None,
     ) -> Agent:
-        self._require_execution()
+        self._require_active()
         if name in self._agents:
             raise ValueError(f"Agent '{name}' already exists")
 
@@ -269,12 +241,13 @@ class Runtime:
         return agent
 
     async def machine(self, image: Image | None = None) -> Machine:
-        self._require_execution()
+        self._require_active()
         machine = await (image or self.image).spawn()
         self._machines.append(machine)
         return machine
 
     def connect(self, a: Agent, b: Agent, *, direction: str = "both") -> None:
+        self._require_active()
         self._require_agent(a.name)
         self._require_agent(b.name)
         if direction not in {"both", "forward"}:
@@ -284,13 +257,25 @@ class Runtime:
             self._edges.add((b.name, a.name))
 
     def exit(self, result: Any = None) -> None:
-        self._require_execution().exit(result)
+        outcome = self._require_started()
+        if not outcome.done():
+            outcome.set_result(("done", result))
 
     def fail(self, reason: str) -> None:
-        self._require_execution().fail(reason)
+        outcome = self._require_started()
+        if not outcome.done():
+            outcome.set_result(("failed", reason))
 
     async def wait(self, *, timeout: float | None = None) -> Any:
-        return await self._require_execution().wait(timeout=timeout)
+        outcome = self._require_started()
+        status, value = await (
+            asyncio.wait_for(asyncio.shield(outcome), timeout=timeout)
+            if timeout is not None
+            else asyncio.shield(outcome)
+        )
+        if status == "failed":
+            raise ExecutionFailed(str(value))
+        return value
 
     async def _resolve_machine(
         self, machine: Machine | None, image: Image | None
@@ -304,13 +289,19 @@ class Runtime:
         self._machines.append(machine)
         return machine
 
-    def _require_execution(self) -> ExecutionState:
-        execution = self.execution
-        if execution is None:
-            raise RuntimeError(
-                "No active runtime. Use @agent_runtime, 'async with Runtime(...)', or 'await runtime.start()'."
-            )
-        return execution
+    def _require_started(self) -> asyncio.Future[tuple[str, Any]]:
+        outcome = self._outcome
+        if outcome is None:
+            raise RuntimeError(_NO_ACTIVE_RUNTIME_ERROR)
+        return outcome
+
+    def _require_active(self) -> None:
+        if not self._is_active():
+            raise RuntimeError(_NO_ACTIVE_RUNTIME_ERROR)
+
+    def _is_active(self) -> bool:
+        outcome = self._outcome
+        return outcome is not None and not outcome.done()
 
     def _deactivate(self) -> None:
         if self._runtime_token is None:
@@ -478,7 +469,7 @@ class Runtime:
             )
 
     async def _shutdown(self) -> None:
-        if self.execution is None:
+        if self._outcome is None:
             return
 
         self._shutting_down = True
@@ -516,26 +507,15 @@ class Runtime:
                 pass
 
         self.server_url = None
-        self.execution = None
+        self._execution_id = None
+        self._outcome = None
 
 
 def current_runtime() -> Runtime:
     runtime = _CURRENT_RUNTIME.get()
-    if runtime is None:
-        raise RuntimeError(
-            "No active runtime. Use @agent_runtime, 'async with Runtime(...)', or 'await runtime.start()'."
-        )
-
-    execution = runtime.execution
-    if execution is None or execution.outcome.done():
-        raise RuntimeError(
-            "No active runtime. Use @agent_runtime, 'async with Runtime(...)', or 'await runtime.start()'."
-        )
+    if runtime is None or not runtime._is_active():
+        raise RuntimeError(_NO_ACTIVE_RUNTIME_ERROR)
     return runtime
-
-
-def current_execution() -> ExecutionState:
-    return current_runtime()._require_execution()
 
 
 async def agent(
