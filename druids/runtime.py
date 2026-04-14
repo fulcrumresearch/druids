@@ -6,7 +6,7 @@ import inspect
 import shlex
 import shutil
 import uuid
-from contextvars import ContextVar, Token
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import wraps
 from typing import Any, Awaitable, Callable, ParamSpec, TypeVar
@@ -122,9 +122,11 @@ class Agent:
                 raise TypeError("Tool handlers must be async")
             if "caller" in inspect.signature(fn).parameters:
                 raise TypeError("'caller' injection is not supported")
-            self._handlers[tool_name] = fn
 
             runtime = current_runtime()
+            runtime._require_owned_agent(self)
+            self._handlers[tool_name] = fn
+
             if runtime._is_agent_registered(self.name) and not runtime._shutting_down:
                 runtime._push_event(
                     self.name, "new_tool", build_tool_definition(tool_name, fn)
@@ -134,12 +136,15 @@ class Agent:
         return decorator
 
     async def send(self, message: str) -> None:
-        current_runtime()._send_message(self.name, message)
+        runtime = current_runtime()
+        runtime._require_owned_agent(self)
+        runtime._send_message(self.name, message)
 
     async def exec(
         self, command: str, *, user: str = "agent", timeout: int | None = None
     ) -> ExecResult:
-        current_runtime()._require_agent(self.name)
+        runtime = current_runtime()
+        runtime._require_owned_agent(self)
         return await self.machine.exec(command, user=user, timeout=timeout)
 
 
@@ -165,7 +170,6 @@ class Runtime:
         self._started = False
         self._shutting_down = False
         self._server: OrchestratorServer | None = None
-        self._runtime_token: Token[Runtime | None] | None = None
 
     @property
     def execution_id(self) -> str | None:
@@ -189,7 +193,7 @@ class Runtime:
             raise RuntimeError("Nested runtimes are not supported")
 
         self._started = True
-        self._runtime_token = _CURRENT_RUNTIME.set(self)
+        _CURRENT_RUNTIME.set(self)
         self._execution_id = str(uuid.uuid4())
         self._outcome = asyncio.get_running_loop().create_future()
         self._shutting_down = False
@@ -202,7 +206,7 @@ class Runtime:
             self.server_url = None
             self._execution_id = None
             self._outcome = None
-            self._deactivate()
+            self._clear_current_runtime()
             raise
 
         self.server_url = f"http://127.0.0.1:{self._server.port}"
@@ -211,7 +215,7 @@ class Runtime:
         try:
             await self._shutdown()
         finally:
-            self._deactivate()
+            self._clear_current_runtime()
 
     async def agent(
         self,
@@ -247,9 +251,8 @@ class Runtime:
         return machine
 
     def connect(self, a: Agent, b: Agent, *, direction: str = "both") -> None:
-        self._require_active()
-        self._require_agent(a.name)
-        self._require_agent(b.name)
+        self._require_owned_agent(a)
+        self._require_owned_agent(b)
         if direction not in {"both", "forward"}:
             raise ValueError("direction must be 'both' or 'forward'")
         self._edges.add((a.name, b.name))
@@ -257,21 +260,22 @@ class Runtime:
             self._edges.add((b.name, a.name))
 
     def exit(self, result: Any = None) -> None:
-        outcome = self._require_started()
-        if not outcome.done():
-            outcome.set_result(("done", result))
+        self._require_active()
+        assert self._outcome is not None
+        self._outcome.set_result(("done", result))
 
     def fail(self, reason: str) -> None:
-        outcome = self._require_started()
-        if not outcome.done():
-            outcome.set_result(("failed", reason))
+        self._require_active()
+        assert self._outcome is not None
+        self._outcome.set_result(("failed", reason))
 
     async def wait(self, *, timeout: float | None = None) -> Any:
-        outcome = self._require_started()
+        self._require_active()
+        assert self._outcome is not None
         status, value = await (
-            asyncio.wait_for(asyncio.shield(outcome), timeout=timeout)
+            asyncio.wait_for(asyncio.shield(self._outcome), timeout=timeout)
             if timeout is not None
-            else asyncio.shield(outcome)
+            else asyncio.shield(self._outcome)
         )
         if status == "failed":
             raise ExecutionFailed(str(value))
@@ -289,12 +293,6 @@ class Runtime:
         self._machines.append(machine)
         return machine
 
-    def _require_started(self) -> asyncio.Future[tuple[str, Any]]:
-        outcome = self._outcome
-        if outcome is None:
-            raise RuntimeError(_NO_ACTIVE_RUNTIME_ERROR)
-        return outcome
-
     def _require_active(self) -> None:
         if not self._is_active():
             raise RuntimeError(_NO_ACTIVE_RUNTIME_ERROR)
@@ -303,14 +301,12 @@ class Runtime:
         outcome = self._outcome
         return outcome is not None and not outcome.done()
 
-    def _deactivate(self) -> None:
-        if self._runtime_token is None:
-            return
-        _CURRENT_RUNTIME.reset(self._runtime_token)
-        self._runtime_token = None
+    def _clear_current_runtime(self) -> None:
+        if _CURRENT_RUNTIME.get() is self:
+            _CURRENT_RUNTIME.set(None)
 
     def _agent_session(self, name: str) -> _AgentSession:
-        self._require_agent(name)
+        self._get_agent(name)
         return self._agent_sessions[name]
 
     def _is_agent_registered(self, name: str) -> bool:
@@ -374,15 +370,13 @@ class Runtime:
         )
 
     def _send_message(self, agent_name: str, message: str) -> None:
-        self._require_agent(agent_name)
+        self._get_agent(agent_name)
         self._push_event(agent_name, "message", {"text": message})
 
     def _register_agent(self, agent_id: str, execution_id: str) -> list[dict[str, Any]]:
         if execution_id != self.execution_id:
             raise ToolCallError("Execution ID mismatch", status_code=400)
-        agent = self._agents.get(agent_id)
-        if agent is None:
-            raise ToolCallError(f"Unknown agent '{agent_id}'", status_code=404)
+        agent = self._get_agent(agent_id)
 
         self._agent_session(agent_id).registered.set()
         return _builtin_tools() + [
@@ -403,9 +397,7 @@ class Runtime:
     async def _handle_tool_call_request(
         self, agent_id: str, tool_name: str, params: dict[str, Any]
     ) -> Any:
-        agent = self._agents.get(agent_id)
-        if agent is None:
-            raise ToolCallError(f"Unknown agent '{agent_id}'", status_code=404)
+        agent = self._get_agent(agent_id)
 
         if tool_name == "message":
             return await self._message(agent_id, params)
@@ -424,43 +416,55 @@ class Runtime:
                 f"Unknown tool '{tool_name}' for agent '{agent.name}'", status_code=404
             )
 
-        token = _CURRENT_RUNTIME.set(self)
+        _CURRENT_RUNTIME.set(self)
         try:
             return await handler(**params)
         finally:
-            _CURRENT_RUNTIME.reset(token)
+            if _CURRENT_RUNTIME.get() is self:
+                _CURRENT_RUNTIME.set(None)
 
     async def _message(self, sender: str, params: dict[str, Any]) -> str:
         receiver = str(params.get("receiver", ""))
         message = str(params.get("message", ""))
-        self._require_agent(receiver)
+        self._get_agent(receiver)
         self._require_connection(sender, receiver)
         self._send_message(receiver, f"[From: {sender}] {message}")
         return f"Message sent to {receiver}."
 
     async def _send_file(self, sender: str, params: dict[str, Any]) -> str:
+        sender_agent = self._get_agent(sender)
         receiver = str(params.get("receiver", ""))
         path = str(params.get("path", ""))
         dest_path = str(params.get("dest_path") or path)
-        self._require_agent(receiver)
+        receiver_agent = self._get_agent(receiver)
         self._require_connection(sender, receiver)
-        content = await self._agents[sender].machine.read_file(path)
-        await self._agents[receiver].machine.write_file(dest_path, content)
+        content = await sender_agent.machine.read_file(path)
+        await receiver_agent.machine.write_file(dest_path, content)
         return f"Sent {len(content)} bytes to {receiver}:{dest_path}."
 
     async def _download_file(self, requester: str, params: dict[str, Any]) -> str:
+        requester_agent = self._get_agent(requester)
         sender = str(params.get("sender", ""))
         path = str(params.get("path", ""))
         dest_path = str(params.get("dest_path") or path)
-        self._require_agent(sender)
+        sender_agent = self._get_agent(sender)
         self._require_connection(sender, requester)
-        content = await self._agents[sender].machine.read_file(path)
-        await self._agents[requester].machine.write_file(dest_path, content)
+        content = await sender_agent.machine.read_file(path)
+        await requester_agent.machine.write_file(dest_path, content)
         return f"Downloaded {len(content)} bytes from {sender}:{path} to {dest_path}."
 
-    def _require_agent(self, name: str) -> None:
-        if name not in self._agents:
+    def _get_agent(self, name: str) -> Agent:
+        agent = self._agents.get(name)
+        if agent is None:
             raise ToolCallError(f"Unknown agent '{name}'", status_code=404)
+        return agent
+
+    def _require_owned_agent(self, agent: Agent) -> None:
+        self._require_active()
+        if self._agents.get(agent.name) is not agent:
+            raise RuntimeError(
+                f"Agent '{agent.name}' does not belong to the current runtime."
+            )
 
     def _require_connection(self, sender: str, receiver: str) -> None:
         if (sender, receiver) not in self._edges:
