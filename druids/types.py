@@ -35,10 +35,6 @@ class ToolCallError(RuntimeError):
         self.status_code = status_code
 
 
-class LaunchError(RuntimeError):
-    """Raised when an agent process cannot be launched."""
-
-
 def to_jsonable(value: Any) -> Any:
     """Best-effort conversion for HTTP responses and log payloads."""
 

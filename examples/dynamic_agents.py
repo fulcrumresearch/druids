@@ -1,54 +1,59 @@
 """Example: dynamic agent spawning from handlers.
 
-A finder agent discovers tasks and spawns impl agents for each one.
+A finder agent discovers tasks and spawns implementation agents for each one.
 Demonstrates:
   - Dynamic agent creation inside handlers
   - ctx.connect() at runtime
   - Multiple agents sharing work
 """
 
+from __future__ import annotations
+
+import asyncio
+
 from druids import Context, LocalImage
 
-ctx = Context(image=LocalImage())
 
 task_count = 0
 
-finder = ctx.agent(
-    "finder",
-    prompt=(
-        "You are a task finder. Spawn exactly 2 tasks:\n"
-        "1. Call spawn_task with name='hello' and spec='Write a file /tmp/hello.txt containing Hello World'\n"
-        "2. Call spawn_task with name='goodbye' and spec='Write a file /tmp/goodbye.txt containing Goodbye World'\n"
-        "After spawning both, call all_done."
-    ),
-)
+
+async def main() -> None:
+    async with Context(image=LocalImage()) as ctx:
+        finder = await ctx.agent("finder")
+
+        @finder.on("spawn_task")
+        async def on_spawn(name: str = "", spec: str = "") -> str:
+            """Spawn an implementation agent for a task."""
+            global task_count
+            task_count += 1
+            agent_name = f"impl-{task_count}"
+            impl = await ctx.agent(agent_name)
+
+            @impl.on("task_complete")
+            async def on_task_complete(summary: str = "") -> str:
+                """Signal that the task is complete."""
+                await finder.send(f"Task '{name}' completed: {summary}")
+                return "Noted."
+
+            await impl.send(
+                f"Complete this task: {spec}\nWhen done, call task_complete with a summary."
+            )
+            return f"Spawned {agent_name} for task '{name}'."
+
+        @finder.on("all_done")
+        async def on_all_done() -> str:
+            """Signal all tasks have been spawned and completed."""
+            await ctx.done(f"Completed {task_count} tasks.")
+            return "Finishing."
+
+        await finder.send(
+            "You are a task finder. Spawn exactly 2 tasks:\n"
+            "1. Call spawn_task with name='hello' and spec='Write a file /tmp/hello.txt containing Hello World'\n"
+            "2. Call spawn_task with name='goodbye' and spec='Write a file /tmp/goodbye.txt containing Goodbye World'\n"
+            "After spawning both, call all_done."
+        )
+        print(await ctx.wait())
 
 
-@finder.on("spawn_task")
-def on_spawn(name="", spec=""):
-    """Spawn an implementation agent for a task."""
-    global task_count
-    task_count += 1
-    agent_name = f"impl-{task_count}"
-    impl = ctx.agent(
-        agent_name,
-        prompt=f"Complete this task: {spec}\nWhen done, call task_complete with a summary.",
-    )
-
-    @impl.on("task_complete")
-    def on_task_complete(summary=""):
-        """Signal that the task is complete."""
-        finder.send(f"Task '{name}' completed: {summary}")
-        return "Noted."
-
-    return f"Spawned {agent_name} for task '{name}'."
-
-
-@finder.on("all_done")
-def on_all_done():
-    """Signal all tasks have been spawned and completed."""
-    ctx.done(f"Completed {task_count} tasks.")
-    return "Finishing."
-
-
-ctx.run()
+if __name__ == "__main__":
+    asyncio.run(main())

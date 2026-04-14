@@ -26,35 +26,35 @@ class SSEEvent:
 
 
 class AgentChannel:
-    """Per-agent async event channel with backlog for disconnected clients."""
+    """Per-agent async event channel with backlog for one SSE subscriber."""
 
     def __init__(self) -> None:
         self._backlog: deque[SSEEvent] = deque()
-        self._subscribers: set[asyncio.Queue[SSEEvent]] = set()
+        self._subscriber: asyncio.Queue[SSEEvent] | None = None
         self.registered = asyncio.Event()
 
     def publish(self, event: SSEEvent) -> None:
-        if not self._subscribers:
+        if self._subscriber is None:
             self._backlog.append(event)
             return
-        for subscriber in list(self._subscribers):
-            subscriber.put_nowait(event)
+        self._subscriber.put_nowait(event)
 
     def subscribe(self) -> asyncio.Queue[SSEEvent]:
         subscriber: asyncio.Queue[SSEEvent] = asyncio.Queue()
-        self._subscribers.add(subscriber)
+        self._subscriber = subscriber
         while self._backlog:
             subscriber.put_nowait(self._backlog.popleft())
         return subscriber
 
     def unsubscribe(self, subscriber: asyncio.Queue[SSEEvent]) -> None:
-        self._subscribers.discard(subscriber)
+        if self._subscriber is subscriber:
+            self._subscriber = None
 
 
 class OrchestratorServer:
     """Async in-process HTTP server for agent communication."""
 
-    def __init__(self, ctx: Context, bind_host: str, bind_port: int):
+    def __init__(self, ctx: Context, bind_host: str = "127.0.0.1", bind_port: int = 0):
         self.ctx = ctx
         self._host = bind_host
         self._port = bind_port
@@ -62,6 +62,7 @@ class OrchestratorServer:
         self._socket: socket.socket | None = None
         self._task: asyncio.Task[None] | None = None
         self._actual_port: int | None = None
+        self._stop_event = asyncio.Event()
 
     @property
     def port(self) -> int:
@@ -70,7 +71,7 @@ class OrchestratorServer:
     async def start(self) -> None:
         import uvicorn
 
-        app = _make_app(self.ctx)
+        app = _make_app(self.ctx, self._stop_event)
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((self._host, self._port))
@@ -104,6 +105,7 @@ class OrchestratorServer:
             await asyncio.sleep(0.01)
 
     async def stop(self) -> None:
+        self._stop_event.set()
         if self._server is not None:
             self._server.should_exit = True
         if self._task is not None:
@@ -120,9 +122,8 @@ class OrchestratorServer:
         self._server = None
 
 
-def _make_app(ctx: Context) -> Starlette:
-    """Build the Starlette app with all routes."""
 
+def _make_app(ctx: Context, stop_event: asyncio.Event) -> Starlette:
     async def health(req: Request) -> JSONResponse:
         return JSONResponse({"status": "ok"})
 
@@ -145,7 +146,7 @@ def _make_app(ctx: Context) -> Starlette:
             result = await ctx._handle_tool_call_request(agent_id, tool, params)
         except ToolCallError as exc:
             return JSONResponse({"error": str(exc)}, status_code=exc.status_code)
-        except Exception as exc:  # pragma: no cover - API boundary safety net
+        except Exception as exc:  # pragma: no cover
             return JSONResponse({"error": str(exc)}, status_code=500)
         return JSONResponse({"result": to_jsonable(result)})
 
@@ -156,11 +157,9 @@ def _make_app(ctx: Context) -> Starlette:
         except ToolCallError as exc:
             return JSONResponse({"error": str(exc)}, status_code=exc.status_code)
 
-        ctx._log_event("agent_connected", agent=agent_id)
-
         async def stream():
             try:
-                while not ctx._server_stop_event.is_set():
+                while not stop_event.is_set():
                     try:
                         event = await asyncio.wait_for(subscription.get(), timeout=10)
                     except asyncio.TimeoutError:
@@ -177,7 +176,6 @@ def _make_app(ctx: Context) -> Starlette:
                 return
             finally:
                 ctx._unsubscribe_events(agent_id, subscription)
-                ctx._log_event("agent_disconnected", agent=agent_id)
 
         return StreamingResponse(
             content=stream(),

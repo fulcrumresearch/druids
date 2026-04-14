@@ -6,7 +6,10 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from druids.context import Context
 
 
 class FakeAgentClient:
@@ -90,6 +93,13 @@ class FakeAgentClient:
             event, data = self.events.get(timeout=remaining)
             if expected is None or event == expected:
                 return data
+
+
+def disable_agent_launch(ctx: Context, monkeypatch) -> None:
+    async def fake_launch(agent):
+        return False
+
+    monkeypatch.setattr(ctx, "_launch_agent", fake_launch)
 
 
 def wait_for_server(base_url: str, timeout: float = 5) -> None:

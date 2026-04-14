@@ -1,14 +1,11 @@
-"""End-to-end tests that launch real pi processes.
+"""End-to-end tests that launch real pi processes."""
 
-These test the full path: spawn → extension → register → tool call → done.
-"""
+from __future__ import annotations
 
 import os
 import subprocess
 import sys
 import tempfile
-
-import pytest
 
 
 def _run_program(source: str, *, timeout: int = 90) -> subprocess.CompletedProcess:
@@ -30,68 +27,77 @@ def _run_program(source: str, *, timeout: int = 90) -> subprocess.CompletedProce
 
 
 SINGLE_AGENT = '''
+import asyncio
 import logging, sys
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 
 from druids import Context, LocalImage
 
-ctx = Context(image=LocalImage())
-worker = ctx.agent(
-    "worker",
-    prompt="Call the finish tool with result='hello-druids'. Do not say anything else, just call the tool immediately.",
-)
+async def main():
+    async with Context(
+        image=LocalImage(),
+    ) as ctx:
+        worker = await ctx.agent("worker")
 
-@worker.on("finish")
-def on_finish(result=""):
-    """Signal completion. Call this with your result."""
-    ctx.done(result)
-    return "Done."
+        @worker.on("finish")
+        async def on_finish(result=""):
+            """Signal completion. Call this with your result."""
+            await ctx.done(result)
+            return "Done."
 
-result = ctx.run(timeout=60)
-print(f"RESULT:{result}")
+        await worker.send(
+            "Call the finish tool with result='hello-druids'. Do not say anything else, just call the tool immediately."
+        )
+        result = await ctx.wait(timeout=60)
+        print(f"RESULT:{result}")
+
+asyncio.run(main())
 '''
 
 
 def test_single_agent_tool_call():
-    """Single agent receives prompt, calls tool, ctx.done() ends run."""
+    """Single agent receives a message, calls a tool, and ctx.done() ends the run."""
     proc = _run_program(SINGLE_AGENT, timeout=90)
     assert proc.returncode == 0, f"Failed:\nSTDOUT: {proc.stdout}\nSTDERR: {proc.stderr}"
     assert "RESULT:hello-druids" in proc.stdout
 
 
 TWO_AGENTS = '''
+import asyncio
 import logging, sys
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 
 from druids import Context, LocalImage
 
-ctx = Context(image=LocalImage())
+async def main():
+    async with Context(image=LocalImage()) as ctx:
+        sender = await ctx.agent("sender")
+        receiver = await ctx.agent("receiver")
+        ctx.connect(sender, receiver)
 
-sender = ctx.agent(
-    "sender",
-    prompt="Call the notify tool with text='ping-from-sender'. Do nothing else, just call the tool.",
-)
-receiver = ctx.agent(
-    "receiver",
-    prompt="Wait for a message. When you receive one, call the finish tool with the message text you received.",
-)
+        @sender.on("notify")
+        async def on_notify(text=""):
+            """Send a notification to the receiver."""
+            await receiver.send(f"Notification: {text}")
+            return "Notification sent."
 
-ctx.connect(sender, receiver)
+        @receiver.on("finish")
+        async def on_finish(summary=""):
+            """Finish the execution with a summary."""
+            await ctx.done(summary)
+            return "Done."
 
-@sender.on("notify")
-def on_notify(text=""):
-    """Send a notification to the receiver."""
-    receiver.send(f"Notification: {text}")
-    return "Notification sent."
+        await receiver.send(
+            "Wait for a message. When you receive one, call the finish tool with the message text you received."
+        )
+        await sender.send(
+            "Call the notify tool with text='ping-from-sender'. Do nothing else, just call the tool."
+        )
 
-@receiver.on("finish")
-def on_finish(summary=""):
-    """Finish the execution with a summary."""
-    ctx.done(summary)
-    return "Done."
+        result = await ctx.wait(timeout=90)
+        print(f"RESULT:{result}")
 
-result = ctx.run(timeout=90)
-print(f"RESULT:{result}")
+asyncio.run(main())
 '''
 
 
@@ -105,32 +111,36 @@ def test_two_agents_message_passing():
 
 
 FAIL_TEST = '''
+import asyncio
 import logging, sys
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 
 from druids import Context, LocalImage, ExecutionFailed
 
-ctx = Context(image=LocalImage())
-worker = ctx.agent(
-    "worker",
-    prompt="Call the abort tool immediately. Do nothing else.",
-)
+async def main():
+    async with Context(image=LocalImage()) as ctx:
+        worker = await ctx.agent("worker")
 
-@worker.on("abort")
-def on_abort(reason=""):
-    """Abort the execution."""
-    ctx.fail(reason or "aborted")
-    return "Aborting."
+        @worker.on("abort")
+        async def on_abort(reason=""):
+            """Abort the execution."""
+            await ctx.fail(reason or "aborted")
+            return "Aborting."
 
-try:
-    ctx.run(timeout=60)
-    print("ERROR:no-exception")
-except ExecutionFailed as e:
-    print(f"CAUGHT:{e.reason}")
+        await worker.send("Call the abort tool immediately. Do nothing else.")
+
+        try:
+            await ctx.wait(timeout=60)
+            print("ERROR:no-exception")
+        except ExecutionFailed as e:
+            print(f"CAUGHT:{e.reason}")
+
+asyncio.run(main())
 '''
 
 
 def test_fail_raises_execution_failed():
-    """ctx.fail() causes ctx.run() to raise ExecutionFailed."""
+    """ctx.fail() causes ctx.wait() to raise ExecutionFailed."""
     proc = _run_program(FAIL_TEST, timeout=90)
+    assert proc.returncode == 0, f"Failed:\nSTDOUT: {proc.stdout}\nSTDERR: {proc.stderr}"
     assert "CAUGHT:" in proc.stdout, f"Expected ExecutionFailed.\nSTDOUT: {proc.stdout}\nSTDERR: {proc.stderr}"

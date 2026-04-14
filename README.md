@@ -1,46 +1,50 @@
 # druids
 
-A simpler Druids runtime with no client/server split.
+A small async in-process multi-agent orchestration runtime.
 
 ```python
+import asyncio
 from druids import Context, LocalImage
 
-ctx = Context(image=LocalImage(), launch_mode="manual")
 
-builder = ctx.agent("builder", prompt="Say hello")
+async def main():
+    async with Context(image=LocalImage()) as ctx:
+        builder = await ctx.agent("builder")
 
-@builder.on("submit")
-def submit(summary: str = ""):
-    ctx.done(summary)
-    return "done"
+        @builder.on("submit")
+        async def submit(summary: str = ""):
+            await ctx.done(summary)
+            return "done"
 
-result = ctx.run(timeout=30)
-print(result)
+        await builder.send("Say hello, then call submit with summary='hello'.")
+        result = await ctx.wait(timeout=30)
+        print(result)
+
+
+asyncio.run(main())
 ```
 
 ## What is implemented
 
-- Synchronous `Context` / `Agent` API
-- In-process HTTP server with:
+- Async `Context`, `Agent`, `Image`, and `Machine` APIs
+- Runtime startup in `async with Context(...)`
+- Immediate agent creation via `await ctx.agent(...)`
+- Shared machines via `await ctx.machine(...)`
+- In-process async HTTP server with:
   - `POST /agents/register`
   - `POST /agents/{agent}/tool_call`
   - `GET /agents/{agent}/events` (SSE)
 - Built-in tools:
   - `message`
-  - `list_agents`
   - `send_file`
   - `download_file`
-- Lazy machine spawning with shared-machine support
-- `LocalImage` and `DockerImage` backends
-- JSONL orchestration logs at `./logs/{execution_id}/orchestrator.jsonl`
+- `LocalImage` / `LocalMachine`
 - A bundled TypeScript extension file for pi deployment
 
-## Launch modes
+## Notes
 
-`Context(..., launch_mode=...)` controls whether real pi agents are started:
-
-- `"auto"` (default): start pi in tmux if both `pi` and `tmux` are available, otherwise keep the runtime available for manually connected test clients.
-- `"always"`: require pi/tmux and fail if launching is not possible.
-- `"manual"`: never launch pi automatically.
-
-`manual` is useful for tests and local protocol development.
+- The runtime starts when the context is entered.
+- `await ctx.wait()` only waits for `await ctx.done(...)` or `await ctx.fail(...)`.
+- First instructions are sent explicitly with `await agent.send(...)` after your tools and connections are in place.
+- Tool handlers must be `async def`.
+- The public API always launches real `pi` agents in `tmux`.

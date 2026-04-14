@@ -1,135 +1,97 @@
-"""Test spawn readiness semantics.
-
-Verifies that:
-1. The channel.registered event is set when an agent registers.
-2. In non-manual mode, _spawn_agent blocks until registration.
-3. Dynamic agent creation inside handlers works correctly.
-"""
+"""Test async spawn readiness semantics."""
 
 from __future__ import annotations
 
-import threading
+import asyncio
 import time
 from pathlib import Path
 
 import pytest
 
 from druids import Context, LocalImage
-from druids.context import Agent
-from tests.helpers import FakeAgentClient, wait_for_server
-
-
-def _start_context(ctx: Context, timeout: float = 10) -> tuple[threading.Thread, dict[str, object]]:
-    outcome: dict[str, object] = {}
-
-    def runner() -> None:
-        try:
-            outcome["result"] = ctx.run(timeout=timeout)
-        except Exception as exc:
-            outcome["error"] = exc
-
-    thread = threading.Thread(target=runner, name="ctx-runner", daemon=True)
-    thread.start()
-
-    deadline = time.time() + 5
-    while ctx.server_url is None and time.time() < deadline:
-        time.sleep(0.01)
-    assert ctx.server_url is not None
-    wait_for_server(ctx.server_url)
-    return thread, outcome
+from tests.helpers import FakeAgentClient, disable_agent_launch, wait_for_server
 
 
 def test_registered_event_set_on_register(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The channel.registered event is set when the agent calls POST /agents/register."""
-    monkeypatch.chdir(tmp_path)
+    async def run() -> None:
+        monkeypatch.chdir(tmp_path)
 
-    ctx = Context(image=LocalImage(tmp_path / "agent"), launch_mode="manual")
-    agent = ctx.agent("worker")
+        async with Context(image=LocalImage(tmp_path / "agent")) as ctx:
+            disable_agent_launch(ctx, monkeypatch)
+            agent = await ctx.agent("worker")
 
-    @agent.on("finish")
-    def finish() -> str:
-        ctx.done("ok")
-        return "ok"
+            @agent.on("finish")
+            async def finish() -> str:
+                await ctx.done("ok")
+                return "ok"
 
-    thread, outcome = _start_context(ctx)
+            assert not agent._channel.registered.is_set()
 
-    channel = ctx._channels["worker"]
-    assert not channel.registered.is_set()
+            assert ctx.server_url is not None
+            await asyncio.to_thread(wait_for_server, ctx.server_url)
 
-    client = FakeAgentClient(ctx.server_url, ctx.execution_id, "worker")
-    client.start_events()
-    client.register()
+            client = FakeAgentClient(ctx.server_url, ctx.execution_id or "", "worker")
+            client.start_events()
+            await asyncio.to_thread(client.register)
 
-    assert channel.registered.is_set()
+            assert agent._channel.registered.is_set()
+            assert await asyncio.to_thread(client.tool_call, "finish") == "ok"
+            assert await ctx.wait(timeout=5) == "ok"
 
-    client.tool_call("finish")
-    thread.join(timeout=5)
-    assert outcome["result"] == "ok"
+    asyncio.run(run())
 
 
 def test_dynamic_agent_in_handler_is_usable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Dynamically created agents inside handlers should be immediately usable."""
-    monkeypatch.chdir(tmp_path)
+    async def run() -> None:
+        monkeypatch.chdir(tmp_path)
 
-    ctx = Context(image=LocalImage(tmp_path / "shared"), launch_mode="manual")
-    finder = ctx.agent("finder")
-    created_agents: dict[str, Agent] = {}
+        async with Context(image=LocalImage(tmp_path / "shared")) as ctx:
+            disable_agent_launch(ctx, monkeypatch)
+            finder = await ctx.agent("finder")
+            created_agents: dict[str, object] = {}
 
-    @finder.on("spawn")
-    def spawn() -> str:
-        worker = ctx.agent("worker", machine=finder.machine)
-        created_agents["worker"] = worker
-        ctx.done("spawned")
-        return worker.name
+            @finder.on("spawn")
+            async def spawn() -> str:
+                worker = await ctx.agent("worker", machine=finder.machine)
+                created_agents["worker"] = worker
+                await ctx.done("spawned")
+                return worker.name
 
-    thread, outcome = _start_context(ctx)
+            assert ctx.server_url is not None
+            await asyncio.to_thread(wait_for_server, ctx.server_url)
 
-    client = FakeAgentClient(ctx.server_url, ctx.execution_id, "finder")
-    client.start_events()
-    client.register()
-    assert client.tool_call("spawn") == "worker"
+            client = FakeAgentClient(ctx.server_url, ctx.execution_id or "", "finder")
+            client.start_events()
+            await asyncio.to_thread(client.register)
+            assert await asyncio.to_thread(client.tool_call, "spawn") == "worker"
 
-    thread.join(timeout=5)
-    assert outcome["result"] == "spawned"
-    assert "worker" in ctx.agents
-    assert created_agents["worker"].machine is finder.machine
+            assert await ctx.wait(timeout=5) == "spawned"
+            assert created_agents["worker"].machine is finder.machine
+
+    asyncio.run(run())
 
 
 def test_spawn_readiness_blocks_until_registered(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verify that when launched=True, _spawn_agent blocks on channel.registered."""
-    monkeypatch.chdir(tmp_path)
+    async def run() -> None:
+        monkeypatch.chdir(tmp_path)
 
-    ctx = Context(image=LocalImage(tmp_path / "agent"), launch_mode="manual")
-    ctx._running = True
-    ctx._open_log()
-    ctx._start_server()
+        async with Context(image=LocalImage(tmp_path / "agent")) as ctx:
+            async def fake_launch(agent):
+                async def delayed_register() -> None:
+                    await asyncio.sleep(0.3)
+                    agent._channel.registered.set()
 
-    try:
-        agent = Agent(
-            name="test-agent",
-            _ctx=ctx,
-            _machine=ctx._resolve_machine(None, None),
-        )
-        ctx._agents["test-agent"] = agent
-        ctx._channels["test-agent"] = ctx._channels.get("test-agent", __import__("druids.server", fromlist=["AgentChannel"]).AgentChannel())
+                asyncio.create_task(delayed_register())
+                return True
 
-        channel = ctx._channels["test-agent"]
+            monkeypatch.setattr(ctx, "_launch_agent", fake_launch)
 
-        # Simulate: registration happens after a delay
-        def _delayed_register():
-            time.sleep(0.3)
-            channel.registered.set()
+            started = time.perf_counter()
+            agent = await ctx.agent("test-agent")
+            elapsed = time.perf_counter() - started
 
-        reg_thread = threading.Thread(target=_delayed_register, daemon=True)
-        reg_thread.start()
+            assert agent.name == "test-agent"
+            assert agent._channel.registered.is_set()
+            assert elapsed >= 0.25
 
-        # Directly call the wait path
-        started = time.time()
-        assert not channel.registered.is_set()
-        channel.registered.wait(timeout=5)
-        elapsed = time.time() - started
-
-        assert channel.registered.is_set()
-        assert elapsed >= 0.2  # Should have waited for the delayed set
-    finally:
-        ctx._shutdown()
+    asyncio.run(run())
