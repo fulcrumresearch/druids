@@ -19,29 +19,22 @@ from druids import (
 from tests.helpers import FakeAgentClient, disable_agent_launch, wait_for_server
 
 
-def test_run_starts_waits_and_closes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_async_with_runtime_starts_waits_and_closes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     async def run() -> None:
         monkeypatch.chdir(tmp_path)
 
         ctx = Runtime(image=LocalImage(tmp_path / "builder"))
         disable_agent_launch(ctx, monkeypatch)
-        created: dict[str, object] = {}
 
-        async def setup() -> None:
+        async with ctx:
             builder = await agent("builder")
-            created["builder"] = builder
 
             @builder.on("submit")
             async def submit(summary: str = "") -> str:
                 exit(summary)
                 return "submitted"
-
-        run_task = asyncio.create_task(ctx.run(setup, timeout=5))
-        try:
-            while ctx.server_url is None or "builder" not in created:
-                if run_task.done():
-                    await run_task
-                await asyncio.sleep(0.01)
 
             assert ctx.server_url is not None
             await asyncio.to_thread(wait_for_server, ctx.server_url)
@@ -49,14 +42,12 @@ def test_run_starts_waits_and_closes(tmp_path: Path, monkeypatch: pytest.MonkeyP
             client = FakeAgentClient(ctx.server_url, ctx.execution_id or "", "builder")
             client.start_events()
             await asyncio.to_thread(client.register)
+
+            wait_task = asyncio.create_task(ctx.wait(timeout=5))
             assert await asyncio.to_thread(client.tool_call, "submit", {"summary": "done"}) == "submitted"
-            assert await run_task == "done"
-            assert ctx.server_url is None
-        finally:
-            if not run_task.done():
-                run_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await run_task
+            assert await wait_task == "done"
+
+        assert ctx.server_url is None
 
     asyncio.run(run())
 

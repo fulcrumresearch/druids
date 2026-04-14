@@ -136,7 +136,6 @@ class Agent:
     machine: Machine
     system_prompt: str | None = None
     _handlers: dict[str, Callable[..., Awaitable[Any]]] = field(default_factory=dict)
-    _channel: AgentChannel = field(default_factory=AgentChannel, repr=False)
 
     def on(
         self, tool_name: str
@@ -153,7 +152,7 @@ class Agent:
             self._handlers[tool_name] = fn
 
             runtime = current_runtime()
-            if self._channel.registered.is_set() and not runtime._shutting_down:
+            if runtime._is_agent_registered(self.name) and not runtime._shutting_down:
                 runtime._push_event(
                     self.name, "new_tool", build_tool_definition(tool_name, fn)
                 )
@@ -171,6 +170,12 @@ class Agent:
         return await self.machine.exec(command, user=user, timeout=timeout)
 
 
+@dataclass
+class _AgentSession:
+    channel: AgentChannel = field(default_factory=AgentChannel, repr=False)
+    registered: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+
+
 class Runtime:
     def __init__(self, *, image: Image | None = None):
         self.image = image or LocalImage()
@@ -179,6 +184,7 @@ class Runtime:
         self.server_url: str | None = None
 
         self._agents: dict[str, Agent] = {}
+        self._agent_sessions: dict[str, _AgentSession] = {}
         self._machines: list[Machine] = []
         self._edges: set[tuple[str, str]] = set()
 
@@ -235,18 +241,6 @@ class Runtime:
         finally:
             self._deactivate()
 
-    async def run(
-        self,
-        body: Callable[[], Awaitable[Any]] | None = None,
-        *,
-        timeout: float | None = None,
-    ) -> Any:
-        async with self:
-            return await _run_until_exit(
-                None if body is None else body(),
-                timeout=timeout,
-            )
-
     async def agent(
         self,
         name: str,
@@ -265,7 +259,13 @@ class Runtime:
             system_prompt=system_prompt,
         )
         self._agents[name] = agent
-        await self._spawn_agent(agent)
+        self._agent_sessions[name] = _AgentSession()
+        try:
+            await self._spawn_agent(agent)
+        except Exception:
+            self._agents.pop(name, None)
+            self._agent_sessions.pop(name, None)
+            raise
         return agent
 
     async def machine(self, image: Image | None = None) -> Machine:
@@ -318,11 +318,20 @@ class Runtime:
         _CURRENT_RUNTIME.reset(self._runtime_token)
         self._runtime_token = None
 
+    def _agent_session(self, name: str) -> _AgentSession:
+        self._require_agent(name)
+        return self._agent_sessions[name]
+
+    def _is_agent_registered(self, name: str) -> bool:
+        return self._agent_session(name).registered.is_set()
+
     async def _spawn_agent(self, agent: Agent) -> None:
         if not await self._launch_agent(agent):
             return
         try:
-            await asyncio.wait_for(agent._channel.registered.wait(), timeout=120)
+            await asyncio.wait_for(
+                self._agent_session(agent.name).registered.wait(), timeout=120
+            )
         except asyncio.TimeoutError as exc:
             raise RuntimeError(
                 f"Agent '{agent.name}' did not register within 120s. "
@@ -369,10 +378,9 @@ class Runtime:
         return True
 
     def _push_event(self, agent_name: str, event: str, data: dict[str, Any]) -> None:
-        agent = self._agents.get(agent_name)
-        if agent is None:
-            raise ToolCallError(f"Unknown agent '{agent_name}'", status_code=404)
-        agent._channel.publish(SSEEvent(event=event, data=data))
+        self._agent_session(agent_name).channel.publish(
+            SSEEvent(event=event, data=data)
+        )
 
     def _send_message(self, agent_name: str, message: str) -> None:
         self._require_agent(agent_name)
@@ -385,24 +393,21 @@ class Runtime:
         if agent is None:
             raise ToolCallError(f"Unknown agent '{agent_id}'", status_code=404)
 
-        agent._channel.registered.set()
+        self._agent_session(agent_id).registered.set()
         return _builtin_tools() + [
             build_tool_definition(name, handler)
             for name, handler in agent._handlers.items()
         ]
 
     def _subscribe_events(self, agent_id: str) -> asyncio.Queue[SSEEvent]:
-        agent = self._agents.get(agent_id)
-        if agent is None:
-            raise ToolCallError(f"Unknown agent '{agent_id}'", status_code=404)
-        return agent._channel.subscribe()
+        return self._agent_session(agent_id).channel.subscribe()
 
     def _unsubscribe_events(
         self, agent_id: str, subscription: asyncio.Queue[SSEEvent]
     ) -> None:
-        agent = self._agents.get(agent_id)
-        if agent is not None:
-            agent._channel.unsubscribe(subscription)
+        session = self._agent_sessions.get(agent_id)
+        if session is not None:
+            session.channel.unsubscribe(subscription)
 
     async def _handle_tool_call_request(
         self, agent_id: str, tool_name: str, params: dict[str, Any]

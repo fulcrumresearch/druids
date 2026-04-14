@@ -37,7 +37,6 @@ class AgentChannel:
     def __init__(self) -> None:
         self._backlog: deque[SSEEvent] = deque()
         self._subscriber: asyncio.Queue[SSEEvent] | None = None
-        self.registered = asyncio.Event()
 
     def publish(self, event: SSEEvent) -> None:
         if self._subscriber is None:
