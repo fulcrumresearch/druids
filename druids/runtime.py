@@ -11,6 +11,12 @@ from dataclasses import dataclass, field
 from functools import wraps
 from typing import Any, Awaitable, Callable, ParamSpec, TypeVar
 
+from druids.agent import (
+    Agent,
+    _agent_extension_path,
+    _agent_session_name,
+    _build_agent_launch_command,
+)
 from druids.extension import extension_source
 from druids.machines import Image, LocalImage, Machine
 from druids.schema import build_tool_definition
@@ -100,52 +106,30 @@ def _builtin_tools() -> list[dict[str, Any]]:
                 "required": ["sender", "path"],
             },
         },
+        {
+            "name": "set_state",
+            "description": "Set a key-value pair in this agent's own state store.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string"},
+                    "value": {"type": "string"},
+                },
+                "required": ["key", "value"],
+            },
+        },
+        {
+            "name": "get_state",
+            "description": "Get the value for a key from this agent's own state store. Returns null if the key does not exist.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string"},
+                },
+                "required": ["key"],
+            },
+        },
     ]
-
-
-@dataclass
-class Agent:
-    name: str
-    machine: Machine
-    system_prompt: str | None = None
-    _handlers: dict[str, Callable[..., Awaitable[Any]]] = field(default_factory=dict)
-
-    def on(
-        self, tool_name: str
-    ) -> Callable[[Callable[..., Awaitable[Any]]], Callable[..., Awaitable[Any]]]:
-        """Register an async tool handler for this agent."""
-
-        def decorator(
-            fn: Callable[..., Awaitable[Any]],
-        ) -> Callable[..., Awaitable[Any]]:
-            if not inspect.iscoroutinefunction(fn):
-                raise TypeError("Tool handlers must be async")
-            if "caller" in inspect.signature(fn).parameters:
-                raise TypeError("'caller' injection is not supported")
-
-            runtime = current_runtime()
-            runtime._require_owned_agent(self)
-            self._handlers[tool_name] = fn
-
-            if runtime._is_agent_registered(self.name) and not runtime._shutting_down:
-                runtime._push_event(
-                    self.name, "new_tool", build_tool_definition(tool_name, fn)
-                )
-            return fn
-
-        return decorator
-
-    async def send(self, message: str) -> None:
-        runtime = current_runtime()
-        runtime._require_owned_agent(self)
-        runtime._send_message(self.name, message)
-
-    async def exec(
-        self, command: str, *, user: str = "agent", timeout: int | None = None
-    ) -> ExecResult:
-        runtime = current_runtime()
-        runtime._require_owned_agent(self)
-        return await self.machine.exec(command, user=user, timeout=timeout)
 
 
 @dataclass
@@ -229,11 +213,19 @@ class Runtime:
         if name in self._agents:
             raise ValueError(f"Agent '{name}' already exists")
 
+        if machine is not None and image is not None:
+            raise ValueError("Pass either machine= or image=, not both")
+        resolved_machine = machine
+        if resolved_machine is None:
+            resolved_machine = await (image or self.image).spawn()
+        self._machines.append(resolved_machine)
+
         agent = Agent(
             name=name,
-            machine=await self._resolve_machine(machine, image),
+            machine=resolved_machine,
             system_prompt=system_prompt,
         )
+        agent._runtime = self
         self._agents[name] = agent
         self._agent_sessions[name] = _AgentSession()
         try:
@@ -251,13 +243,36 @@ class Runtime:
         return machine
 
     def connect(self, a: Agent, b: Agent, *, direction: str = "both") -> None:
-        self._require_owned_agent(a)
-        self._require_owned_agent(b)
+        self._require_active()
+        if a._runtime is not self or b._runtime is not self:
+            raise RuntimeError("Agents must belong to the current runtime.")
         if direction not in {"both", "forward"}:
             raise ValueError("direction must be 'both' or 'forward'")
         self._edges.add((a.name, b.name))
         if direction == "both":
             self._edges.add((b.name, a.name))
+
+    def _register_tool_handler(
+        self,
+        agent: Agent,
+        tool_name: str,
+        fn: Callable[..., Awaitable[Any]],
+    ) -> None:
+        self._require_active()
+        agent._handlers[tool_name] = fn
+        if self._is_agent_registered(agent.name) and not self._shutting_down:
+            self._push_event(agent.name, "new_tool", build_tool_definition(tool_name, fn))
+
+    async def _exec_agent(
+        self,
+        agent: Agent,
+        command: str,
+        *,
+        user: str = "agent",
+        timeout: int | None = None,
+    ) -> ExecResult:
+        self._require_active()
+        return await agent.machine.exec(command, user=user, timeout=timeout)
 
     def exit(self, result: Any = None) -> None:
         self._require_active()
@@ -280,18 +295,6 @@ class Runtime:
         if status == "failed":
             raise ExecutionFailed(str(value))
         return value
-
-    async def _resolve_machine(
-        self, machine: Machine | None, image: Image | None
-    ) -> Machine:
-        if machine is not None and image is not None:
-            raise ValueError("Pass either machine= or image=, not both")
-        if machine is not None:
-            self._machines.append(machine)
-            return machine
-        machine = await (image or self.image).spawn()
-        self._machines.append(machine)
-        return machine
 
     def _require_active(self) -> None:
         if not self._is_active():
@@ -322,7 +325,7 @@ class Runtime:
         except asyncio.TimeoutError as exc:
             raise RuntimeError(
                 f"Agent '{agent.name}' did not register within 120s. "
-                f"Check tmux session: druids-{self.execution_id}-{agent.name}"
+                f"Check tmux session: {_agent_session_name(self.execution_id or '', agent.name)}"
             ) from exc
 
     async def _launch_agent(self, agent: Agent) -> bool:
@@ -331,7 +334,7 @@ class Runtime:
         if not pi_command or not tmux_command:
             raise RuntimeError("pi and tmux must both be available to launch agents")
 
-        extension_path = f"/tmp/druids-extension-{self.execution_id}-{agent.name}.ts"
+        extension_path = _agent_extension_path(self.execution_id or "", agent.name)
         await agent.machine.write_file(extension_path, extension_source())
 
         server_url = self.server_url
@@ -344,16 +347,13 @@ class Runtime:
             "DRUIDS_AGENT_ID": agent.name,
             "DRUIDS_SYSTEM_PROMPT": agent.system_prompt or "",
         }
-        env_prefix = " ".join(
-            f"{key}={shlex.quote(value)}" for key, value in env.items()
-        )
-        pi_invocation = f"env {env_prefix} {shlex.quote(pi_command)} --extension {shlex.quote(extension_path)}"
-        session_name = f"druids-{self.execution_id}-{agent.name}"
-        command = (
-            f"{shlex.quote(tmux_command)} has-session -t {shlex.quote(session_name)} 2>/dev/null && "
-            f"{shlex.quote(tmux_command)} kill-session -t {shlex.quote(session_name)}; "
-            f"{shlex.quote(tmux_command)} new-session -d -s {shlex.quote(session_name)} "
-            f"/bin/bash -lc {shlex.quote(pi_invocation)}"
+        session_name = _agent_session_name(self.execution_id or "", agent.name)
+        command = _build_agent_launch_command(
+            pi_command=pi_command,
+            tmux_command=tmux_command,
+            extension_path=extension_path,
+            env=env,
+            session_name=session_name,
         )
         result = await agent.machine.exec(command)
         if not result.ok:
@@ -370,6 +370,7 @@ class Runtime:
         )
 
     def _send_message(self, agent_name: str, message: str) -> None:
+        self._require_active()
         self._get_agent(agent_name)
         self._push_event(agent_name, "message", {"text": message})
 
@@ -405,6 +406,10 @@ class Runtime:
             return await self._send_file(agent_id, params)
         if tool_name == "download_file":
             return await self._download_file(agent_id, params)
+        if tool_name == "set_state":
+            return self._set_state(agent_id, params)
+        if tool_name == "get_state":
+            return self._get_state(agent_id, params)
         return await self._invoke_handler(agent, tool_name, params)
 
     async def _invoke_handler(
@@ -453,18 +458,23 @@ class Runtime:
         await requester_agent.machine.write_file(dest_path, content)
         return f"Downloaded {len(content)} bytes from {sender}:{path} to {dest_path}."
 
+    def _set_state(self, agent_id: str, params: dict[str, Any]) -> str:
+        agent = self._get_agent(agent_id)
+        key = str(params.get("key", ""))
+        value = params.get("value", "")
+        agent.state[key] = value
+        return f"Set state '{key}'."
+
+    def _get_state(self, agent_id: str, params: dict[str, Any]) -> Any:
+        agent = self._get_agent(agent_id)
+        key = str(params.get("key", ""))
+        return agent.state.get(key)
+
     def _get_agent(self, name: str) -> Agent:
         agent = self._agents.get(name)
         if agent is None:
             raise ToolCallError(f"Unknown agent '{name}'", status_code=404)
         return agent
-
-    def _require_owned_agent(self, agent: Agent) -> None:
-        self._require_active()
-        if self._agents.get(agent.name) is not agent:
-            raise RuntimeError(
-                f"Agent '{agent.name}' does not belong to the current runtime."
-            )
 
     def _require_connection(self, sender: str, receiver: str) -> None:
         if (sender, receiver) not in self._edges:
@@ -491,7 +501,7 @@ class Runtime:
             self._server = None
 
         for agent in self._agents.values():
-            session_name = f"druids-{self.execution_id}-{agent.name}"
+            session_name = _agent_session_name(self.execution_id or "", agent.name)
             try:
                 await agent.machine.exec(
                     f"tmux kill-session -t {shlex.quote(session_name)} 2>/dev/null || true",
