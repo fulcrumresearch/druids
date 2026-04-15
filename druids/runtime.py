@@ -19,6 +19,10 @@ from druids.agent import (
 )
 from druids.event_log import AgentEventLog, LogEntry
 from druids.extension import extension_source
+
+
+async def _noop(_entry: LogEntry) -> None:
+    pass
 from druids.machines import Image, LocalImage, Machine
 from druids.schema import build_tool_definition
 from druids.server import Server
@@ -32,16 +36,16 @@ class AgentRecord:
     agent: Agent
     log: AgentEventLog = field(repr=False)
     registered: asyncio.Event = field(default_factory=asyncio.Event)
-    _ws: Any = field(default=None, init=False, repr=False)
+    _notify: Callable[[LogEntry], Awaitable[None]] = field(
+        default=_noop, init=False, repr=False
+    )
 
     async def push(self, entry: LogEntry) -> None:
-        """Send a log entry to the connected agent over WebSocket."""
-        ws = self._ws
-        if ws is not None:
-            try:
-                await ws.send(entry.to_json())
-            except Exception:
-                pass
+        """Deliver a log entry to the connected agent."""
+        try:
+            await self._notify(entry)
+        except Exception:
+            pass
 
     async def push_entries(self, entries: list[LogEntry]) -> None:
         for entry in entries:
