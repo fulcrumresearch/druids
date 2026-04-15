@@ -9,10 +9,6 @@ import websockets
 
 from druids.types import ToolCallError, to_jsonable
 
-
-async def _noop_notify(_entry: Any) -> None:
-    pass
-
 if TYPE_CHECKING:
     from druids.runtime import AgentRecord, Runtime
 
@@ -64,7 +60,7 @@ class Server:
                     continue
                 await self._dispatch(ws, agent_id, rec, msg)
         finally:
-            rec._notify = _noop_notify
+            rec._notify = None
             rec.log.append("disconnected", "agent")
 
     async def _dispatch(
