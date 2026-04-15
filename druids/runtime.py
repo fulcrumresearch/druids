@@ -106,6 +106,29 @@ def _builtin_tools() -> list[dict[str, Any]]:
                 "required": ["sender", "path"],
             },
         },
+        {
+            "name": "set_state",
+            "description": "Set a key-value pair in this agent's own state store.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string"},
+                    "value": {"type": "string"},
+                },
+                "required": ["key", "value"],
+            },
+        },
+        {
+            "name": "get_state",
+            "description": "Get the value for a key from this agent's own state store. Returns null if the key does not exist.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string"},
+                },
+                "required": ["key"],
+            },
+        },
     ]
 
 
@@ -391,6 +414,10 @@ class Runtime:
             return await self._send_file(agent_id, params)
         if tool_name == "download_file":
             return await self._download_file(agent_id, params)
+        if tool_name == "set_state":
+            return self._set_state(agent_id, params)
+        if tool_name == "get_state":
+            return self._get_state(agent_id, params)
         return await self._invoke_handler(agent, tool_name, params)
 
     async def _invoke_handler(
@@ -438,6 +465,18 @@ class Runtime:
         content = await sender_agent.machine.read_file(path)
         await requester_agent.machine.write_file(dest_path, content)
         return f"Downloaded {len(content)} bytes from {sender}:{path} to {dest_path}."
+
+    def _set_state(self, agent_id: str, params: dict[str, Any]) -> str:
+        agent = self._get_agent(agent_id)
+        key = str(params.get("key", ""))
+        value = params.get("value", "")
+        agent.state[key] = value
+        return f"Set state '{key}'."
+
+    def _get_state(self, agent_id: str, params: dict[str, Any]) -> Any:
+        agent = self._get_agent(agent_id)
+        key = str(params.get("key", ""))
+        return agent.state.get(key)
 
     def _get_agent(self, name: str) -> Agent:
         agent = self._agents.get(name)
