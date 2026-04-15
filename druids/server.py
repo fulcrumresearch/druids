@@ -1,18 +1,20 @@
+"""Orchestrator HTTP + WebSocket server."""
+
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import json
 import socket
-from collections import deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
 import uvicorn
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response, StreamingResponse
-from starlette.routing import Route
+from starlette.responses import JSONResponse
+from starlette.routing import Route, WebSocketRoute
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from druids.types import ToolCallError, to_jsonable
 
@@ -22,42 +24,10 @@ if TYPE_CHECKING:
 
 STARTUP_TIMEOUT = 10
 SHUTDOWN_TIMEOUT = 10
-EVENT_POLL_TIMEOUT = 10
-
-
-@dataclass
-class SSEEvent:
-    event: str
-    data: dict[str, Any]
-
-
-class AgentChannel:
-    """Per-agent async event channel with backlog for one SSE subscriber."""
-
-    def __init__(self) -> None:
-        self._backlog: deque[SSEEvent] = deque()
-        self._subscriber: asyncio.Queue[SSEEvent] | None = None
-
-    def publish(self, event: SSEEvent) -> None:
-        if self._subscriber is None:
-            self._backlog.append(event)
-            return
-        self._subscriber.put_nowait(event)
-
-    def subscribe(self) -> asyncio.Queue[SSEEvent]:
-        subscriber: asyncio.Queue[SSEEvent] = asyncio.Queue()
-        self._subscriber = subscriber
-        while self._backlog:
-            subscriber.put_nowait(self._backlog.popleft())
-        return subscriber
-
-    def unsubscribe(self, subscriber: asyncio.Queue[SSEEvent]) -> None:
-        if self._subscriber is subscriber:
-            self._subscriber = None
 
 
 class OrchestratorServer:
-    """Async in-process HTTP server for agent communication."""
+    """Async in-process HTTP + WebSocket server for agent communication."""
 
     def __init__(
         self,
@@ -72,14 +42,13 @@ class OrchestratorServer:
         self._socket: socket.socket | None = None
         self._task: asyncio.Task[None] | None = None
         self._actual_port: int | None = None
-        self._stop_event = asyncio.Event()
 
     @property
     def port(self) -> int:
         return self._actual_port or self._port
 
     async def start(self) -> None:
-        app = _OrchestratorAPI(self.runtime, self._stop_event).app()
+        app = _OrchestratorAPI(self.runtime).app()
         sock = self._open_socket()
 
         self._socket = sock
@@ -91,8 +60,6 @@ class OrchestratorServer:
         await self._wait_until_started()
 
     async def stop(self) -> None:
-        self._stop_event.set()
-
         if self._server is not None:
             self._server.should_exit = True
 
@@ -149,105 +116,128 @@ class OrchestratorServer:
 @dataclass
 class _OrchestratorAPI:
     runtime: Runtime
-    stop_event: asyncio.Event
 
     def app(self) -> Starlette:
         return Starlette(
             routes=[
                 Route("/health", self.health),
-                Route("/agents/register", self.register, methods=["POST"]),
-                Route("/agents/{agent_id}/tool_call", self.tool_call, methods=["POST"]),
-                Route("/agents/{agent_id}/events", self.events),
+                WebSocketRoute("/agents/{agent_id}/ws", self.agent_ws),
             ],
-            exception_handlers={
-                ToolCallError: self.handle_tool_call_error,
-                Exception: self.handle_unexpected_error,
-            },
         )
 
     async def health(self, request: Request) -> JSONResponse:
         del request
         return JSONResponse({"status": "ok"})
 
-    async def register(self, request: Request) -> JSONResponse:
-        payload = await request.json()
-        agent_id = str(payload.get("agent_id", ""))
-        execution_id = str(payload.get("execution_id", ""))
-        tools = self.runtime._register_agent(agent_id, execution_id)
-        return JSONResponse({"tools": to_jsonable(tools)})
+    async def agent_ws(self, ws: WebSocket) -> None:
+        agent_id = ws.path_params["agent_id"]
+        await ws.accept()
 
-    async def tool_call(self, request: Request) -> JSONResponse:
-        agent_id = request.path_params["agent_id"]
-        payload = await request.json()
-        tool_name = str(payload.get("tool", ""))
-        params = payload.get("params", {}) or {}
-        result = await self.runtime._handle_tool_call_request(agent_id, tool_name, params)
-        return JSONResponse({"result": to_jsonable(result)})
+        log = self.runtime._get_event_log(agent_id)
+        log.set_ws(ws)
 
-    async def events(self, request: Request) -> Response:
-        agent_id = request.path_params["agent_id"]
-        subscription = self.runtime._subscribe_events(agent_id)
-        return StreamingResponse(
-            content=self._stream_events(request, agent_id, subscription),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
-
-    async def handle_tool_call_error(
-        self, request: Request, exc: Exception
-    ) -> JSONResponse:
-        del request
-        if not isinstance(exc, ToolCallError):
-            raise TypeError(f"Expected ToolCallError, got {type(exc).__name__}")
-        return self._json_error(str(exc), status_code=exc.status_code)
-
-    async def handle_unexpected_error(
-        self, request: Request, exc: Exception
-    ) -> JSONResponse:
-        del request
-        return self._json_error(str(exc), status_code=500)
-
-    async def _stream_events(
-        self,
-        request: Request,
-        agent_id: str,
-        subscription: asyncio.Queue[SSEEvent],
-    ):
         try:
-            while not self.stop_event.is_set():
-                poll_result, event = await self._poll_event(request, subscription)
-                if poll_result == "disconnect":
-                    return
-                if poll_result == "keepalive":
-                    yield ": keepalive\n\n"
-                    continue
-
-                assert event is not None
-                yield self._encode_event(event)
-                if event.event == "shutdown":
-                    return
-        except asyncio.CancelledError:
-            return
+            await self._ws_loop(ws, agent_id, log)
+        except WebSocketDisconnect:
+            pass
+        except Exception:
+            pass
         finally:
-            self.runtime._unsubscribe_events(agent_id, subscription)
+            log.clear_ws()
+            # Log disconnection
+            log.append("disconnected", "agent")
 
-    async def _poll_event(
+    async def _ws_loop(
         self,
-        request: Request,
-        subscription: asyncio.Queue[SSEEvent],
-    ) -> tuple[Literal["event", "keepalive", "disconnect"], SSEEvent | None]:
-        try:
-            return "event", await asyncio.wait_for(
-                subscription.get(), timeout=EVENT_POLL_TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            if await request.is_disconnected():
-                return "disconnect", None
-            return "keepalive", None
+        ws: WebSocket,
+        agent_id: str,
+        log: Any,
+    ) -> None:
+        while True:
+            raw = await ws.receive_text()
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                await ws.send_json({"error": "invalid JSON"})
+                continue
 
-    def _encode_event(self, event: SSEEvent) -> str:
-        payload = json.dumps(to_jsonable(event.data))
-        return f"event: {event.event}\ndata: {payload}\n\n"
+            msg_type = msg.get("type")
 
-    def _json_error(self, message: str, *, status_code: int) -> JSONResponse:
-        return JSONResponse({"error": message}, status_code=status_code)
+            if msg_type == "sync":
+                after = msg.get("after", 0)
+                entries = log.entries_after(after)
+                await log.push_entries(entries)
+
+            elif msg_type == "event":
+                event_type = msg.get("event_type", "")
+                data = msg.get("data", {})
+                await self._handle_agent_event(ws, agent_id, log, event_type, data)
+
+            else:
+                await ws.send_json({"error": f"unknown message type: {msg_type}"})
+
+    async def _handle_agent_event(
+        self,
+        ws: WebSocket,
+        agent_id: str,
+        log: Any,
+        event_type: str,
+        data: dict[str, Any],
+    ) -> None:
+        if event_type == "register":
+            # Agent is registering
+            entry = log.append("register", "agent", data)
+            await log.push(entry)
+
+            try:
+                tools = self.runtime._register_agent(
+                    agent_id, data.get("execution_id", "")
+                )
+                result_entry = log.append(
+                    "registered", "server", {"tools": to_jsonable(tools)}
+                )
+                await log.push(result_entry)
+            except ToolCallError as exc:
+                err_entry = log.append(
+                    "error", "server", {"error": str(exc)}
+                )
+                await log.push(err_entry)
+
+        elif event_type == "tool_call":
+            # Agent is calling a druids tool
+            entry = log.append("tool_call", "agent", data)
+            await log.push(entry)
+
+            call_id = data.get("call_id", "")
+            tool_name = data.get("tool", "")
+            params = data.get("params", {})
+
+            try:
+                result = await self.runtime._handle_tool_call_request(
+                    agent_id, tool_name, params
+                )
+                result_entry = log.append(
+                    "tool_result",
+                    "server",
+                    {"call_id": call_id, "result": to_jsonable(result)},
+                )
+                await log.push(result_entry)
+            except ToolCallError as exc:
+                err_entry = log.append(
+                    "tool_result",
+                    "server",
+                    {"call_id": call_id, "error": str(exc)},
+                )
+                await log.push(err_entry)
+            except Exception as exc:
+                err_entry = log.append(
+                    "tool_result",
+                    "server",
+                    {"call_id": call_id, "error": str(exc)},
+                )
+                await log.push(err_entry)
+
+        else:
+            # Informational agent event (pi activity, etc.) — just log it
+            entry = log.append(event_type, "agent", data)
+            await log.push(entry)

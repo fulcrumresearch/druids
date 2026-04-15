@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import urllib.error
 from pathlib import Path
 
 import pytest
@@ -17,6 +16,12 @@ from druids import (
     exit,
 )
 from tests.helpers import FakeAgentClient, disable_agent_launch, wait_for_server
+
+
+async def _make_client(ctx: Runtime, agent_id: str) -> FakeAgentClient:
+    client = FakeAgentClient(ctx.server_url, ctx.execution_id or "", agent_id)
+    await asyncio.to_thread(client.connect)
+    return client
 
 
 def test_async_with_runtime_starts_waits_and_closes(
@@ -39,13 +44,15 @@ def test_async_with_runtime_starts_waits_and_closes(
             assert ctx.server_url is not None
             await asyncio.to_thread(wait_for_server, ctx.server_url)
 
-            client = FakeAgentClient(ctx.server_url, ctx.execution_id or "", "builder")
-            client.start_events()
-            await asyncio.to_thread(client.register)
+            client = await _make_client(ctx, "builder")
+            try:
+                await asyncio.to_thread(client.register)
 
-            wait_task = asyncio.create_task(ctx.wait(timeout=5))
-            assert await asyncio.to_thread(client.tool_call, "submit", {"summary": "done"}) == "submitted"
-            assert await wait_task == "done"
+                wait_task = asyncio.create_task(ctx.wait(timeout=5))
+                assert await asyncio.to_thread(client.tool_call, "submit", {"summary": "done"}) == "submitted"
+                assert await wait_task == "done"
+            finally:
+                await asyncio.to_thread(client.close)
 
         assert ctx.server_url is None
 
@@ -70,12 +77,14 @@ def test_agent_runtime_decorator(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
             assert runtime.server_url is not None
             await asyncio.to_thread(wait_for_server, runtime.server_url)
 
-            client = FakeAgentClient(runtime.server_url, runtime.execution_id or "", "builder")
-            client.start_events()
-            await asyncio.to_thread(client.register)
-            await builder.send("Implement the thing")
-            assert await asyncio.to_thread(client.next_event, "message") == {"text": "Implement the thing"}
-            assert await asyncio.to_thread(client.tool_call, "submit", {"summary": "done"}) == "submitted"
+            client = await _make_client(runtime, "builder")
+            try:
+                await asyncio.to_thread(client.register)
+                await builder.send("Implement the thing")
+                assert await asyncio.to_thread(client.next_event, "message") == {"text": "Implement the thing"}
+                assert await asyncio.to_thread(client.tool_call, "submit", {"summary": "done"}) == "submitted"
+            finally:
+                await asyncio.to_thread(client.close)
 
         assert await program() == "done"
         with pytest.raises(RuntimeError, match="No active runtime"):
@@ -103,8 +112,7 @@ def test_exit_cancels_decorated_program(tmp_path: Path, monkeypatch: pytest.Monk
             assert runtime.server_url is not None
             await asyncio.to_thread(wait_for_server, runtime.server_url)
 
-            client = FakeAgentClient(runtime.server_url, runtime.execution_id or "", "builder")
-            client.start_events()
+            client = await _make_client(runtime, "builder")
             await asyncio.to_thread(client.register)
             state["client"] = client
 
@@ -153,19 +161,21 @@ def test_register_and_submit_flow(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
             assert ctx.server_url is not None
             await asyncio.to_thread(wait_for_server, ctx.server_url)
 
-            client = FakeAgentClient(ctx.server_url, ctx.execution_id or "", "builder")
-            client.start_events()
-            tools = await asyncio.to_thread(client.register)
+            client = await _make_client(ctx, "builder")
+            try:
+                tools = await asyncio.to_thread(client.register)
 
-            tool_names = [tool["name"] for tool in tools]
-            assert tool_names[:3] == ["message", "send_file", "download_file"]
-            assert "submit" in tool_names
+                tool_names = [tool["name"] for tool in tools]
+                assert tool_names[:3] == ["message", "send_file", "download_file"]
+                assert "submit" in tool_names
 
-            await builder.send("Implement the thing")
-            assert await asyncio.to_thread(client.next_event, "message") == {"text": "Implement the thing"}
+                await builder.send("Implement the thing")
+                assert await asyncio.to_thread(client.next_event, "message") == {"text": "Implement the thing"}
 
-            assert await asyncio.to_thread(client.tool_call, "submit", {"summary": "done"}) == "submitted"
-            assert await ctx.wait(timeout=5) == "done"
+                assert await asyncio.to_thread(client.tool_call, "submit", {"summary": "done"}) == "submitted"
+                assert await ctx.wait(timeout=5) == "done"
+            finally:
+                await asyncio.to_thread(client.close)
         finally:
             await ctx.close()
 
@@ -190,21 +200,23 @@ def test_dynamic_tool_registration_pushes_new_tool_event(tmp_path: Path, monkeyp
             assert ctx.server_url is not None
             await asyncio.to_thread(wait_for_server, ctx.server_url)
 
-            client = FakeAgentClient(ctx.server_url, ctx.execution_id or "", "builder")
-            client.start_events()
-            await asyncio.to_thread(client.register)
+            client = await _make_client(ctx, "builder")
+            try:
+                await asyncio.to_thread(client.register)
 
-            @builder.on("late_tool")
-            async def late_tool(message: str = "") -> str:
-                return message.upper()
+                @builder.on("late_tool")
+                async def late_tool(message: str = "") -> str:
+                    return message.upper()
 
-            event = await asyncio.to_thread(client.next_event, "new_tool")
-            assert event["name"] == "late_tool"
-            assert event["parameters"]["properties"]["message"]["type"] == "string"
+                event = await asyncio.to_thread(client.next_event, "tool_registered")
+                assert event["name"] == "late_tool"
+                assert event["parameters"]["properties"]["message"]["type"] == "string"
 
-            assert await asyncio.to_thread(client.tool_call, "late_tool", {"message": "hello"}) == "HELLO"
-            assert await asyncio.to_thread(client.tool_call, "finish") == "ok"
-            assert await ctx.wait(timeout=5) == "ok"
+                assert await asyncio.to_thread(client.tool_call, "late_tool", {"message": "hello"}) == "HELLO"
+                assert await asyncio.to_thread(client.tool_call, "finish") == "ok"
+                assert await ctx.wait(timeout=5) == "ok"
+            finally:
+                await asyncio.to_thread(client.close)
         finally:
             await ctx.close()
 
@@ -231,48 +243,50 @@ def test_builtin_message_and_file_transfer(tmp_path: Path, monkeypatch: pytest.M
             assert ctx.server_url is not None
             await asyncio.to_thread(wait_for_server, ctx.server_url)
 
-            builder_client = FakeAgentClient(ctx.server_url, ctx.execution_id or "", "builder")
-            reviewer_client = FakeAgentClient(ctx.server_url, ctx.execution_id or "", "reviewer")
-            builder_client.start_events()
-            reviewer_client.start_events()
-            await asyncio.to_thread(builder_client.register)
-            await asyncio.to_thread(reviewer_client.register)
+            builder_client = await _make_client(ctx, "builder")
+            reviewer_client = await _make_client(ctx, "reviewer")
+            try:
+                await asyncio.to_thread(builder_client.register)
+                await asyncio.to_thread(reviewer_client.register)
 
-            await builder.machine.write_file("artifact.txt", b"hello")
-            send_result = await asyncio.to_thread(
-                builder_client.tool_call,
-                "send_file",
-                {"receiver": "reviewer", "path": "artifact.txt"},
-            )
-            assert "Sent 5 bytes" in send_result
-            assert await reviewer.machine.read_file("artifact.txt") == b"hello"
+                await builder.machine.write_file("artifact.txt", b"hello")
+                send_result = await asyncio.to_thread(
+                    builder_client.tool_call,
+                    "send_file",
+                    {"receiver": "reviewer", "path": "artifact.txt"},
+                )
+                assert "Sent 5 bytes" in send_result
+                assert await reviewer.machine.read_file("artifact.txt") == b"hello"
 
-            message_result = await asyncio.to_thread(
-                builder_client.tool_call,
-                "message",
-                {"receiver": "reviewer", "message": "done"},
-            )
-            assert message_result == "Message sent to reviewer."
-            assert await asyncio.to_thread(reviewer_client.next_event, "message") == {"text": "[From: builder] done"}
+                message_result = await asyncio.to_thread(
+                    builder_client.tool_call,
+                    "message",
+                    {"receiver": "reviewer", "message": "done"},
+                )
+                assert message_result == "Message sent to reviewer."
+                assert await asyncio.to_thread(reviewer_client.next_event, "message") == {"text": "[From: builder] done"}
 
-            await builder.machine.write_file("artifact-2.txt", b"world")
-            download_result = await asyncio.to_thread(
-                reviewer_client.tool_call,
-                "download_file",
-                {"sender": "builder", "path": "artifact-2.txt", "dest_path": "copied.txt"},
-            )
-            assert "Downloaded 5 bytes" in download_result
-            assert await reviewer.machine.read_file("copied.txt") == b"world"
+                await builder.machine.write_file("artifact-2.txt", b"world")
+                download_result = await asyncio.to_thread(
+                    reviewer_client.tool_call,
+                    "download_file",
+                    {"sender": "builder", "path": "artifact-2.txt", "dest_path": "copied.txt"},
+                )
+                assert "Downloaded 5 bytes" in download_result
+                assert await reviewer.machine.read_file("copied.txt") == b"world"
 
-            assert await asyncio.to_thread(builder_client.tool_call, "finish") == "complete"
-            assert await ctx.wait(timeout=5) == "complete"
+                assert await asyncio.to_thread(builder_client.tool_call, "finish") == "complete"
+                assert await ctx.wait(timeout=5) == "complete"
+            finally:
+                await asyncio.to_thread(builder_client.close)
+                await asyncio.to_thread(reviewer_client.close)
         finally:
             await ctx.close()
 
     asyncio.run(run())
 
 
-def test_connection_enforcement_returns_http_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_connection_enforcement_returns_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     async def run() -> None:
         monkeypatch.chdir(tmp_path)
 
@@ -292,23 +306,24 @@ def test_connection_enforcement_returns_http_error(tmp_path: Path, monkeypatch: 
             assert ctx.server_url is not None
             await asyncio.to_thread(wait_for_server, ctx.server_url)
 
-            builder_client = FakeAgentClient(ctx.server_url, ctx.execution_id or "", "builder")
-            reviewer_client = FakeAgentClient(ctx.server_url, ctx.execution_id or "", "reviewer")
-            builder_client.start_events()
-            reviewer_client.start_events()
-            await asyncio.to_thread(builder_client.register)
-            await asyncio.to_thread(reviewer_client.register)
+            builder_client = await _make_client(ctx, "builder")
+            reviewer_client = await _make_client(ctx, "reviewer")
+            try:
+                await asyncio.to_thread(builder_client.register)
+                await asyncio.to_thread(reviewer_client.register)
 
-            status, error = await asyncio.to_thread(
-                reviewer_client.tool_call_error,
-                "message",
-                {"receiver": "builder", "message": "nope"},
-            )
-            assert status == 403
-            assert "not connected" in error
+                error_type, error_msg = await asyncio.to_thread(
+                    reviewer_client.tool_call_error,
+                    "message",
+                    {"receiver": "builder", "message": "nope"},
+                )
+                assert "not connected" in error_msg
 
-            assert await asyncio.to_thread(builder_client.tool_call, "finish") == "ok"
-            assert await ctx.wait(timeout=5) == "ok"
+                assert await asyncio.to_thread(builder_client.tool_call, "finish") == "ok"
+                assert await ctx.wait(timeout=5) == "ok"
+            finally:
+                await asyncio.to_thread(builder_client.close)
+                await asyncio.to_thread(reviewer_client.close)
         finally:
             await ctx.close()
 
@@ -336,14 +351,16 @@ def test_dynamic_agent_creation_inside_handler_is_immediate(tmp_path: Path, monk
             assert ctx.server_url is not None
             await asyncio.to_thread(wait_for_server, ctx.server_url)
 
-            client = FakeAgentClient(ctx.server_url, ctx.execution_id or "", "builder")
-            client.start_events()
-            await asyncio.to_thread(client.register)
-            assert await asyncio.to_thread(client.tool_call, "spawn") == "reviewer"
+            client = await _make_client(ctx, "builder")
+            try:
+                await asyncio.to_thread(client.register)
+                assert await asyncio.to_thread(client.tool_call, "spawn") == "reviewer"
 
-            assert await ctx.wait(timeout=5) == "spawned"
-            reviewer = created["reviewer"]
-            assert reviewer.machine is builder.machine
+                assert await ctx.wait(timeout=5) == "spawned"
+                reviewer = created["reviewer"]
+                assert reviewer.machine is builder.machine
+            finally:
+                await asyncio.to_thread(client.close)
         finally:
             await ctx.close()
 
@@ -368,14 +385,16 @@ def test_ctx_fail_raises_execution_failed(tmp_path: Path, monkeypatch: pytest.Mo
             assert ctx.server_url is not None
             await asyncio.to_thread(wait_for_server, ctx.server_url)
 
-            client = FakeAgentClient(ctx.server_url, ctx.execution_id or "", "builder")
-            client.start_events()
-            await asyncio.to_thread(client.register)
-            assert await asyncio.to_thread(client.tool_call, "reject", {"reason": "bad build"}) == "rejected"
+            client = await _make_client(ctx, "builder")
+            try:
+                await asyncio.to_thread(client.register)
+                assert await asyncio.to_thread(client.tool_call, "reject", {"reason": "bad build"}) == "rejected"
 
-            with pytest.raises(ExecutionFailed) as exc_info:
-                await ctx.wait(timeout=5)
-            assert exc_info.value.reason == "bad build"
+                with pytest.raises(ExecutionFailed) as exc_info:
+                    await ctx.wait(timeout=5)
+                assert exc_info.value.reason == "bad build"
+            finally:
+                await asyncio.to_thread(client.close)
         finally:
             await ctx.close()
 
@@ -413,13 +432,23 @@ def test_register_validates_execution_id(tmp_path: Path, monkeypatch: pytest.Mon
             await asyncio.to_thread(wait_for_server, ctx.server_url)
 
             client = FakeAgentClient(ctx.server_url, "wrong-execution-id", "builder")
-            client.start_events()
-            with pytest.raises(urllib.error.HTTPError) as exc_info:
-                await asyncio.to_thread(client.register)
+            await asyncio.to_thread(client.connect)
+            try:
+                def bad_register():
+                    # Send sync + register with wrong execution_id
+                    client.sync()
+                    client._send({
+                        "type": "event",
+                        "event_type": "register",
+                        "data": {"execution_id": "wrong-execution-id"},
+                    })
+                    # Should get an error entry back
+                    return client._drain_until(lambda e: e.get("type") == "error")
 
-            assert exc_info.value.code == 400
-            body = exc_info.value.read().decode("utf-8")
-            assert "Execution ID mismatch" in body
+                entry = await asyncio.to_thread(bad_register)
+                assert "Execution ID mismatch" in entry["data"]["error"]
+            finally:
+                await asyncio.to_thread(client.close)
         finally:
             await ctx.close()
 

@@ -12,8 +12,11 @@ type RemoteTool = {
   parameters?: Record<string, unknown>;
 };
 
-type SseEvent = {
-  event: string;
+type LogEntry = {
+  seq: number;
+  ts: number;
+  type: string;
+  origin: string;
   data: any;
 };
 
@@ -25,6 +28,9 @@ function requireEnv(name: string, value: string | undefined): string {
 const baseUrl = requireEnv("DRUIDS_SERVER_URL", serverUrl);
 const currentExecutionId = requireEnv("DRUIDS_EXECUTION_ID", executionId);
 const currentAgentId = requireEnv("DRUIDS_AGENT_ID", agentId);
+
+// Derive ws:// URL from http:// URL
+const wsUrl = baseUrl.replace(/^http/, "ws");
 
 function humanizeLabel(name: string): string {
   return name
@@ -42,27 +48,6 @@ function formatToolResult(value: unknown): string {
   } catch {
     return String(value);
   }
-}
-
-async function postJson(path: string, body: unknown): Promise<any> {
-  const response = await fetch(`${baseUrl}${path}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-
-  let data: any = {};
-  try {
-    data = await response.json();
-  } catch {
-    data = {};
-  }
-
-  if (!response.ok) {
-    throw new Error(data?.error || `HTTP ${response.status}`);
-  }
-
-  return data;
 }
 
 function schemaToTypeBox(schema: any): any {
@@ -117,6 +102,38 @@ function schemaToTypeBox(schema: any): any {
   }
 }
 
+// -- WebSocket state --
+
+let ws: WebSocket | null = null;
+let lastSeq = 0;
+let callIdCounter = 0;
+
+// Pending tool calls waiting for results
+const pendingCalls = new Map<string, {
+  resolve: (value: unknown) => void;
+  reject: (error: Error) => void;
+}>();
+
+function nextCallId(): string {
+  return `tc-${++callIdCounter}`;
+}
+
+function sendWs(msg: object): void {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(msg));
+  }
+}
+
+function sendEvent(eventType: string, data: object): void {
+  sendWs({ type: "event", event_type: eventType, data });
+}
+
+function sendSync(): void {
+  sendWs({ type: "sync", after: lastSeq });
+}
+
+// -- Tool registration --
+
 function registerRemoteTool(pi: ExtensionAPI, tool: RemoteTool, registeredTools: Set<string>) {
   if (!tool?.name || registeredTools.has(tool.name)) {
     return;
@@ -128,13 +145,14 @@ function registerRemoteTool(pi: ExtensionAPI, tool: RemoteTool, registeredTools:
     description: tool.description || "",
     parameters: schemaToTypeBox(tool.parameters || { type: "object", properties: {}, required: [] }),
     async execute(toolCallId, params, _signal, _onUpdate, _ctx) {
-      const response = await postJson(`/agents/${currentAgentId}/tool_call`, {
-        tool: tool.name,
-        params,
+      const callId = nextCallId();
+      const result = await new Promise<unknown>((resolve, reject) => {
+        pendingCalls.set(callId, { resolve, reject });
+        sendEvent("tool_call", { call_id: callId, tool: tool.name, params });
       });
       return {
-        content: [{ type: "text", text: formatToolResult(response.result) }],
-        details: { remoteResult: response.result, toolCallId },
+        content: [{ type: "text", text: formatToolResult(result) }],
+        details: { remoteResult: result, toolCallId },
       };
     },
   };
@@ -143,103 +161,170 @@ function registerRemoteTool(pi: ExtensionAPI, tool: RemoteTool, registeredTools:
   registeredTools.add(tool.name);
 }
 
-async function deliverMessage(pi: ExtensionAPI, ctx: ExtensionContext, text: string) {
-  if (!text) return;
-  if (ctx.isIdle()) {
-    pi.sendUserMessage(text);
-  } else {
-    pi.sendUserMessage(text, { deliverAs: "steer" });
-  }
-}
+// -- Log entry handling --
 
-async function registerWithServer(pi: ExtensionAPI, registeredTools: Set<string>) {
-  const response = await postJson("/agents/register", {
-    agent_id: currentAgentId,
-    execution_id: currentExecutionId,
-  });
+function handleLogEntry(
+  entry: LogEntry,
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  registeredTools: Set<string>,
+): boolean {
+  lastSeq = entry.seq;
 
-  for (const tool of response.tools || []) {
-    registerRemoteTool(pi, tool, registeredTools);
-  }
-}
-
-async function* parseSseStream(response: Response): AsyncGenerator<SseEvent> {
-  if (!response.body) {
-    throw new Error("SSE stream missing response body");
-  }
-
-  const decoder = new TextDecoder();
-  const reader = response.body.getReader();
-  let buffer = "";
-
-  while (true) {
-    const chunk = await reader.read();
-    if (chunk.done) return;
-    buffer += decoder.decode(chunk.value, { stream: true });
-
-    while (true) {
-      const boundary = buffer.indexOf("\n\n");
-      if (boundary === -1) break;
-
-      const rawEvent = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-
-      let event = "message";
-      const dataLines: string[] = [];
-
-      for (const line of rawEvent.split("\n")) {
-        if (!line || line.startsWith(":")) continue;
-        if (line.startsWith("event:")) event = line.slice(6).trim();
-        if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+  switch (entry.type) {
+    case "registered": {
+      const tools = entry.data?.tools || [];
+      for (const tool of tools) {
+        registerRemoteTool(pi, tool, registeredTools);
       }
-
-      const payload = dataLines.join("\n");
-      yield { event, data: payload ? JSON.parse(payload) : {} };
+      break;
     }
-  }
-}
 
-async function runEventLoop(pi: ExtensionAPI, ctx: ExtensionContext, registeredTools: Set<string>) {
-  while (true) {
-    try {
-      await registerWithServer(pi, registeredTools);
-
-      const response = await fetch(`${baseUrl}/agents/${currentAgentId}/events`, {
-        headers: { Accept: "text/event-stream" },
-      });
-      if (!response.ok) {
-        throw new Error(`SSE connection failed with HTTP ${response.status}`);
-      }
-
-      for await (const event of parseSseStream(response)) {
-        if (event.event === "message") {
-          await deliverMessage(pi, ctx, String(event.data?.text || ""));
-        } else if (event.event === "new_tool") {
-          registerRemoteTool(pi, event.data, registeredTools);
-        } else if (event.event === "shutdown") {
-          ctx.shutdown();
-          return;
+    case "tool_result": {
+      const callId = entry.data?.call_id;
+      const pending = pendingCalls.get(callId);
+      if (pending) {
+        pendingCalls.delete(callId);
+        if (entry.data?.error) {
+          pending.reject(new Error(entry.data.error));
+        } else {
+          pending.resolve(entry.data?.result);
         }
       }
-    } catch (error) {
-      if (ctx.hasUI) {
-        const message = error instanceof Error ? error.message : String(error);
-        ctx.ui.notify(`druids extension disconnected: ${message}`, "warning");
-      }
+      break;
     }
 
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+    case "tool_registered": {
+      registerRemoteTool(pi, entry.data, registeredTools);
+      break;
+    }
+
+    case "message": {
+      const text = String(entry.data?.text || "");
+      if (text) {
+        if (ctx.isIdle()) {
+          pi.sendUserMessage(text);
+        } else {
+          pi.sendUserMessage(text, { deliverAs: "steer" });
+        }
+      }
+      break;
+    }
+
+    case "shutdown": {
+      ctx.shutdown();
+      return true; // signal to stop
+    }
+
+    case "error": {
+      if (ctx.hasUI) {
+        ctx.ui.notify(`druids error: ${entry.data?.error || "unknown"}`, "error");
+      }
+      break;
+    }
   }
+
+  return false;
 }
+
+// -- WebSocket connection --
+
+function connectWs(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  registeredTools: Set<string>,
+): void {
+  const url = `${wsUrl}/agents/${currentAgentId}/ws`;
+  ws = new WebSocket(url);
+
+  ws.onopen = () => {
+    // Sync first, then register
+    sendSync();
+    sendEvent("register", { execution_id: currentExecutionId });
+  };
+
+  ws.onmessage = (event: MessageEvent) => {
+    try {
+      const entry: LogEntry = JSON.parse(String(event.data));
+      const shouldStop = handleLogEntry(entry, pi, ctx, registeredTools);
+      if (shouldStop) {
+        ws?.close();
+        ws = null;
+      }
+    } catch (error) {
+      // Ignore parse errors
+    }
+  };
+
+  ws.onclose = () => {
+    ws = null;
+    // Reject any pending tool calls
+    for (const [callId, pending] of pendingCalls) {
+      pending.reject(new Error("WebSocket disconnected"));
+      pendingCalls.delete(callId);
+    }
+    // Reconnect after delay
+    setTimeout(() => {
+      connectWs(pi, ctx, registeredTools);
+    }, 1000);
+  };
+
+  ws.onerror = () => {
+    // onclose will fire after this
+    if (ctx.hasUI) {
+      ctx.ui.notify("druids: WebSocket error, reconnecting...", "warning");
+    }
+  };
+}
+
+// -- Pi activity event forwarding --
+
+function setupActivityForwarding(pi: ExtensionAPI): void {
+  pi.on("turn_start", async (event) => {
+    sendEvent("turn_start", { turn_index: event.turnIndex });
+  });
+
+  pi.on("turn_end", async (event) => {
+    sendEvent("turn_end", { turn_index: event.turnIndex });
+  });
+
+  pi.on("message_start", async (event) => {
+    sendEvent("message_start", { role: event.message?.role });
+  });
+
+  pi.on("message_end", async (event) => {
+    sendEvent("message_end", { role: event.message?.role });
+  });
+
+  pi.on("tool_execution_start", async (event) => {
+    sendEvent("pi_tool_start", {
+      tool_call_id: event.toolCallId,
+      tool: event.toolName,
+      args: event.args,
+    });
+  });
+
+  pi.on("tool_execution_end", async (event) => {
+    sendEvent("pi_tool_end", {
+      tool_call_id: event.toolCallId,
+      tool: event.toolName,
+      is_error: event.isError || false,
+    });
+  });
+}
+
+// -- Extension entry point --
 
 export default function druidsExtension(pi: ExtensionAPI) {
   const registeredTools = new Set<string>();
   let started = false;
 
+  setupActivityForwarding(pi);
+
   pi.on("session_start", async (_event, ctx) => {
     if (started) return;
     started = true;
-    void runEventLoop(pi, ctx, registeredTools);
+    connectWs(pi, ctx, registeredTools);
   });
 
   pi.on("before_agent_start", async (event) => {

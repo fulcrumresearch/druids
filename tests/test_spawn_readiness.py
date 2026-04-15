@@ -12,6 +12,12 @@ from druids import Runtime, LocalImage
 from tests.helpers import FakeAgentClient, disable_agent_launch, wait_for_server
 
 
+async def _make_client(ctx: Runtime, agent_id: str) -> FakeAgentClient:
+    client = FakeAgentClient(ctx.server_url, ctx.execution_id or "", agent_id)
+    await asyncio.to_thread(client.connect)
+    return client
+
+
 def test_registered_event_set_on_register(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     async def run() -> None:
         monkeypatch.chdir(tmp_path)
@@ -27,18 +33,21 @@ def test_registered_event_set_on_register(tmp_path: Path, monkeypatch: pytest.Mo
                 ctx.exit("ok")
                 return "ok"
 
-            assert not agent._channel.registered.is_set()
+            log = ctx._event_logs["worker"]
+            assert not log.registered.is_set()
 
             assert ctx.server_url is not None
             await asyncio.to_thread(wait_for_server, ctx.server_url)
 
-            client = FakeAgentClient(ctx.server_url, ctx.execution_id or "", "worker")
-            client.start_events()
-            await asyncio.to_thread(client.register)
+            client = await _make_client(ctx, "worker")
+            try:
+                await asyncio.to_thread(client.register)
 
-            assert agent._channel.registered.is_set()
-            assert await asyncio.to_thread(client.tool_call, "finish") == "ok"
-            assert await ctx.wait(timeout=5) == "ok"
+                assert log.registered.is_set()
+                assert await asyncio.to_thread(client.tool_call, "finish") == "ok"
+                assert await ctx.wait(timeout=5) == "ok"
+            finally:
+                await asyncio.to_thread(client.close)
         finally:
             await ctx.close()
 
@@ -66,13 +75,15 @@ def test_dynamic_agent_in_handler_is_usable(tmp_path: Path, monkeypatch: pytest.
             assert ctx.server_url is not None
             await asyncio.to_thread(wait_for_server, ctx.server_url)
 
-            client = FakeAgentClient(ctx.server_url, ctx.execution_id or "", "finder")
-            client.start_events()
-            await asyncio.to_thread(client.register)
-            assert await asyncio.to_thread(client.tool_call, "spawn") == "worker"
+            client = await _make_client(ctx, "finder")
+            try:
+                await asyncio.to_thread(client.register)
+                assert await asyncio.to_thread(client.tool_call, "spawn") == "worker"
 
-            assert await ctx.wait(timeout=5) == "spawned"
-            assert created_agents["worker"].machine is finder.machine
+                assert await ctx.wait(timeout=5) == "spawned"
+                assert created_agents["worker"].machine is finder.machine
+            finally:
+                await asyncio.to_thread(client.close)
         finally:
             await ctx.close()
 
@@ -87,9 +98,11 @@ def test_spawn_readiness_blocks_until_registered(tmp_path: Path, monkeypatch: py
         await ctx.start()
         try:
             async def fake_launch(agent):
+                log = ctx._event_logs[agent.name]
+
                 async def delayed_register() -> None:
                     await asyncio.sleep(0.3)
-                    agent._channel.registered.set()
+                    log.registered.set()
 
                 asyncio.create_task(delayed_register())
                 return True
@@ -101,7 +114,7 @@ def test_spawn_readiness_blocks_until_registered(tmp_path: Path, monkeypatch: py
             elapsed = time.perf_counter() - started
 
             assert agent.name == "test-agent"
-            assert agent._channel.registered.is_set()
+            assert ctx._event_logs["test-agent"].registered.is_set()
             assert elapsed >= 0.25
         finally:
             await ctx.close()

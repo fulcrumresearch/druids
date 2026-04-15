@@ -7,8 +7,7 @@ import shlex
 import shutil
 import uuid
 from contextvars import ContextVar
-from dataclasses import dataclass, field
-from functools import wraps
+from pathlib import Path
 from typing import Any, Awaitable, Callable, ParamSpec, TypeVar
 
 from druids.agent import (
@@ -17,10 +16,11 @@ from druids.agent import (
     _agent_session_name,
     _build_agent_launch_command,
 )
+from druids.event_log import AgentEventLog
 from druids.extension import extension_source
 from druids.machines import Image, LocalImage, Machine
 from druids.schema import build_tool_definition
-from druids.server import AgentChannel, OrchestratorServer, SSEEvent
+from druids.server import OrchestratorServer
 from druids.types import ExecResult, ExecutionFailed, ToolCallError
 
 
@@ -106,40 +106,11 @@ def _builtin_tools() -> list[dict[str, Any]]:
                 "required": ["sender", "path"],
             },
         },
-        {
-            "name": "set_state",
-            "description": "Set a key-value pair in this agent's own state store.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "key": {"type": "string"},
-                    "value": {"type": "string"},
-                },
-                "required": ["key", "value"],
-            },
-        },
-        {
-            "name": "get_state",
-            "description": "Get the value for a key from this agent's own state store. Returns null if the key does not exist.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "key": {"type": "string"},
-                },
-                "required": ["key"],
-            },
-        },
     ]
 
 
-@dataclass
-class _AgentSession:
-    channel: AgentChannel = field(default_factory=AgentChannel, repr=False)
-    registered: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
-
-
 class Runtime:
-    def __init__(self, *, image: Image | None = None):
+    def __init__(self, *, image: Image | None = None, log_dir: Path | str | None = None):
         self.image = image or LocalImage()
 
         self._execution_id: str | None = None
@@ -147,10 +118,11 @@ class Runtime:
         self.server_url: str | None = None
 
         self._agents: dict[str, Agent] = {}
-        self._agent_sessions: dict[str, _AgentSession] = {}
+        self._event_logs: dict[str, AgentEventLog] = {}
         self._machines: list[Machine] = []
         self._edges: set[tuple[str, str]] = set()
 
+        self._log_dir_root = Path(log_dir) if log_dir else None
         self._started = False
         self._shutting_down = False
         self._server: OrchestratorServer | None = None
@@ -227,12 +199,21 @@ class Runtime:
         )
         agent._runtime = self
         self._agents[name] = agent
-        self._agent_sessions[name] = _AgentSession()
+
+        # Create event log for this agent
+        log_dir = None
+        if self._log_dir_root is not None and self._execution_id:
+            log_dir = self._log_dir_root / self._execution_id
+        self._event_logs[name] = AgentEventLog(log_dir=log_dir, agent_name=name)
+
+        # Log agent creation
+        self._event_logs[name].append("agent_created", "server", {"agent": name})
+
         try:
             await self._spawn_agent(agent)
         except Exception:
             self._agents.pop(name, None)
-            self._agent_sessions.pop(name, None)
+            self._event_logs.pop(name, None)
             raise
         return agent
 
@@ -260,8 +241,11 @@ class Runtime:
     ) -> None:
         self._require_active()
         agent._handlers[tool_name] = fn
-        if self._is_agent_registered(agent.name) and not self._shutting_down:
-            self._push_event(agent.name, "new_tool", build_tool_definition(tool_name, fn))
+        log = self._event_logs.get(agent.name)
+        if log and log.registered.is_set() and not self._shutting_down:
+            tool_def = build_tool_definition(tool_name, fn)
+            entry = log.append("tool_registered", "server", tool_def)
+            asyncio.ensure_future(log.push(entry))
 
     async def _exec_agent(
         self,
@@ -277,20 +261,26 @@ class Runtime:
     def exit(self, result: Any = None) -> None:
         self._require_active()
         assert self._outcome is not None
+        # Log before resolving the future
+        for log in self._event_logs.values():
+            log.append("done", "server", {"result": result})
         self._outcome.set_result(("done", result))
 
     def fail(self, reason: str) -> None:
         self._require_active()
         assert self._outcome is not None
+        for log in self._event_logs.values():
+            log.append("failed", "server", {"reason": reason})
         self._outcome.set_result(("failed", reason))
 
     async def wait(self, *, timeout: float | None = None) -> Any:
-        self._require_active()
-        assert self._outcome is not None
+        outcome = self._outcome
+        if outcome is None:
+            raise RuntimeError(_NO_ACTIVE_RUNTIME_ERROR)
         status, value = await (
-            asyncio.wait_for(asyncio.shield(self._outcome), timeout=timeout)
+            asyncio.wait_for(asyncio.shield(outcome), timeout=timeout)
             if timeout is not None
-            else asyncio.shield(self._outcome)
+            else asyncio.shield(outcome)
         )
         if status == "failed":
             raise ExecutionFailed(str(value))
@@ -308,20 +298,22 @@ class Runtime:
         if _CURRENT_RUNTIME.get() is self:
             _CURRENT_RUNTIME.set(None)
 
-    def _agent_session(self, name: str) -> _AgentSession:
-        self._get_agent(name)
-        return self._agent_sessions[name]
+    def _get_event_log(self, agent_name: str) -> AgentEventLog:
+        log = self._event_logs.get(agent_name)
+        if log is None:
+            raise ToolCallError(f"Unknown agent '{agent_name}'", status_code=404)
+        return log
 
     def _is_agent_registered(self, name: str) -> bool:
-        return self._agent_session(name).registered.is_set()
+        log = self._event_logs.get(name)
+        return log is not None and log.registered.is_set()
 
     async def _spawn_agent(self, agent: Agent) -> None:
         if not await self._launch_agent(agent):
             return
+        log = self._event_logs[agent.name]
         try:
-            await asyncio.wait_for(
-                self._agent_session(agent.name).registered.wait(), timeout=120
-            )
+            await asyncio.wait_for(log.registered.wait(), timeout=120)
         except asyncio.TimeoutError as exc:
             raise RuntimeError(
                 f"Agent '{agent.name}' did not register within 120s. "
@@ -362,38 +354,31 @@ class Runtime:
                 or result.stdout.strip()
                 or f"Failed to launch agent '{agent.name}'"
             )
-        return True
 
-    def _push_event(self, agent_name: str, event: str, data: dict[str, Any]) -> None:
-        self._agent_session(agent_name).channel.publish(
-            SSEEvent(event=event, data=data)
-        )
+        log = self._event_logs[agent.name]
+        log.append("agent_spawned", "server", {
+            "agent": agent.name,
+            "tmux_session": session_name,
+        })
+        return True
 
     def _send_message(self, agent_name: str, message: str) -> None:
         self._require_active()
         self._get_agent(agent_name)
-        self._push_event(agent_name, "message", {"text": message})
+        log = self._get_event_log(agent_name)
+        entry = log.append("message", "server", {"text": message})
+        asyncio.ensure_future(log.push(entry))
 
     def _register_agent(self, agent_id: str, execution_id: str) -> list[dict[str, Any]]:
         if execution_id != self.execution_id:
             raise ToolCallError("Execution ID mismatch", status_code=400)
         agent = self._get_agent(agent_id)
-
-        self._agent_session(agent_id).registered.set()
+        log = self._get_event_log(agent_id)
+        log.registered.set()
         return _builtin_tools() + [
             build_tool_definition(name, handler)
             for name, handler in agent._handlers.items()
         ]
-
-    def _subscribe_events(self, agent_id: str) -> asyncio.Queue[SSEEvent]:
-        return self._agent_session(agent_id).channel.subscribe()
-
-    def _unsubscribe_events(
-        self, agent_id: str, subscription: asyncio.Queue[SSEEvent]
-    ) -> None:
-        session = self._agent_sessions.get(agent_id)
-        if session is not None:
-            session.channel.unsubscribe(subscription)
 
     async def _handle_tool_call_request(
         self, agent_id: str, tool_name: str, params: dict[str, Any]
@@ -406,10 +391,6 @@ class Runtime:
             return await self._send_file(agent_id, params)
         if tool_name == "download_file":
             return await self._download_file(agent_id, params)
-        if tool_name == "set_state":
-            return self._set_state(agent_id, params)
-        if tool_name == "get_state":
-            return self._get_state(agent_id, params)
         return await self._invoke_handler(agent, tool_name, params)
 
     async def _invoke_handler(
@@ -458,18 +439,6 @@ class Runtime:
         await requester_agent.machine.write_file(dest_path, content)
         return f"Downloaded {len(content)} bytes from {sender}:{path} to {dest_path}."
 
-    def _set_state(self, agent_id: str, params: dict[str, Any]) -> str:
-        agent = self._get_agent(agent_id)
-        key = str(params.get("key", ""))
-        value = params.get("value", "")
-        agent.state[key] = value
-        return f"Set state '{key}'."
-
-    def _get_state(self, agent_id: str, params: dict[str, Any]) -> Any:
-        agent = self._get_agent(agent_id)
-        key = str(params.get("key", ""))
-        return agent.state.get(key)
-
     def _get_agent(self, name: str) -> Agent:
         agent = self._agents.get(name)
         if agent is None:
@@ -488,9 +457,11 @@ class Runtime:
 
         self._shutting_down = True
 
-        for agent_name in list(self._agents):
+        # Push shutdown event to all agents
+        for agent_name, log in self._event_logs.items():
             try:
-                self._push_event(agent_name, "shutdown", {})
+                entry = log.append("shutdown", "server")
+                await log.push(entry)
             except Exception:
                 pass
 
@@ -569,6 +540,8 @@ def agent_runtime(
     image: Image | None = None,
     timeout: float | None = None,
 ) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]] | Callable[P, Awaitable[Any]]:
+    from functools import wraps
+
     def decorate(coro_fn: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
         if not inspect.iscoroutinefunction(coro_fn):
             raise TypeError("@agent_runtime requires an async function")

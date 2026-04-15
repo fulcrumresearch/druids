@@ -1,6 +1,7 @@
+from druids.agent import Agent
+from druids.event_log import AgentEventLog, LogEntry
 from druids.machines import Image, LocalImage, LocalMachine, Machine
 from druids.runtime import (
-    Agent,
     Runtime,
     agent,
     agent_runtime,
@@ -14,6 +15,7 @@ from druids.types import ExecResult, ExecutionFailed
 
 __all__ = [
     "Agent",
+    "AgentEventLog",
     "ExecResult",
     "ExecutionFailed",
     "Image",
