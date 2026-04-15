@@ -7,6 +7,7 @@ import shlex
 import shutil
 import uuid
 from contextvars import ContextVar
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, ParamSpec, TypeVar
 
@@ -16,12 +17,35 @@ from druids.agent import (
     _agent_session_name,
     _build_agent_launch_command,
 )
-from druids.event_log import AgentEventLog
+from druids.event_log import AgentEventLog, LogEntry
 from druids.extension import extension_source
 from druids.machines import Image, LocalImage, Machine
 from druids.schema import build_tool_definition
-from druids.server import OrchestratorServer
+from druids.server import Server
 from druids.types import ExecResult, ExecutionFailed, ToolCallError
+
+
+@dataclass
+class AgentRecord:
+    """Single source of truth for all per-agent state."""
+
+    agent: Agent
+    log: AgentEventLog = field(repr=False)
+    registered: asyncio.Event = field(default_factory=asyncio.Event)
+    _ws: Any = field(default=None, init=False, repr=False)
+
+    async def push(self, entry: LogEntry) -> None:
+        """Send a log entry to the connected agent over WebSocket."""
+        ws = self._ws
+        if ws is not None:
+            try:
+                await ws.send(entry.to_json())
+            except Exception:
+                pass
+
+    async def push_entries(self, entries: list[LogEntry]) -> None:
+        for entry in entries:
+            await self.push(entry)
 
 
 _CURRENT_RUNTIME: ContextVar[Runtime | None] = ContextVar(
@@ -140,15 +164,14 @@ class Runtime:
         self._outcome: asyncio.Future[tuple[str, Any]] | None = None
         self.server_url: str | None = None
 
-        self._agents: dict[str, Agent] = {}
-        self._event_logs: dict[str, AgentEventLog] = {}
+        self._records: dict[str, AgentRecord] = {}
         self._machines: list[Machine] = []
         self._edges: set[tuple[str, str]] = set()
 
         self._log_dir_root = Path(log_dir) if log_dir else None
         self._started = False
         self._shutting_down = False
-        self._server: OrchestratorServer | None = None
+        self._server: Server | None = None
 
     @property
     def execution_id(self) -> str | None:
@@ -176,7 +199,7 @@ class Runtime:
         self._execution_id = str(uuid.uuid4())
         self._outcome = asyncio.get_running_loop().create_future()
         self._shutting_down = False
-        self._server = OrchestratorServer(self)
+        self._server = Server(self)
 
         try:
             await self._server.start()
@@ -188,7 +211,7 @@ class Runtime:
             self._clear_current_runtime()
             raise
 
-        self.server_url = f"http://127.0.0.1:{self._server.port}"
+        self.server_url = f"ws://127.0.0.1:{self._server.port}"
 
     async def close(self) -> None:
         try:
@@ -205,7 +228,7 @@ class Runtime:
         machine: Machine | None = None,
     ) -> Agent:
         self._require_active()
-        if name in self._agents:
+        if name in self._records:
             raise ValueError(f"Agent '{name}' already exists")
 
         if machine is not None and image is not None:
@@ -215,30 +238,27 @@ class Runtime:
             resolved_machine = await (image or self.image).spawn()
         self._machines.append(resolved_machine)
 
-        agent = Agent(
+        ag = Agent(
             name=name,
             machine=resolved_machine,
             system_prompt=system_prompt,
         )
-        agent._runtime = self
-        self._agents[name] = agent
+        ag._runtime = self
 
-        # Create event log for this agent
         log_dir = None
         if self._log_dir_root is not None and self._execution_id:
             log_dir = self._log_dir_root / self._execution_id
-        self._event_logs[name] = AgentEventLog(log_dir=log_dir, agent_name=name)
+        log = AgentEventLog(log_dir=log_dir, agent_name=name)
 
-        # Log agent creation
-        self._event_logs[name].append("agent_created", "server", {"agent": name})
+        self._records[name] = AgentRecord(agent=ag, log=log)
+        log.append("agent_created", "server", {"agent": name})
 
         try:
-            await self._spawn_agent(agent)
+            await self._spawn_agent(ag)
         except Exception:
-            self._agents.pop(name, None)
-            self._event_logs.pop(name, None)
+            self._records.pop(name, None)
             raise
-        return agent
+        return ag
 
     async def machine(self, image: Image | None = None) -> Machine:
         self._require_active()
@@ -264,11 +284,11 @@ class Runtime:
     ) -> None:
         self._require_active()
         agent._handlers[tool_name] = fn
-        log = self._event_logs.get(agent.name)
-        if log and log.registered.is_set() and not self._shutting_down:
+        rec = self._records.get(agent.name)
+        if rec and rec.registered.is_set() and not self._shutting_down:
             tool_def = build_tool_definition(tool_name, fn)
-            entry = log.append("tool_registered", "server", tool_def)
-            asyncio.ensure_future(log.push(entry))
+            entry = rec.log.append("tool_registered", "server", tool_def)
+            asyncio.ensure_future(rec.push(entry))
 
     async def _exec_agent(
         self,
@@ -284,16 +304,15 @@ class Runtime:
     def exit(self, result: Any = None) -> None:
         self._require_active()
         assert self._outcome is not None
-        # Log before resolving the future
-        for log in self._event_logs.values():
-            log.append("done", "server", {"result": result})
+        for rec in self._records.values():
+            rec.log.append("done", "server", {"result": result})
         self._outcome.set_result(("done", result))
 
     def fail(self, reason: str) -> None:
         self._require_active()
         assert self._outcome is not None
-        for log in self._event_logs.values():
-            log.append("failed", "server", {"reason": reason})
+        for rec in self._records.values():
+            rec.log.append("failed", "server", {"reason": reason})
         self._outcome.set_result(("failed", reason))
 
     async def wait(self, *, timeout: float | None = None) -> Any:
@@ -321,22 +340,25 @@ class Runtime:
         if _CURRENT_RUNTIME.get() is self:
             _CURRENT_RUNTIME.set(None)
 
+    def _get_record(self, name: str) -> AgentRecord:
+        rec = self._records.get(name)
+        if rec is None:
+            raise ToolCallError(f"Unknown agent '{name}'", status_code=404)
+        return rec
+
     def _get_event_log(self, agent_name: str) -> AgentEventLog:
-        log = self._event_logs.get(agent_name)
-        if log is None:
-            raise ToolCallError(f"Unknown agent '{agent_name}'", status_code=404)
-        return log
+        return self._get_record(agent_name).log
 
     def _is_agent_registered(self, name: str) -> bool:
-        log = self._event_logs.get(name)
-        return log is not None and log.registered.is_set()
+        rec = self._records.get(name)
+        return rec is not None and rec.registered.is_set()
 
     async def _spawn_agent(self, agent: Agent) -> None:
         if not await self._launch_agent(agent):
             return
-        log = self._event_logs[agent.name]
+        rec = self._records[agent.name]
         try:
-            await asyncio.wait_for(log.registered.wait(), timeout=120)
+            await asyncio.wait_for(rec.registered.wait(), timeout=120)
         except asyncio.TimeoutError as exc:
             raise RuntimeError(
                 f"Agent '{agent.name}' did not register within 120s. "
@@ -378,8 +400,8 @@ class Runtime:
                 or f"Failed to launch agent '{agent.name}'"
             )
 
-        log = self._event_logs[agent.name]
-        log.append("agent_spawned", "server", {
+        rec = self._records[agent.name]
+        rec.log.append("agent_spawned", "server", {
             "agent": agent.name,
             "tmux_session": session_name,
         })
@@ -387,26 +409,24 @@ class Runtime:
 
     def _send_message(self, agent_name: str, message: str) -> None:
         self._require_active()
-        self._get_agent(agent_name)
-        log = self._get_event_log(agent_name)
-        entry = log.append("message", "server", {"text": message})
-        asyncio.ensure_future(log.push(entry))
+        rec = self._get_record(agent_name)
+        entry = rec.log.append("message", "server", {"text": message})
+        asyncio.ensure_future(rec.push(entry))
 
     def _register_agent(self, agent_id: str, execution_id: str) -> list[dict[str, Any]]:
         if execution_id != self.execution_id:
             raise ToolCallError("Execution ID mismatch", status_code=400)
-        agent = self._get_agent(agent_id)
-        log = self._get_event_log(agent_id)
-        log.registered.set()
+        rec = self._get_record(agent_id)
+        rec.registered.set()
         return _builtin_tools() + [
             build_tool_definition(name, handler)
-            for name, handler in agent._handlers.items()
+            for name, handler in rec.agent._handlers.items()
         ]
 
     async def _handle_tool_call_request(
         self, agent_id: str, tool_name: str, params: dict[str, Any]
     ) -> Any:
-        agent = self._get_agent(agent_id)
+        rec = self._get_record(agent_id)
 
         if tool_name == "message":
             return await self._message(agent_id, params)
@@ -418,15 +438,15 @@ class Runtime:
             return self._set_state(agent_id, params)
         if tool_name == "get_state":
             return self._get_state(agent_id, params)
-        return await self._invoke_handler(agent, tool_name, params)
+        return await self._invoke_handler(rec, tool_name, params)
 
     async def _invoke_handler(
-        self, agent: Agent, tool_name: str, params: dict[str, Any]
+        self, rec: AgentRecord, tool_name: str, params: dict[str, Any]
     ) -> Any:
-        handler = agent._handlers.get(tool_name)
+        handler = rec.agent._handlers.get(tool_name)
         if handler is None:
             raise ToolCallError(
-                f"Unknown tool '{tool_name}' for agent '{agent.name}'", status_code=404
+                f"Unknown tool '{tool_name}' for agent '{rec.agent.name}'", status_code=404
             )
 
         _CURRENT_RUNTIME.set(self)
@@ -439,50 +459,44 @@ class Runtime:
     async def _message(self, sender: str, params: dict[str, Any]) -> str:
         receiver = str(params.get("receiver", ""))
         message = str(params.get("message", ""))
-        self._get_agent(receiver)
+        self._get_record(receiver)
         self._require_connection(sender, receiver)
         self._send_message(receiver, f"[From: {sender}] {message}")
         return f"Message sent to {receiver}."
 
     async def _send_file(self, sender: str, params: dict[str, Any]) -> str:
-        sender_agent = self._get_agent(sender)
+        sender_rec = self._get_record(sender)
         receiver = str(params.get("receiver", ""))
         path = str(params.get("path", ""))
         dest_path = str(params.get("dest_path") or path)
-        receiver_agent = self._get_agent(receiver)
+        receiver_rec = self._get_record(receiver)
         self._require_connection(sender, receiver)
-        content = await sender_agent.machine.read_file(path)
-        await receiver_agent.machine.write_file(dest_path, content)
+        content = await sender_rec.agent.machine.read_file(path)
+        await receiver_rec.agent.machine.write_file(dest_path, content)
         return f"Sent {len(content)} bytes to {receiver}:{dest_path}."
 
     async def _download_file(self, requester: str, params: dict[str, Any]) -> str:
-        requester_agent = self._get_agent(requester)
+        requester_rec = self._get_record(requester)
         sender = str(params.get("sender", ""))
         path = str(params.get("path", ""))
         dest_path = str(params.get("dest_path") or path)
-        sender_agent = self._get_agent(sender)
+        sender_rec = self._get_record(sender)
         self._require_connection(sender, requester)
-        content = await sender_agent.machine.read_file(path)
-        await requester_agent.machine.write_file(dest_path, content)
+        content = await sender_rec.agent.machine.read_file(path)
+        await requester_rec.agent.machine.write_file(dest_path, content)
         return f"Downloaded {len(content)} bytes from {sender}:{path} to {dest_path}."
 
     def _set_state(self, agent_id: str, params: dict[str, Any]) -> str:
-        agent = self._get_agent(agent_id)
+        rec = self._get_record(agent_id)
         key = str(params.get("key", ""))
         value = params.get("value", "")
-        agent.state[key] = value
+        rec.agent.state[key] = value
         return f"Set state '{key}'."
 
     def _get_state(self, agent_id: str, params: dict[str, Any]) -> Any:
-        agent = self._get_agent(agent_id)
+        rec = self._get_record(agent_id)
         key = str(params.get("key", ""))
-        return agent.state.get(key)
-
-    def _get_agent(self, name: str) -> Agent:
-        agent = self._agents.get(name)
-        if agent is None:
-            raise ToolCallError(f"Unknown agent '{name}'", status_code=404)
-        return agent
+        return rec.agent.state.get(key)
 
     def _require_connection(self, sender: str, receiver: str) -> None:
         if (sender, receiver) not in self._edges:
@@ -496,11 +510,10 @@ class Runtime:
 
         self._shutting_down = True
 
-        # Push shutdown event to all agents
-        for agent_name, log in self._event_logs.items():
+        for rec in self._records.values():
             try:
-                entry = log.append("shutdown", "server")
-                await log.push(entry)
+                entry = rec.log.append("shutdown", "server")
+                await rec.push(entry)
             except Exception:
                 pass
 
@@ -510,10 +523,10 @@ class Runtime:
             await self._server.stop()
             self._server = None
 
-        for agent in self._agents.values():
-            session_name = _agent_session_name(self.execution_id or "", agent.name)
+        for rec in self._records.values():
+            session_name = _agent_session_name(self.execution_id or "", rec.agent.name)
             try:
-                await agent.machine.exec(
+                await rec.agent.machine.exec(
                     f"tmux kill-session -t {shlex.quote(session_name)} 2>/dev/null || true",
                     timeout=5,
                 )

@@ -33,8 +33,8 @@ def test_registered_event_set_on_register(tmp_path: Path, monkeypatch: pytest.Mo
                 ctx.exit("ok")
                 return "ok"
 
-            log = ctx._event_logs["worker"]
-            assert not log.registered.is_set()
+            rec = ctx._records["worker"]
+            assert not rec.registered.is_set()
 
             assert ctx.server_url is not None
             await asyncio.to_thread(wait_for_server, ctx.server_url)
@@ -43,7 +43,7 @@ def test_registered_event_set_on_register(tmp_path: Path, monkeypatch: pytest.Mo
             try:
                 await asyncio.to_thread(client.register)
 
-                assert log.registered.is_set()
+                assert rec.registered.is_set()
                 assert await asyncio.to_thread(client.tool_call, "finish") == "ok"
                 assert await ctx.wait(timeout=5) == "ok"
             finally:
@@ -98,11 +98,11 @@ def test_spawn_readiness_blocks_until_registered(tmp_path: Path, monkeypatch: py
         await ctx.start()
         try:
             async def fake_launch(agent):
-                log = ctx._event_logs[agent.name]
+                rec = ctx._records[agent.name]
 
                 async def delayed_register() -> None:
                     await asyncio.sleep(0.3)
-                    log.registered.set()
+                    rec.registered.set()
 
                 asyncio.create_task(delayed_register())
                 return True
@@ -114,7 +114,7 @@ def test_spawn_readiness_blocks_until_registered(tmp_path: Path, monkeypatch: py
             elapsed = time.perf_counter() - started
 
             assert agent.name == "test-agent"
-            assert ctx._event_logs["test-agent"].registered.is_set()
+            assert ctx._records["test-agent"].registered.is_set()
             assert elapsed >= 0.25
         finally:
             await ctx.close()
