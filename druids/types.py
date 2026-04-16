@@ -20,7 +20,9 @@ class ExecResult:
 
 
 class ExecutionFailed(RuntimeError):
-    """Raised when a runtime ends via ``runtime.fail(...)``."""
+    """Raised when a process ends via ``fail(...)``.
+
+    The ``reason`` attribute contains the failure message."""
 
     def __init__(self, reason: str):
         super().__init__(reason)

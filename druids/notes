@@ -1,2 +1,3 @@
-- do we need all of these require agent things? if agents are by default on the current runtime
-- what is the point of resolve machine? deactivate?
+- what is the point of schema.py? (generates JSON Schema tool definitions from Python function signatures — used by build_tool_definition)
+let's make helpers more organized in druids/helpers
+and then sub, have agent.py for agent helpers, and schema.py there

@@ -5,15 +5,16 @@ import inspect
 import uuid
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from functools import wraps
 from pathlib import Path
 from typing import Any, Awaitable, Callable, ParamSpec, TypeVar
 
 from druids.agent import Agent
 from druids.event_log import AgentEventLog
 from druids.events import EventStream
-from druids.helpers import BUILTIN_TOOLS, agent_session_name, kill_agent, launch_agent
+from druids.helpers import agent_session_name, build_tool_definition, kill_agent
+from druids.helpers import launch_agent as _launch_agent_impl
 from druids.machines import Image, LocalImage, Machine
-from druids.schema import build_tool_definition
 from druids.server import Server
 from druids.types import ExecutionFailed, ToolCallError
 
@@ -183,7 +184,6 @@ class Runtime:
         system_prompt: str | None = None,
         image: Image | None = None,
         machine: Machine | None = None,
-        scope: ProcessScope,
     ) -> tuple[Agent, Machine | None]:
         """Create, register, and launch an agent.
 
@@ -208,7 +208,6 @@ class Runtime:
             system_prompt=system_prompt,
         )
         ag._runtime = self
-        ag._scope = scope
 
         log_dir = None
         if self.log_dir_root is not None and self.execution_id:
@@ -216,6 +215,7 @@ class Runtime:
         log = AgentEventLog(log_dir=log_dir, agent_name=name)
 
         self.records[name] = AgentRecord(agent=ag, log=log)
+        self._register_builtins(ag)
         log.append("agent_created", "server", {"agent": name})
 
         try:
@@ -225,6 +225,39 @@ class Runtime:
             raise
 
         return ag, spawned_machine
+
+    def _register_builtins(self, ag: Agent) -> None:
+        """Register builtin tools (message, send_file, download_file) on an agent."""
+        runtime = self
+
+        async def message(receiver: str, message: str) -> str:
+            """Send a message to a connected agent."""
+            runtime.get_record(receiver)
+            runtime.require_connection(ag.name, receiver)
+            runtime.send_message(receiver, f"[From: {ag.name}] {message}")
+            return f"Message sent to {receiver}."
+
+        async def send_file(receiver: str, path: str, dest_path: str = "") -> str:
+            """Send a file to a connected agent."""
+            dest = dest_path or path
+            receiver_rec = runtime.get_record(receiver)
+            runtime.require_connection(ag.name, receiver)
+            content = await ag.machine.read_file(path)
+            await receiver_rec.agent.machine.write_file(dest, content)
+            return f"Sent {len(content)} bytes to {receiver}:{dest}."
+
+        async def download_file(sender: str, path: str, dest_path: str = "") -> str:
+            """Download a file from a connected agent."""
+            dest = dest_path or path
+            sender_rec = runtime.get_record(sender)
+            runtime.require_connection(sender, ag.name)
+            content = await sender_rec.agent.machine.read_file(path)
+            await ag.machine.write_file(dest, content)
+            return f"Downloaded {len(content)} bytes from {sender}:{path} to {dest}."
+
+        ag._handlers["message"] = message
+        ag._handlers["send_file"] = send_file
+        ag._handlers["download_file"] = download_file
 
     # -- Connections --
 
@@ -276,7 +309,7 @@ class Runtime:
         if server_url is None:
             raise RuntimeError("Server is not running")
 
-        session_name = await launch_agent(
+        session_name = await _launch_agent_impl(
             agent, server_url=server_url, execution_id=self.execution_id or ""
         )
         rec = self.records[agent.name]
@@ -295,7 +328,7 @@ class Runtime:
             raise ToolCallError("Execution ID mismatch", status_code=400)
         rec = self.get_record(agent_id)
         rec.registered.set()
-        return BUILTIN_TOOLS + [
+        return [
             build_tool_definition(name, fn)
             for name, fn in rec.agent._handlers.items()
         ]
@@ -305,17 +338,7 @@ class Runtime:
     async def handle_tool_call(
         self, agent_id: str, tool_name: str, params: dict[str, Any]
     ) -> Any:
-        if tool_name == "message":
-            return await self.handle_message(agent_id, params)
-        if tool_name == "send_file":
-            return await self.handle_send_file(agent_id, params)
-        if tool_name == "download_file":
-            return await self.handle_download_file(agent_id, params)
-        return await self.invoke_handler(self.get_record(agent_id), tool_name, params)
-
-    async def invoke_handler(
-        self, rec: AgentRecord, tool_name: str, params: dict[str, Any]
-    ) -> Any:
+        rec = self.get_record(agent_id)
         handler = rec.agent._handlers.get(tool_name)
         if handler is None:
             raise ToolCallError(
@@ -327,38 +350,6 @@ class Runtime:
             return await handler(**params)
         finally:
             _current_process.reset(token)
-
-    # -- Builtin tool implementations --
-
-    async def handle_message(self, sender: str, params: dict[str, Any]) -> str:
-        receiver = str(params.get("receiver", ""))
-        message = str(params.get("message", ""))
-        self.get_record(receiver)
-        self.require_connection(sender, receiver)
-        self.send_message(receiver, f"[From: {sender}] {message}")
-        return f"Message sent to {receiver}."
-
-    async def handle_send_file(self, sender: str, params: dict[str, Any]) -> str:
-        sender_rec = self.get_record(sender)
-        receiver = str(params.get("receiver", ""))
-        path = str(params.get("path", ""))
-        dest_path = str(params.get("dest_path") or path)
-        receiver_rec = self.get_record(receiver)
-        self.require_connection(sender, receiver)
-        content = await sender_rec.agent.machine.read_file(path)
-        await receiver_rec.agent.machine.write_file(dest_path, content)
-        return f"Sent {len(content)} bytes to {receiver}:{dest_path}."
-
-    async def handle_download_file(self, requester: str, params: dict[str, Any]) -> str:
-        requester_rec = self.get_record(requester)
-        sender = str(params.get("sender", ""))
-        path = str(params.get("path", ""))
-        dest_path = str(params.get("dest_path") or path)
-        sender_rec = self.get_record(sender)
-        self.require_connection(sender, requester)
-        content = await sender_rec.agent.machine.read_file(path)
-        await requester_rec.agent.machine.write_file(dest_path, content)
-        return f"Downloaded {len(content)} bytes from {sender}:{path} to {dest_path}."
 
     # -- Helpers --
 
@@ -390,8 +381,6 @@ def agent_process(
     Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[Any]]]
     | Callable[P, Awaitable[Any]]
 ):
-    from functools import wraps
-
     def decorate(coro_fn: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[Any]]:
         if not inspect.iscoroutinefunction(coro_fn):
             raise TypeError("@agent_process requires an async function")
@@ -473,14 +462,14 @@ async def agent(
     machine: Machine | None = None,
 ) -> Agent:
     scope = _require_scope()
-    resolved_image = image or scope.image if machine is None else None
+    resolved_image = (image or scope.image) if machine is None else None
     ag, spawned_machine = await scope.runtime.create_agent(
         name,
         system_prompt=system_prompt,
         image=resolved_image,
         machine=machine,
-        scope=scope,
     )
+    ag._scope = scope
     scope.agents.append(ag)
     if spawned_machine is not None:
         scope.machines.append(spawned_machine)

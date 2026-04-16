@@ -8,7 +8,7 @@ from druids.machines import Machine
 from druids.types import ExecResult
 
 if TYPE_CHECKING:
-    from druids.runtime import Runtime
+    from druids.runtime import ProcessScope, Runtime
 
 
 @dataclass
@@ -18,7 +18,7 @@ class Agent:
     system_prompt: str | None = None
     _handlers: dict[str, Callable[..., Awaitable[Any]]] = field(default_factory=dict)
     _runtime: Runtime | None = field(default=None, init=False, repr=False, compare=False)
-    _scope: Any = field(default=None, init=False, repr=False)
+    _scope: ProcessScope | None = field(default=None, init=False, repr=False)
     _public: bool = field(default=False, init=False, repr=False)
 
     @property
