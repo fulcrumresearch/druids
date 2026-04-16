@@ -14,9 +14,9 @@ from tests.helpers import FakeAgentClient, disable_agent_launch, wait_for_server
 
 
 async def _setup(tmp_path, monkeypatch):
-    runtime = Runtime(image=LocalImage(tmp_path))
+    runtime = Runtime()
     await runtime.start()
-    scope = ProcessScope(parent=None, runtime=runtime)
+    scope = ProcessScope(parent=None, runtime=runtime, image=LocalImage(tmp_path))
     token = _current_process.set(scope)
     return runtime, scope, token
 
@@ -46,7 +46,7 @@ def test_registered_event_set_on_register(tmp_path: Path, monkeypatch) -> None:
                 done("ok")
                 return "ok"
 
-            rec = runtime._records["worker"]
+            rec = runtime.records["worker"]
             assert not rec.registered.is_set()
 
             await asyncio.to_thread(wait_for_server, runtime.server_url)
@@ -102,7 +102,7 @@ def test_spawn_readiness_blocks_until_registered(tmp_path: Path, monkeypatch) ->
         runtime, scope, token = await _setup(tmp_path, monkeypatch)
         try:
             async def fake_launch(ag):
-                rec = runtime._records[ag.name]
+                rec = runtime.records[ag.name]
 
                 async def delayed_register() -> None:
                     await asyncio.sleep(0.3)
@@ -111,14 +111,14 @@ def test_spawn_readiness_blocks_until_registered(tmp_path: Path, monkeypatch) ->
                 asyncio.create_task(delayed_register())
                 return True
 
-            monkeypatch.setattr(runtime, "_launch_agent", fake_launch)
+            monkeypatch.setattr(runtime, "launch_agent", fake_launch)
 
             started = time.perf_counter()
             worker = await agent("test-agent")
             elapsed = time.perf_counter() - started
 
             assert worker.name == "test-agent"
-            assert runtime._records["test-agent"].registered.is_set()
+            assert runtime.records["test-agent"].registered.is_set()
             assert elapsed >= 0.25
         finally:
             await _teardown(runtime, scope, token)

@@ -64,7 +64,7 @@ def build_tool_definition(name: str, handler: Any) -> dict[str, Any]:
     }
 
     for param_name, param in signature.parameters.items():
-        if param_name in {"self", "cls", "caller"}:
+        if param_name in {"self", "cls"}:
             continue
         annotation = annotations.get(param_name, param.annotation)
         parameter_schema = _schema_for_annotation(annotation)

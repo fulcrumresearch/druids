@@ -10,13 +10,14 @@ import websockets
 from druids.types import ToolCallError, to_jsonable
 
 if TYPE_CHECKING:
-    from druids.runtime import AgentRecord, Runtime
+    from druids.event_log import AgentEventLog
+    from druids.runtime import Runtime
 
 
 class Server:
     def __init__(self, runtime: Runtime) -> None:
         self.runtime = runtime
-        self._server: websockets.WebSocketServer | None = None
+        self.server_instance: websockets.WebSocketServer | None = None
         self._port: int | None = None
 
     @property
@@ -26,14 +27,14 @@ class Server:
         return self._port
 
     async def start(self, host: str = "127.0.0.1", port: int = 0) -> None:
-        self._server = await websockets.serve(self._handle, host, port)
-        self._port = self._server.sockets[0].getsockname()[1]
+        self.server_instance = await websockets.serve(self._handle, host, port)
+        self._port = self.server_instance.sockets[0].getsockname()[1]
 
     async def stop(self) -> None:
-        if self._server is not None:
-            self._server.close()
-            await self._server.wait_closed()
-            self._server = None
+        if self.server_instance is not None:
+            self.server_instance.close()
+            await self.server_instance.wait_closed()
+            self.server_instance = None
             self._port = None
 
     async def _handle(self, ws: Any) -> None:
@@ -45,12 +46,13 @@ class Server:
 
         agent_id = parts[1]
         try:
-            rec = self.runtime._get_record(agent_id)
+            rec = self.runtime.get_record(agent_id)
         except ToolCallError:
             await ws.close(4001, f"unknown agent: {agent_id}")
             return
 
-        rec._notify = lambda entry: ws.send(entry.to_json())
+        log = rec.log
+        log.on_push = lambda entry: ws.send(entry.to_json())
         try:
             async for raw in ws:
                 try:
@@ -58,74 +60,74 @@ class Server:
                 except json.JSONDecodeError:
                     await ws.send(json.dumps({"error": "invalid JSON"}))
                     continue
-                await self._dispatch(ws, agent_id, rec, msg)
+                await self._dispatch(ws, agent_id, log, msg)
         finally:
-            rec._notify = None
-            rec.log.append("disconnected", "agent")
+            log.on_push = None
+            log.append("disconnected", "agent")
 
     async def _dispatch(
-        self, ws: Any, agent_id: str, rec: AgentRecord, msg: dict[str, Any]
+        self, ws: Any, agent_id: str, log: AgentEventLog, msg: dict[str, Any]
     ) -> None:
         msg_type = msg.get("type")
 
         if msg_type == "sync":
-            entries = rec.log.entries_after(msg.get("after", 0))
-            await rec.push_entries(entries)
+            entries = log.entries_after(msg.get("after", 0))
+            await log.push_entries(entries)
 
         elif msg_type == "event":
             event_type = msg.get("event_type", "")
             data = msg.get("data", {})
-            await self._handle_event(agent_id, rec, event_type, data)
+            await self._handle_event(agent_id, log, event_type, data)
 
         else:
             await ws.send(json.dumps({"error": f"unknown message type: {msg_type}"}))
 
     async def _handle_event(
-        self, agent_id: str, rec: AgentRecord, event_type: str, data: dict[str, Any]
+        self, agent_id: str, log: AgentEventLog, event_type: str, data: dict[str, Any]
     ) -> None:
         if event_type == "register":
-            entry = rec.log.append("register", "agent", data)
-            await rec.push(entry)
+            entry = log.append("register", "agent", data)
+            await log.push(entry)
             try:
-                tools = self.runtime._register_agent(
+                tools = self.runtime.register_agent(
                     agent_id, data.get("execution_id", "")
                 )
-                result_entry = rec.log.append(
+                result_entry = log.append(
                     "registered", "server", {"tools": to_jsonable(tools)}
                 )
-                await rec.push(result_entry)
+                await log.push(result_entry)
             except ToolCallError as exc:
-                err_entry = rec.log.append(
+                err_entry = log.append(
                     "error", "server", {"error": str(exc)}
                 )
-                await rec.push(err_entry)
+                await log.push(err_entry)
 
         elif event_type == "tool_call":
-            entry = rec.log.append("tool_call", "agent", data)
-            await rec.push(entry)
+            entry = log.append("tool_call", "agent", data)
+            await log.push(entry)
 
             call_id = data.get("call_id", "")
             tool_name = data.get("tool", "")
             params = data.get("params", {})
 
             try:
-                result = await self.runtime._handle_tool_call_request(
+                result = await self.runtime.handle_tool_call(
                     agent_id, tool_name, params
                 )
-                result_entry = rec.log.append(
+                result_entry = log.append(
                     "tool_result",
                     "server",
                     {"call_id": call_id, "result": to_jsonable(result)},
                 )
-                await rec.push(result_entry)
+                await log.push(result_entry)
             except Exception as exc:
-                err_entry = rec.log.append(
+                err_entry = log.append(
                     "tool_result",
                     "server",
                     {"call_id": call_id, "error": str(exc)},
                 )
-                await rec.push(err_entry)
+                await log.push(err_entry)
 
         else:
-            entry = rec.log.append(event_type, "agent", data)
-            await rec.push(entry)
+            entry = log.append(event_type, "agent", data)
+            await log.push(entry)

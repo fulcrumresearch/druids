@@ -23,9 +23,9 @@ from tests.helpers import FakeAgentClient, disable_agent_launch, wait_for_server
 
 
 async def _setup(tmp_path, monkeypatch):
-    runtime = Runtime(image=LocalImage(tmp_path))
+    runtime = Runtime()
     await runtime.start()
-    scope = ProcessScope(parent=None, runtime=runtime)
+    scope = ProcessScope(parent=None, runtime=runtime, image=LocalImage(tmp_path))
     token = _current_process.set(scope)
     disable_agent_launch(runtime, monkeypatch)
     return runtime, scope, token
