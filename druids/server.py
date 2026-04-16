@@ -7,9 +7,9 @@ Wire protocol (see spec-replication.md):
 - Server -> client: a ``LogEntry`` encoded as JSON.
 
 The server is the sole writer of the log. Every client event is appended
-as a ``LogEntry`` (which assigns ``seq``), broadcast to all subscribers
-(including the sender), and then reacted to. Reactions may append further
-entries; each goes through the same append-then-broadcast path.
+via ``log.emit`` (which assigns ``seq``, persists, and schedules delivery
+to all subscribers) and then reacted to. Reactions may append further
+entries via the same ``log.emit`` primitive.
 """
 
 from __future__ import annotations
@@ -60,12 +60,12 @@ class Server:
 
         agent_id = parts[1]
         try:
-            rec = self.runtime.get_record(agent_id)
+            ag = self.runtime.get_agent(agent_id)
         except ToolCallError:
             await ws.close(4001, f"unknown agent: {agent_id}")
             return
 
-        log = rec.log
+        log = ag.log
 
         async def send(entry: LogEntry) -> None:
             await ws.send(entry.to_json())
@@ -82,7 +82,7 @@ class Server:
                 await self._dispatch(agent_id, log, send, msg)
         finally:
             unsubscribe()
-            await self._append(log, "disconnected", {}, origin="agent")
+            log.emit("disconnected", {}, origin="agent")
 
     async def _dispatch(
         self, agent_id: str, log: Log, send: Send, msg: dict[str, Any]
@@ -103,24 +103,9 @@ class Server:
         if msg_type == "event":
             event_type = str(msg.get("event_type", ""))
             data = msg.get("data", {}) or {}
-            entry = await self._append(log, event_type, data, origin="agent")
+            entry = log.emit(event_type, data, origin="agent")
             if entry is not None:
                 await self._react(agent_id, log, entry)
-
-    # -- append / send helpers --
-
-    async def _append(
-        self,
-        log: Log,
-        event_type: str,
-        data: Any,
-        *,
-        origin: str = "server",
-    ) -> LogEntry | None:
-        entry = log.emit(event_type, data, origin=origin)
-        if entry is not None:
-            await log.broadcast(entry)
-        return entry
 
     # -- reactions: the only place derived entries are produced --
 
@@ -130,9 +115,9 @@ class Server:
                 tools = self.runtime.register_agent(
                     agent_id, entry.data.get("execution_id", "")
                 )
-                await self._append(log, "registered", {"tools": to_jsonable(tools)})
+                log.emit("registered", {"tools": to_jsonable(tools)})
             except ToolCallError as exc:
-                await self._append(log, "error", {"error": str(exc)})
+                log.emit("error", {"error": str(exc)})
             return
 
         if entry.type == "tool_call":
@@ -143,14 +128,12 @@ class Server:
                 result = await self.runtime.handle_tool_call(
                     agent_id, tool_name, params
                 )
-                await self._append(
-                    log,
+                log.emit(
                     "tool_result",
                     {"call_id": call_id, "result": to_jsonable(result)},
                 )
             except Exception as exc:
-                await self._append(
-                    log,
+                log.emit(
                     "tool_result",
                     {"call_id": call_id, "error": str(exc)},
                 )

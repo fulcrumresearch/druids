@@ -17,19 +17,12 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, ParamSpec, TypeVar
 
 from druids.agent import Agent
+from druids.context import _current_process
 from druids.helpers import kill_agent
 from druids.machines import Image, LocalImage, Machine
 from druids.runtime import Runtime
 from druids.stream import Stream
 from druids.types import ExecutionFailed
-
-# ---------------------------------------------------------------------------
-# Context variables (read by Runtime.handle_tool_call as well)
-# ---------------------------------------------------------------------------
-
-_current_process: ContextVar["ProcessScope | None"] = ContextVar(
-    "druids_current_process", default=None
-)
 
 _spawn_handle: ContextVar["ProcessHandle | None"] = ContextVar(
     "druids_spawn_handle", default=None
@@ -67,25 +60,20 @@ class ProcessScope:
         """Tear down agents and machines owned by this scope."""
         eid = self.runtime.execution_id or ""
 
-        # Send shutdown events
+        # Emit a shutdown entry to each agent's log. Delivery is scheduled
+        # internally by ``emit``; we then proceed to kill the tmux session.
+        # Any client-side cleanup pi does is best-effort.
         for ag in self.agents:
-            rec = self.runtime.records.get(ag.name)
-            if rec:
-                try:
-                    entry = rec.log.emit("shutdown")
-                    if entry is not None:
-                        await rec.log.broadcast(entry)
-                except Exception:
-                    pass
-
-        if self.agents:
-            await asyncio.sleep(0.2)
+            try:
+                ag.log.emit("shutdown")
+            except Exception:
+                pass
 
         # Kill agents and deregister
         for ag in self.agents:
             await kill_agent(ag, execution_id=eid)
-            ag.events.close()
-            self.runtime.records.pop(ag.name, None)
+            ag.log.close()
+            self.runtime.agents.pop(ag.name, None)
 
         seen: set[int] = set()
         for m in self.machines:
@@ -117,7 +105,7 @@ class ProcessHandle:
         """Public agents exposed by the child process."""
         if self._scope is None:
             return {}
-        return {ag.name: ag for ag in self._scope.agents if ag._public}
+        return {ag.name: ag for ag in self._scope.agents if ag.is_public}
 
     async def call(self, event_name: str, **kwargs: Any) -> Any:
         """Call a client event handler defined by the child process."""
@@ -237,7 +225,7 @@ async def agent(
         image=resolved_image,
         machine=machine,
     )
-    ag._scope = scope
+    ag.scope = scope
     scope.agents.append(ag)
     if spawned_machine is not None:
         scope.machines.append(spawned_machine)
@@ -284,7 +272,7 @@ def emit(event_type: str, data: Any = None) -> None:
 
 def public(ag: Agent) -> None:
     """Expose an agent so the parent process can interact with it."""
-    ag._public = True
+    ag.is_public = True
 
 
 def client_event(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:

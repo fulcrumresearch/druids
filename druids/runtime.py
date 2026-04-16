@@ -2,43 +2,25 @@
 
 One ``Runtime`` is created per root ``@agent_process`` invocation. It
 owns the WebSocket server that agents connect to, the map of agent
-records, and the edge set that authorizes inter-agent messages.
+records (keyed by agent name), and the edge set that authorizes
+inter-agent messages.
 """
 
 from __future__ import annotations
 
 import asyncio
 import uuid
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from druids.agent import Agent
+from druids.context import _current_process
 from druids.helpers import agent_session_name, build_tool_definition
 from druids.helpers import launch_agent as _launch_agent_impl
 from druids.log import Log
 from druids.machines import Image, Machine
 from druids.server import Server
 from druids.types import ToolCallError
-
-
-# ---------------------------------------------------------------------------
-# Agent record (per-agent bookkeeping inside the runtime)
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class AgentRecord:
-    """Single source of truth for all per-agent state inside the runtime."""
-
-    agent: Agent
-    log: Log = field(repr=False)
-    registered: asyncio.Event = field(default_factory=asyncio.Event)
-
-
-# ---------------------------------------------------------------------------
-# Runtime
-# ---------------------------------------------------------------------------
 
 
 class Runtime:
@@ -51,7 +33,7 @@ class Runtime:
     def __init__(self, *, log_dir: Path | str | None = None):
         self.execution_id: str | None = None
         self.server_url: str | None = None
-        self.records: dict[str, AgentRecord] = {}
+        self.agents: dict[str, Agent] = {}
         self.edges: set[tuple[str, str]] = set()
         self.log_dir_root = Path(log_dir) if log_dir else None
         self.server_instance: Server | None = None
@@ -85,7 +67,7 @@ class Runtime:
         machine that was created (so the scope can track it), or ``None`` if
         an existing machine was passed in.
         """
-        if name in self.records:
+        if name in self.agents:
             raise ValueError(f"Agent '{name}' already exists")
         if machine is not None and image is not None:
             raise ValueError("Pass either machine= or image=, not both")
@@ -96,26 +78,25 @@ class Runtime:
             resolved_machine = await image.spawn()
             spawned_machine = resolved_machine
 
-        ag = Agent(
-            name=name,
-            machine=resolved_machine,
-            system_prompt=system_prompt,
-        )
-        ag._runtime = self
-
         log_path: Path | None = None
         if self.log_dir_root is not None and self.execution_id:
             log_path = self.log_dir_root / self.execution_id / f"{name}.jsonl"
-        log = Log(path=log_path)
 
-        self.records[name] = AgentRecord(agent=ag, log=log)
+        ag = Agent(
+            name=name,
+            machine=resolved_machine,
+            log=Log(path=log_path),
+            system_prompt=system_prompt,
+        )
+
+        self.agents[name] = ag
         self._register_builtins(ag)
-        log.emit("agent_created", {"agent": name})
+        ag.log.emit("agent_created", {"agent": name})
 
         try:
             await self.spawn_agent(ag)
         except Exception:
-            self.records.pop(name, None)
+            self.agents.pop(name, None)
             raise
 
         return ag, spawned_machine
@@ -126,32 +107,32 @@ class Runtime:
 
         async def message(receiver: str, message: str) -> str:
             """Send a message to a connected agent."""
-            runtime.get_record(receiver)
+            target = runtime.get_agent(receiver)
             runtime.require_connection(ag.name, receiver)
-            runtime.send_message(receiver, f"[From: {ag.name}] {message}")
+            await target.send(f"[From: {ag.name}] {message}")
             return f"Message sent to {receiver}."
 
         async def send_file(receiver: str, path: str, dest_path: str = "") -> str:
             """Send a file to a connected agent."""
             dest = dest_path or path
-            receiver_rec = runtime.get_record(receiver)
+            target = runtime.get_agent(receiver)
             runtime.require_connection(ag.name, receiver)
             content = await ag.machine.read_file(path)
-            await receiver_rec.agent.machine.write_file(dest, content)
+            await target.machine.write_file(dest, content)
             return f"Sent {len(content)} bytes to {receiver}:{dest}."
 
         async def download_file(sender: str, path: str, dest_path: str = "") -> str:
             """Download a file from a connected agent."""
             dest = dest_path or path
-            sender_rec = runtime.get_record(sender)
+            source = runtime.get_agent(sender)
             runtime.require_connection(sender, ag.name)
-            content = await sender_rec.agent.machine.read_file(path)
+            content = await source.machine.read_file(path)
             await ag.machine.write_file(dest, content)
             return f"Downloaded {len(content)} bytes from {sender}:{path} to {dest}."
 
-        ag._handlers["message"] = message
-        ag._handlers["send_file"] = send_file
-        ag._handlers["download_file"] = download_file
+        ag.handlers["message"] = message
+        ag.handlers["send_file"] = send_file
+        ag.handlers["download_file"] = download_file
 
     # -- Connections --
 
@@ -162,38 +143,13 @@ class Runtime:
         if direction == "both":
             self.edges.add((b.name, a.name))
 
-    # -- Tool handler registration --
-
-    def register_tool_handler(
-        self,
-        agent: Agent,
-        tool_name: str,
-        fn: Callable[..., Awaitable[Any]],
-    ) -> None:
-        agent._handlers[tool_name] = fn
-        rec = self.records.get(agent.name)
-        if rec and rec.registered.is_set():
-            tool_def = build_tool_definition(tool_name, fn)
-            entry = rec.log.emit("tool_registered", tool_def)
-            if entry is not None:
-                asyncio.ensure_future(rec.log.broadcast(entry))
-
-    # -- Messaging --
-
-    def send_message(self, agent_name: str, message: str) -> None:
-        rec = self.get_record(agent_name)
-        entry = rec.log.emit("message", {"text": message})
-        if entry is not None:
-            asyncio.ensure_future(rec.log.broadcast(entry))
-
     # -- Agent spawn / registration --
 
     async def spawn_agent(self, agent: Agent) -> None:
         if not await self.launch_agent(agent):
             return
-        rec = self.records[agent.name]
         try:
-            await asyncio.wait_for(rec.registered.wait(), timeout=120)
+            await asyncio.wait_for(agent.registered.wait(), timeout=120)
         except asyncio.TimeoutError as exc:
             raise RuntimeError(
                 f"Agent '{agent.name}' did not register within 120s. "
@@ -208,24 +164,19 @@ class Runtime:
         session_name = await _launch_agent_impl(
             agent, server_url=server_url, execution_id=self.execution_id or ""
         )
-        rec = self.records[agent.name]
-        rec.log.emit(
+        agent.log.emit(
             "agent_spawned",
-            {
-                "agent": agent.name,
-                "tmux_session": session_name,
-            },
+            {"agent": agent.name, "tmux_session": session_name},
         )
         return True
 
     def register_agent(self, agent_id: str, execution_id: str) -> list[dict[str, Any]]:
         if execution_id != self.execution_id:
             raise ToolCallError("Execution ID mismatch", status_code=400)
-        rec = self.get_record(agent_id)
-        rec.registered.set()
+        ag = self.get_agent(agent_id)
+        ag.registered.set()
         return [
-            build_tool_definition(name, fn)
-            for name, fn in rec.agent._handlers.items()
+            build_tool_definition(name, fn) for name, fn in ag.handlers.items()
         ]
 
     # -- Tool call dispatch --
@@ -233,18 +184,14 @@ class Runtime:
     async def handle_tool_call(
         self, agent_id: str, tool_name: str, params: dict[str, Any]
     ) -> Any:
-        # Imported here to avoid a module-level cycle with druids.process,
-        # which itself imports Runtime.
-        from druids.process import _current_process
-
-        rec = self.get_record(agent_id)
-        handler = rec.agent._handlers.get(tool_name)
+        ag = self.get_agent(agent_id)
+        handler = ag.handlers.get(tool_name)
         if handler is None:
             raise ToolCallError(
-                f"Unknown tool '{tool_name}' for agent '{rec.agent.name}'",
+                f"Unknown tool '{tool_name}' for agent '{ag.name}'",
                 status_code=404,
             )
-        token = _current_process.set(rec.agent._scope)
+        token = _current_process.set(ag.scope)
         try:
             return await handler(**params)
         finally:
@@ -252,11 +199,11 @@ class Runtime:
 
     # -- Helpers --
 
-    def get_record(self, name: str) -> AgentRecord:
-        rec = self.records.get(name)
-        if rec is None:
+    def get_agent(self, name: str) -> Agent:
+        ag = self.agents.get(name)
+        if ag is None:
             raise ToolCallError(f"Unknown agent '{name}'", status_code=404)
-        return rec
+        return ag
 
     def require_connection(self, sender: str, receiver: str) -> None:
         if (sender, receiver) not in self.edges:

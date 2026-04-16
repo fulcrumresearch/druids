@@ -46,14 +46,14 @@ def test_registered_event_set_on_register(tmp_path: Path, monkeypatch) -> None:
                 done("ok")
                 return "ok"
 
-            rec = runtime.records["worker"]
-            assert not rec.registered.is_set()
+            ag = runtime.agents["worker"]
+            assert not ag.registered.is_set()
 
             await asyncio.to_thread(wait_for_server, runtime.server_url)
             client = await _make_client(runtime, "worker")
             try:
                 await asyncio.to_thread(client.register)
-                assert rec.registered.is_set()
+                assert ag.registered.is_set()
                 assert await asyncio.to_thread(client.tool_call, "finish") == "ok"
                 from druids.process import wait
                 assert await wait() == "ok"
@@ -102,11 +102,11 @@ def test_spawn_readiness_blocks_until_registered(tmp_path: Path, monkeypatch) ->
         runtime, scope, token = await _setup(tmp_path, monkeypatch)
         try:
             async def fake_launch(ag):
-                rec = runtime.records[ag.name]
+                target = runtime.agents[ag.name]
 
                 async def delayed_register() -> None:
                     await asyncio.sleep(0.3)
-                    rec.registered.set()
+                    target.registered.set()
 
                 asyncio.create_task(delayed_register())
                 return True
@@ -118,7 +118,7 @@ def test_spawn_readiness_blocks_until_registered(tmp_path: Path, monkeypatch) ->
             elapsed = time.perf_counter() - started
 
             assert worker.name == "test-agent"
-            assert runtime.records["test-agent"].registered.is_set()
+            assert runtime.agents["test-agent"].registered.is_set()
             assert elapsed >= 0.25
         finally:
             await _teardown(runtime, scope, token)
