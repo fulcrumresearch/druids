@@ -10,12 +10,12 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, ParamSpec, TypeVar
 
 from druids.agent import Agent
-from druids.event_log import AgentEventLog
-from druids.events import EventStream
 from druids.helpers import agent_session_name, build_tool_definition, kill_agent
 from druids.helpers import launch_agent as _launch_agent_impl
+from druids.log import Log
 from druids.machines import Image, LocalImage, Machine
 from druids.server import Server
+from druids.stream import Stream
 from druids.types import ExecutionFailed, ToolCallError
 
 # ---------------------------------------------------------------------------
@@ -44,7 +44,7 @@ class AgentRecord:
     """Single source of truth for all per-agent state inside the runtime."""
 
     agent: Agent
-    log: AgentEventLog = field(repr=False)
+    log: Log = field(repr=False)
     registered: asyncio.Event = field(default_factory=asyncio.Event)
 
 
@@ -62,7 +62,7 @@ class ProcessScope:
     image: Image = field(default_factory=LocalImage)
     agents: list[Agent] = field(default_factory=list)
     machines: list[Machine] = field(default_factory=list)
-    events: EventStream = field(default_factory=EventStream)
+    events: Stream = field(default_factory=Stream)
     client_handlers: dict[str, Callable[..., Awaitable[Any]]] = field(
         default_factory=dict
     )
@@ -81,8 +81,9 @@ class ProcessScope:
             rec = self.runtime.records.get(ag.name)
             if rec:
                 try:
-                    entry = rec.log.append("shutdown", "server")
-                    await rec.log.push(entry)
+                    entry = rec.log.emit("shutdown")
+                    if entry is not None:
+                        await rec.log.push(entry)
                 except Exception:
                     pass
 
@@ -115,7 +116,7 @@ class ProcessScope:
 class ProcessHandle:
     """Handle to a spawned process. Provides event stream and control."""
 
-    def __init__(self, events: EventStream) -> None:
+    def __init__(self, events: Stream) -> None:
         self.events = events
         self.task: asyncio.Task | None = None
         self._scope: ProcessScope | None = None
@@ -209,14 +210,14 @@ class Runtime:
         )
         ag._runtime = self
 
-        log_dir = None
+        log_path: Path | None = None
         if self.log_dir_root is not None and self.execution_id:
-            log_dir = self.log_dir_root / self.execution_id
-        log = AgentEventLog(log_dir=log_dir, agent_name=name)
+            log_path = self.log_dir_root / self.execution_id / f"{name}.jsonl"
+        log = Log(path=log_path)
 
         self.records[name] = AgentRecord(agent=ag, log=log)
         self._register_builtins(ag)
-        log.append("agent_created", "server", {"agent": name})
+        log.emit("agent_created", {"agent": name})
 
         try:
             await self.spawn_agent(ag)
@@ -280,15 +281,17 @@ class Runtime:
         rec = self.records.get(agent.name)
         if rec and rec.registered.is_set():
             tool_def = build_tool_definition(tool_name, fn)
-            entry = rec.log.append("tool_registered", "server", tool_def)
-            asyncio.ensure_future(rec.log.push(entry))
+            entry = rec.log.emit("tool_registered", tool_def)
+            if entry is not None:
+                asyncio.ensure_future(rec.log.push(entry))
 
     # -- Messaging --
 
     def send_message(self, agent_name: str, message: str) -> None:
         rec = self.get_record(agent_name)
-        entry = rec.log.append("message", "server", {"text": message})
-        asyncio.ensure_future(rec.log.push(entry))
+        entry = rec.log.emit("message", {"text": message})
+        if entry is not None:
+            asyncio.ensure_future(rec.log.push(entry))
 
     # -- Agent spawn / registration --
 
@@ -313,9 +316,8 @@ class Runtime:
             agent, server_url=server_url, execution_id=self.execution_id or ""
         )
         rec = self.records[agent.name]
-        rec.log.append(
+        rec.log.emit(
             "agent_spawned",
-            "server",
             {
                 "agent": agent.name,
                 "tmux_session": session_name,
@@ -528,7 +530,7 @@ def client_event(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[A
 
 def spawn(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> ProcessHandle:
     """Run a process function in a background task. Returns a handle."""
-    events = EventStream()
+    events = Stream()
     handle = ProcessHandle(events=events)
 
     async def run() -> None:

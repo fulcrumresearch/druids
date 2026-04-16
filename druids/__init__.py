@@ -1,7 +1,7 @@
 from druids.agent import Agent
-from druids.event_log import AgentEventLog
-from druids.events import Event, EventStream
+from druids.log import Log, LogEntry
 from druids.machines import Image, LocalImage, LocalMachine, Machine
+from druids.stream import Event, Stream
 from druids.runtime import (
     ProcessHandle,
     ProcessScope,
@@ -23,18 +23,19 @@ from druids.types import ExecResult, ExecutionFailed
 
 __all__ = [
     "Agent",
-    "AgentEventLog",
     "Event",
-    "EventStream",
     "ExecResult",
     "ExecutionFailed",
     "Image",
     "LocalImage",
     "LocalMachine",
+    "Log",
+    "LogEntry",
     "Machine",
     "ProcessHandle",
     "ProcessScope",
     "Runtime",
+    "Stream",
     "agent",
     "agent_process",
     "client_event",

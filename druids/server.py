@@ -10,7 +10,7 @@ import websockets
 from druids.types import ToolCallError, to_jsonable
 
 if TYPE_CHECKING:
-    from druids.event_log import AgentEventLog
+    from druids.log import Log
     from druids.runtime import Runtime
 
 
@@ -63,16 +63,16 @@ class Server:
                 await self._dispatch(ws, agent_id, log, msg)
         finally:
             log.on_push = None
-            log.append("disconnected", "agent")
+            log.emit("disconnected", origin="agent")
 
     async def _dispatch(
-        self, ws: Any, agent_id: str, log: AgentEventLog, msg: dict[str, Any]
+        self, ws: Any, agent_id: str, log: Log, msg: dict[str, Any]
     ) -> None:
         msg_type = msg.get("type")
 
         if msg_type == "sync":
-            entries = log.entries_after(msg.get("after", 0))
-            await log.push_entries(entries)
+            entries = log.after(msg.get("after", 0))
+            await log.push_all(entries)
 
         elif msg_type == "event":
             event_type = msg.get("event_type", "")
@@ -83,28 +83,30 @@ class Server:
             await ws.send(json.dumps({"error": f"unknown message type: {msg_type}"}))
 
     async def _handle_event(
-        self, agent_id: str, log: AgentEventLog, event_type: str, data: dict[str, Any]
+        self, agent_id: str, log: Log, event_type: str, data: dict[str, Any]
     ) -> None:
         if event_type == "register":
-            entry = log.append("register", "agent", data)
-            await log.push(entry)
+            entry = log.emit("register", data, origin="agent")
+            if entry is not None:
+                await log.push(entry)
             try:
                 tools = self.runtime.register_agent(
                     agent_id, data.get("execution_id", "")
                 )
-                result_entry = log.append(
-                    "registered", "server", {"tools": to_jsonable(tools)}
+                result_entry = log.emit(
+                    "registered", {"tools": to_jsonable(tools)}
                 )
-                await log.push(result_entry)
+                if result_entry is not None:
+                    await log.push(result_entry)
             except ToolCallError as exc:
-                err_entry = log.append(
-                    "error", "server", {"error": str(exc)}
-                )
-                await log.push(err_entry)
+                err_entry = log.emit("error", {"error": str(exc)})
+                if err_entry is not None:
+                    await log.push(err_entry)
 
         elif event_type == "tool_call":
-            entry = log.append("tool_call", "agent", data)
-            await log.push(entry)
+            entry = log.emit("tool_call", data, origin="agent")
+            if entry is not None:
+                await log.push(entry)
 
             call_id = data.get("call_id", "")
             tool_name = data.get("tool", "")
@@ -114,20 +116,21 @@ class Server:
                 result = await self.runtime.handle_tool_call(
                     agent_id, tool_name, params
                 )
-                result_entry = log.append(
+                result_entry = log.emit(
                     "tool_result",
-                    "server",
                     {"call_id": call_id, "result": to_jsonable(result)},
                 )
-                await log.push(result_entry)
+                if result_entry is not None:
+                    await log.push(result_entry)
             except Exception as exc:
-                err_entry = log.append(
+                err_entry = log.emit(
                     "tool_result",
-                    "server",
                     {"call_id": call_id, "error": str(exc)},
                 )
-                await log.push(err_entry)
+                if err_entry is not None:
+                    await log.push(err_entry)
 
         else:
-            entry = log.append(event_type, "agent", data)
-            await log.push(entry)
+            entry = log.emit(event_type, data, origin="agent")
+            if entry is not None:
+                await log.push(entry)

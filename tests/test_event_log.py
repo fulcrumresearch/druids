@@ -1,18 +1,19 @@
-"""Tests for the AgentEventLog."""
+"""Tests for Log (replicated wrapper around Stream)."""
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
-from druids.event_log import AgentEventLog, LogEntry
+from druids.log import Log, LogEntry
+from druids.stream import Event
 
 
-def test_append_assigns_sequential_ids() -> None:
-    log = AgentEventLog()
-    e1 = log.append("register", "agent", {"execution_id": "abc"})
-    e2 = log.append("registered", "server", {"tools": []})
-    e3 = log.append("tool_call", "agent", {"call_id": "tc-1", "tool": "submit"})
+def test_emit_assigns_sequential_ids() -> None:
+    log = Log()
+    e1 = log.emit("register", {"execution_id": "abc"}, origin="agent")
+    e2 = log.emit("registered", {"tools": []})
+    e3 = log.emit("tool_call", {"call_id": "tc-1", "tool": "submit"}, origin="agent")
 
     assert e1.seq == 1
     assert e2.seq == 2
@@ -20,31 +21,29 @@ def test_append_assigns_sequential_ids() -> None:
     assert len(log) == 3
     assert log.last_seq == 3
 
+    # origin defaults to "server" when not specified
+    assert e1.origin == "agent"
+    assert e2.origin == "server"
+    assert e3.origin == "agent"
 
-def test_entries_after_returns_correct_slice() -> None:
-    log = AgentEventLog()
-    log.append("a", "agent")
-    log.append("b", "server")
-    log.append("c", "agent")
-    log.append("d", "server")
 
-    after_0 = log.entries_after(0)
-    assert [e.seq for e in after_0] == [1, 2, 3, 4]
+def test_after_returns_correct_slice() -> None:
+    log = Log()
+    log.emit("a", origin="agent")
+    log.emit("b")
+    log.emit("c", origin="agent")
+    log.emit("d")
 
-    after_2 = log.entries_after(2)
-    assert [e.seq for e in after_2] == [3, 4]
-
-    after_4 = log.entries_after(4)
-    assert after_4 == []
-
-    after_99 = log.entries_after(99)
-    assert after_99 == []
+    assert [e.seq for e in log.after(0)] == [1, 2, 3, 4]
+    assert [e.seq for e in log.after(2)] == [3, 4]
+    assert log.after(4) == []
+    assert log.after(99) == []
 
 
 def test_persistence_writes_jsonl(tmp_path: Path) -> None:
-    log = AgentEventLog(log_dir=tmp_path, agent_name="worker")
-    log.append("register", "agent", {"execution_id": "abc"})
-    log.append("registered", "server", {"tools": []})
+    log = Log(path=tmp_path / "worker.jsonl")
+    log.emit("register", {"execution_id": "abc"}, origin="agent")
+    log.emit("registered", {"tools": []})
 
     log_file = tmp_path / "worker.jsonl"
     assert log_file.exists()
@@ -61,18 +60,46 @@ def test_persistence_writes_jsonl(tmp_path: Path) -> None:
     second = json.loads(lines[1])
     assert second["seq"] == 2
     assert second["type"] == "registered"
+    assert second["origin"] == "server"
 
 
 def test_log_entry_round_trip() -> None:
-    entry = LogEntry(seq=5, ts=1713100000.0, type="tool_call", origin="agent", data={"tool": "bash"})
+    entry = LogEntry(
+        seq=5,
+        ts=1713100000.0,
+        origin="agent",
+        event=Event(type="tool_call", data={"tool": "bash"}),
+    )
     d = entry.to_dict()
     restored = LogEntry.from_dict(d)
     assert restored == entry
     assert json.loads(entry.to_json()) == d
 
 
-def test_no_persistence_without_log_dir() -> None:
-    log = AgentEventLog()
-    log.append("test", "agent")
-    assert log._log_path is None
+def test_no_persistence_without_path() -> None:
+    log = Log()
+    log.emit("test", origin="agent")
+    assert log._path is None
     assert len(log) == 1
+
+
+def test_emit_after_close_returns_none() -> None:
+    log = Log()
+    log.emit("a")
+    log.close()
+    result = log.emit("b")
+    assert result is None
+    assert len(log) == 1
+
+
+def test_stream_and_log_stay_in_sync() -> None:
+    log = Log()
+    log.emit("a", {"x": 1})
+    log.emit("b", {"x": 2})
+
+    # Stream sees events without replication metadata.
+    events = log.stream.snapshot()
+    assert events == [Event(type="a", data={"x": 1}), Event(type="b", data={"x": 2})]
+
+    # Log entries wrap each event with seq/ts/origin.
+    assert [e.event for e in log.after(0)] == events

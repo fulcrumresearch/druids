@@ -23,7 +23,12 @@ class Agent:
 
     @property
     def events(self):
-        """Async-iterable log of raw agent events."""
+        """Async-iterable stream of this agent's events (no replication metadata)."""
+        return self._runtime.get_record(self.name).log.stream
+
+    @property
+    def log(self):
+        """The agent's replicated event log (with seq/ts/origin per entry)."""
         return self._runtime.get_record(self.name).log
 
     def on(
