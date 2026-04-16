@@ -48,10 +48,16 @@ class AgentEventLog:
     Pure data store — append, query, persist. No networking or lifecycle.
     """
 
-    def __init__(self, log_dir: Path | None = None, agent_name: str = "") -> None:
+    def __init__(
+        self,
+        log_dir: Path | None = None,
+        agent_name: str = "",
+        on_append: Any | None = None,
+    ) -> None:
         self._entries: list[LogEntry] = []
         self._next_seq: int = 1
         self._log_path: Path | None = None
+        self._on_append = on_append
 
         if log_dir is not None and agent_name:
             log_dir.mkdir(parents=True, exist_ok=True)
@@ -74,6 +80,8 @@ class AgentEventLog:
         self._next_seq += 1
         self._entries.append(entry)
         self._persist(entry)
+        if self._on_append is not None:
+            self._on_append(entry)
         return entry
 
     def entries_after(self, seq: int) -> list[LogEntry]:

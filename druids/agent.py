@@ -5,11 +5,12 @@ import shlex
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
+from druids.events import EventStream
 from druids.machines import Machine
 from druids.types import ExecResult
 
 if TYPE_CHECKING:
-    from druids.runtime import Runtime
+    from druids.runtime import ProcessScope, Runtime
 
 
 def _agent_extension_path(execution_id: str, agent_name: str) -> str:
@@ -47,9 +48,16 @@ class Agent:
     name: str
     machine: Machine
     system_prompt: str | None = None
-    state: dict[str, Any] = field(default_factory=dict)
     _handlers: dict[str, Callable[..., Awaitable[Any]]] = field(default_factory=dict)
     _runtime: Runtime | None = field(default=None, init=False, repr=False, compare=False)
+    _scope: ProcessScope | None = field(default=None, init=False, repr=False, compare=False)
+    _events: EventStream = field(default_factory=EventStream, init=False, repr=False)
+    _public: bool = field(default=False, init=False, repr=False)
+
+    @property
+    def events(self) -> EventStream:
+        """Async-iterable stream of raw agent events."""
+        return self._events
 
     def on(
         self, tool_name: str

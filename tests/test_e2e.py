@@ -31,21 +31,22 @@ import asyncio
 import logging, sys
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 
-from druids import LocalImage, agent, agent_runtime, exit
+from druids import LocalImage, agent, agent_process, done, wait
 
-@agent_runtime(image=LocalImage(), timeout=60)
+@agent_process(image=LocalImage(), timeout=60)
 async def run_agents():
     worker = await agent("worker")
 
     @worker.on("finish")
     async def on_finish(result=""):
         """Signal completion. Call this with your result."""
-        exit(result)
+        done(result)
         return "Done."
 
     await worker.send(
         "Call the finish tool with result='hello-druids'. Do not say anything else, just call the tool immediately."
     )
+    return await wait()
 
 async def main():
     result = await run_agents()
@@ -56,7 +57,7 @@ asyncio.run(main())
 
 
 def test_single_agent_tool_call():
-    """Single agent receives a message, calls a tool, and exit() ends the run."""
+    """Single agent receives a message, calls a tool, and done() ends the run."""
     proc = _run_program(SINGLE_AGENT, timeout=90)
     assert proc.returncode == 0, f"Failed:\nSTDOUT: {proc.stdout}\nSTDERR: {proc.stderr}"
     assert "RESULT:hello-druids" in proc.stdout
@@ -67,9 +68,9 @@ import asyncio
 import logging, sys
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 
-from druids import LocalImage, agent, agent_runtime, connect, exit
+from druids import LocalImage, agent, agent_process, connect, done, wait
 
-@agent_runtime(image=LocalImage(), timeout=90)
+@agent_process(image=LocalImage(), timeout=90)
 async def run_agents():
     sender = await agent("sender")
     receiver = await agent("receiver")
@@ -84,7 +85,7 @@ async def run_agents():
     @receiver.on("finish")
     async def on_finish(summary=""):
         """Finish the execution with a summary."""
-        exit(summary)
+        done(summary)
         return "Done."
 
     await receiver.send(
@@ -93,6 +94,7 @@ async def run_agents():
     await sender.send(
         "Call the notify tool with text='ping-from-sender'. Do nothing else, just call the tool."
     )
+    return await wait()
 
 async def main():
     result = await run_agents()
@@ -103,7 +105,7 @@ asyncio.run(main())
 
 
 def test_two_agents_message_passing():
-    """Two agents: sender notifies receiver, receiver calls exit."""
+    """Two agents: sender notifies receiver, receiver calls done."""
     proc = _run_program(TWO_AGENTS, timeout=120)
     assert proc.returncode == 0, f"Failed:\nSTDOUT: {proc.stdout}\nSTDERR: {proc.stderr}"
     assert "RESULT:" in proc.stdout
@@ -116,9 +118,9 @@ import asyncio
 import logging, sys
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 
-from druids import ExecutionFailed, LocalImage, agent, agent_runtime, fail
+from druids import ExecutionFailed, LocalImage, agent, agent_process, fail, wait
 
-@agent_runtime(image=LocalImage(), timeout=60)
+@agent_process(image=LocalImage(), timeout=60)
 async def run_agents():
     worker = await agent("worker")
 
@@ -129,6 +131,7 @@ async def run_agents():
         return "Aborting."
 
     await worker.send("Call the abort tool immediately. Do nothing else.")
+    return await wait()
 
 async def main():
     try:
@@ -142,7 +145,7 @@ asyncio.run(main())
 
 
 def test_fail_raises_execution_failed():
-    """fail() causes the decorated runtime entrypoint to raise ExecutionFailed."""
+    """fail() causes the process to raise ExecutionFailed."""
     proc = _run_program(FAIL_TEST, timeout=90)
     assert proc.returncode == 0, f"Failed:\nSTDOUT: {proc.stdout}\nSTDERR: {proc.stderr}"
     assert "CAUGHT:" in proc.stdout, f"Expected ExecutionFailed.\nSTDOUT: {proc.stdout}\nSTDERR: {proc.stderr}"

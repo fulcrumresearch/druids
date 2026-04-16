@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import inspect
 import shlex
 import shutil
@@ -18,6 +17,7 @@ from druids.agent import (
     _build_agent_launch_command,
 )
 from druids.event_log import AgentEventLog, LogEntry
+from druids.events import EventStream
 from druids.extension import extension_source
 from druids.machines import Image, LocalImage, Machine
 from druids.schema import build_tool_definition
@@ -25,9 +25,29 @@ from druids.server import Server
 from druids.types import ExecResult, ExecutionFailed, ToolCallError
 
 
+# ---------------------------------------------------------------------------
+# Context variables
+# ---------------------------------------------------------------------------
+
+_current_process: ContextVar[ProcessScope | None] = ContextVar(
+    "druids_current_process", default=None
+)
+
+_spawn_handle: ContextVar[ProcessHandle | None] = ContextVar(
+    "druids_spawn_handle", default=None
+)
+
+P = ParamSpec("P")
+R = TypeVar("R")
+
+
+# ---------------------------------------------------------------------------
+# Agent record (per-agent bookkeeping inside the runtime)
+# ---------------------------------------------------------------------------
+
 @dataclass
 class AgentRecord:
-    """Single source of truth for all per-agent state."""
+    """Single source of truth for all per-agent state inside the runtime."""
 
     agent: Agent
     log: AgentEventLog = field(repr=False)
@@ -37,7 +57,6 @@ class AgentRecord:
     )
 
     async def push(self, entry: LogEntry) -> None:
-        """Deliver a log entry to the connected agent."""
         if self._notify is not None:
             try:
                 await self._notify(entry)
@@ -49,47 +68,108 @@ class AgentRecord:
             await self.push(entry)
 
 
-_CURRENT_RUNTIME: ContextVar[Runtime | None] = ContextVar(
-    "druids_current_runtime", default=None
-)
+# ---------------------------------------------------------------------------
+# Process scope
+# ---------------------------------------------------------------------------
 
-P = ParamSpec("P")
-R = TypeVar("R")
+@dataclass
+class ProcessScope:
+    """Ownership boundary for agents and machines created within a process."""
 
-_NO_ACTIVE_RUNTIME_ERROR = (
-    "No active runtime. Use @agent_runtime, 'async with Runtime(...)', or 'await runtime.start()'."
-)
+    parent: ProcessScope | None
+    runtime: Runtime
+    agents: list[Agent] = field(default_factory=list)
+    machines: list[Machine] = field(default_factory=list)
+    events: EventStream = field(default_factory=EventStream)
+    client_handlers: dict[str, Callable[..., Awaitable[Any]]] = field(default_factory=dict)
+    _outcome: asyncio.Future | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if self._outcome is None:
+            self._outcome = asyncio.get_running_loop().create_future()
+
+    async def cleanup(self) -> None:
+        """Tear down agents and machines owned by this scope."""
+        # Send shutdown events
+        for ag in self.agents:
+            rec = self.runtime._records.get(ag.name)
+            if rec:
+                try:
+                    entry = rec.log.append("shutdown", "server")
+                    await rec.push(entry)
+                except Exception:
+                    pass
+
+        if self.agents:
+            await asyncio.sleep(0.2)
+
+        # Kill tmux sessions and deregister
+        for ag in self.agents:
+            session = _agent_session_name(self.runtime.execution_id or "", ag.name)
+            try:
+                await ag.machine.exec(
+                    f"tmux kill-session -t {shlex.quote(session)} 2>/dev/null || true",
+                    timeout=5,
+                )
+            except Exception:
+                pass
+            self.runtime._records.pop(ag.name, None)
+
+        # Close agent event streams
+        for ag in self.agents:
+            ag._events.close()
+
+        # Stop machines spawned by this scope
+        seen: set[int] = set()
+        for m in self.machines:
+            if id(m) not in seen:
+                seen.add(id(m))
+                try:
+                    await m.stop()
+                except Exception:
+                    pass
+
+        # Close process event stream
+        self.events.close()
 
 
-async def _run_until_exit(body: Awaitable[Any] | None, *, timeout: float | None) -> Any:
-    if body is None:
-        return await current_runtime().wait(timeout=timeout)
+# ---------------------------------------------------------------------------
+# Process handle (returned by spawn())
+# ---------------------------------------------------------------------------
 
-    body_task = asyncio.create_task(body)
-    exit_task = asyncio.create_task(current_runtime().wait(timeout=timeout))
-    try:
-        done, _ = await asyncio.wait(
-            {body_task, exit_task}, return_when=asyncio.FIRST_COMPLETED
-        )
-        if body_task in done:
-            await body_task
-            return await exit_task
+class ProcessHandle:
+    """Handle to a spawned process. Provides event stream and control."""
 
-        result = await exit_task
-        body_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await body_task
-        return result
-    finally:
-        if not body_task.done():
-            body_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await body_task
-        if not exit_task.done():
-            exit_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await exit_task
+    def __init__(self, events: EventStream) -> None:
+        self.events = events
+        self.task: asyncio.Task | None = None
+        self._scope: ProcessScope | None = None
 
+    @property
+    def agents(self) -> dict[str, Agent]:
+        """Public agents exposed by the child process."""
+        if self._scope is None:
+            return {}
+        return {ag.name: ag for ag in self._scope.agents if ag._public}
+
+    async def call(self, event_name: str, **kwargs: Any) -> Any:
+        """Call a client event handler defined by the child process."""
+        if self._scope is None:
+            raise RuntimeError("Process scope not yet initialized")
+        handler = self._scope.client_handlers.get(event_name)
+        if handler is None:
+            raise ValueError(f"No client event '{event_name}'")
+        return await handler(**kwargs)
+
+    def cancel(self) -> None:
+        """Cancel the process. Triggers cleanup."""
+        if self.task is not None:
+            self.task.cancel()
+
+
+# ---------------------------------------------------------------------------
+# Builtin agent tools
+# ---------------------------------------------------------------------------
 
 def _builtin_tools() -> list[dict[str, Any]]:
     return [
@@ -131,113 +211,80 @@ def _builtin_tools() -> list[dict[str, Any]]:
                 "required": ["sender", "path"],
             },
         },
-        {
-            "name": "set_state",
-            "description": "Set a key-value pair in this agent's own state store.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "key": {"type": "string"},
-                    "value": {"type": "string"},
-                },
-                "required": ["key", "value"],
-            },
-        },
-        {
-            "name": "get_state",
-            "description": "Get the value for a key from this agent's own state store. Returns null if the key does not exist.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "key": {"type": "string"},
-                },
-                "required": ["key"],
-            },
-        },
     ]
 
 
+# ---------------------------------------------------------------------------
+# Runtime (singleton infrastructure)
+# ---------------------------------------------------------------------------
+
 class Runtime:
+    """Manages the server, agent registry, and tool dispatch.
+
+    Created automatically by the root ``@agent_process``. Not intended for
+    direct use in normal code; exists as infrastructure that process scopes
+    share.
+    """
+
     def __init__(self, *, image: Image | None = None, log_dir: Path | str | None = None):
         self.image = image or LocalImage()
-
         self._execution_id: str | None = None
-        self._outcome: asyncio.Future[tuple[str, Any]] | None = None
         self.server_url: str | None = None
-
         self._records: dict[str, AgentRecord] = {}
-        self._machines: list[Machine] = []
         self._edges: set[tuple[str, str]] = set()
-
         self._log_dir_root = Path(log_dir) if log_dir else None
-        self._started = False
-        self._shutting_down = False
         self._server: Server | None = None
 
     @property
     def execution_id(self) -> str | None:
         return self._execution_id
 
-    async def __aenter__(self) -> Runtime:
-        await self.start()
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb) -> None:
-        await self.close()
-
     async def start(self) -> None:
-        if self._outcome is not None:
-            raise RuntimeError("Runtime is already running")
-        if self._started:
-            raise RuntimeError(
-                "Runtime instances are single-use. Create a new Runtime for each execution."
-            )
-        if _CURRENT_RUNTIME.get() is not None:
-            raise RuntimeError("Nested runtimes are not supported")
-
-        self._started = True
-        _CURRENT_RUNTIME.set(self)
         self._execution_id = str(uuid.uuid4())
-        self._outcome = asyncio.get_running_loop().create_future()
-        self._shutting_down = False
         self._server = Server(self)
-
         try:
             await self._server.start()
         except Exception:
             self._server = None
             self.server_url = None
             self._execution_id = None
-            self._outcome = None
-            self._clear_current_runtime()
             raise
-
         self.server_url = f"ws://127.0.0.1:{self._server.port}"
 
     async def close(self) -> None:
-        try:
-            await self._shutdown()
-        finally:
-            self._clear_current_runtime()
+        if self._server is not None:
+            await self._server.stop()
+            self._server = None
+        self.server_url = None
+        self._execution_id = None
 
-    async def agent(
+    # -- Agent creation (called by ambient agent()) --
+
+    async def _create_agent(
         self,
         name: str,
         *,
         system_prompt: str | None = None,
         image: Image | None = None,
         machine: Machine | None = None,
-    ) -> Agent:
-        self._require_active()
+        scope: ProcessScope,
+    ) -> tuple[Agent, Machine | None]:
+        """Create, register, and launch an agent.
+
+        Returns ``(agent, spawned_machine)`` where *spawned_machine* is the
+        machine that was created (so the scope can track it), or ``None`` if
+        an existing machine was passed in.
+        """
         if name in self._records:
             raise ValueError(f"Agent '{name}' already exists")
-
         if machine is not None and image is not None:
             raise ValueError("Pass either machine= or image=, not both")
+
+        spawned_machine: Machine | None = None
         resolved_machine = machine
         if resolved_machine is None:
             resolved_machine = await (image or self.image).spawn()
-        self._machines.append(resolved_machine)
+            spawned_machine = resolved_machine
 
         ag = Agent(
             name=name,
@@ -245,11 +292,16 @@ class Runtime:
             system_prompt=system_prompt,
         )
         ag._runtime = self
+        ag._scope = scope
 
         log_dir = None
         if self._log_dir_root is not None and self._execution_id:
             log_dir = self._log_dir_root / self._execution_id
-        log = AgentEventLog(log_dir=log_dir, agent_name=name)
+        log = AgentEventLog(
+            log_dir=log_dir,
+            agent_name=name,
+            on_append=lambda entry: ag._events.emit(entry.type, entry.data),
+        )
 
         self._records[name] = AgentRecord(agent=ag, log=log)
         log.append("agent_created", "server", {"agent": name})
@@ -259,23 +311,19 @@ class Runtime:
         except Exception:
             self._records.pop(name, None)
             raise
-        return ag
 
-    async def machine(self, image: Image | None = None) -> Machine:
-        self._require_active()
-        machine = await (image or self.image).spawn()
-        self._machines.append(machine)
-        return machine
+        return ag, spawned_machine
 
-    def connect(self, a: Agent, b: Agent, *, direction: str = "both") -> None:
-        self._require_active()
-        if a._runtime is not self or b._runtime is not self:
-            raise RuntimeError("Agents must belong to the current runtime.")
+    # -- Connections --
+
+    def _connect(self, a: Agent, b: Agent, *, direction: str = "both") -> None:
         if direction not in {"both", "forward"}:
             raise ValueError("direction must be 'both' or 'forward'")
         self._edges.add((a.name, b.name))
         if direction == "both":
             self._edges.add((b.name, a.name))
+
+    # -- Tool handler registration --
 
     def _register_tool_handler(
         self,
@@ -283,13 +331,17 @@ class Runtime:
         tool_name: str,
         fn: Callable[..., Awaitable[Any]],
     ) -> None:
-        self._require_active()
+        # Capture the scope at registration time so that done()/fail()
+        # resolve the correct process when the handler is invoked later.
+        fn._handler_scope = _current_process.get()  # type: ignore[attr-defined]
         agent._handlers[tool_name] = fn
         rec = self._records.get(agent.name)
-        if rec and rec.registered.is_set() and not self._shutting_down:
+        if rec and rec.registered.is_set():
             tool_def = build_tool_definition(tool_name, fn)
             entry = rec.log.append("tool_registered", "server", tool_def)
             asyncio.ensure_future(rec.push(entry))
+
+    # -- Exec --
 
     async def _exec_agent(
         self,
@@ -299,60 +351,16 @@ class Runtime:
         user: str = "agent",
         timeout: int | None = None,
     ) -> ExecResult:
-        self._require_active()
         return await agent.machine.exec(command, user=user, timeout=timeout)
 
-    def exit(self, result: Any = None) -> None:
-        self._require_active()
-        assert self._outcome is not None
-        for rec in self._records.values():
-            rec.log.append("done", "server", {"result": result})
-        self._outcome.set_result(("done", result))
+    # -- Messaging --
 
-    def fail(self, reason: str) -> None:
-        self._require_active()
-        assert self._outcome is not None
-        for rec in self._records.values():
-            rec.log.append("failed", "server", {"reason": reason})
-        self._outcome.set_result(("failed", reason))
+    def _send_message(self, agent_name: str, message: str) -> None:
+        rec = self._get_record(agent_name)
+        entry = rec.log.append("message", "server", {"text": message})
+        asyncio.ensure_future(rec.push(entry))
 
-    async def wait(self, *, timeout: float | None = None) -> Any:
-        outcome = self._outcome
-        if outcome is None:
-            raise RuntimeError(_NO_ACTIVE_RUNTIME_ERROR)
-        status, value = await (
-            asyncio.wait_for(asyncio.shield(outcome), timeout=timeout)
-            if timeout is not None
-            else asyncio.shield(outcome)
-        )
-        if status == "failed":
-            raise ExecutionFailed(str(value))
-        return value
-
-    def _require_active(self) -> None:
-        if not self._is_active():
-            raise RuntimeError(_NO_ACTIVE_RUNTIME_ERROR)
-
-    def _is_active(self) -> bool:
-        outcome = self._outcome
-        return outcome is not None and not outcome.done()
-
-    def _clear_current_runtime(self) -> None:
-        if _CURRENT_RUNTIME.get() is self:
-            _CURRENT_RUNTIME.set(None)
-
-    def _get_record(self, name: str) -> AgentRecord:
-        rec = self._records.get(name)
-        if rec is None:
-            raise ToolCallError(f"Unknown agent '{name}'", status_code=404)
-        return rec
-
-    def _get_event_log(self, agent_name: str) -> AgentEventLog:
-        return self._get_record(agent_name).log
-
-    def _is_agent_registered(self, name: str) -> bool:
-        rec = self._records.get(name)
-        return rec is not None and rec.registered.is_set()
+    # -- Agent spawn / registration --
 
     async def _spawn_agent(self, agent: Agent) -> None:
         if not await self._launch_agent(agent):
@@ -408,12 +416,6 @@ class Runtime:
         })
         return True
 
-    def _send_message(self, agent_name: str, message: str) -> None:
-        self._require_active()
-        rec = self._get_record(agent_name)
-        entry = rec.log.append("message", "server", {"text": message})
-        asyncio.ensure_future(rec.push(entry))
-
     def _register_agent(self, agent_id: str, execution_id: str) -> list[dict[str, Any]]:
         if execution_id != self.execution_id:
             raise ToolCallError("Execution ID mismatch", status_code=400)
@@ -424,10 +426,12 @@ class Runtime:
             for name, handler in rec.agent._handlers.items()
         ]
 
+    # -- Tool call dispatch --
+
     async def _handle_tool_call_request(
         self, agent_id: str, tool_name: str, params: dict[str, Any]
     ) -> Any:
-        rec = self._get_record(agent_id)
+        self._get_record(agent_id)
 
         if tool_name == "message":
             return await self._message(agent_id, params)
@@ -435,11 +439,7 @@ class Runtime:
             return await self._send_file(agent_id, params)
         if tool_name == "download_file":
             return await self._download_file(agent_id, params)
-        if tool_name == "set_state":
-            return self._set_state(agent_id, params)
-        if tool_name == "get_state":
-            return self._get_state(agent_id, params)
-        return await self._invoke_handler(rec, tool_name, params)
+        return await self._invoke_handler(self._get_record(agent_id), tool_name, params)
 
     async def _invoke_handler(
         self, rec: AgentRecord, tool_name: str, params: dict[str, Any]
@@ -450,12 +450,16 @@ class Runtime:
                 f"Unknown tool '{tool_name}' for agent '{rec.agent.name}'", status_code=404
             )
 
-        _CURRENT_RUNTIME.set(self)
+        # Use the scope captured at handler registration time, falling back
+        # to the agent's own scope.
+        scope = getattr(handler, "_handler_scope", None) or rec.agent._scope
+        token = _current_process.set(scope)
         try:
             return await handler(**params)
         finally:
-            if _CURRENT_RUNTIME.get() is self:
-                _CURRENT_RUNTIME.set(None)
+            _current_process.reset(token)
+
+    # -- Builtin tool implementations --
 
     async def _message(self, sender: str, params: dict[str, Any]) -> str:
         receiver = str(params.get("receiver", ""))
@@ -487,17 +491,13 @@ class Runtime:
         await requester_rec.agent.machine.write_file(dest_path, content)
         return f"Downloaded {len(content)} bytes from {sender}:{path} to {dest_path}."
 
-    def _set_state(self, agent_id: str, params: dict[str, Any]) -> str:
-        rec = self._get_record(agent_id)
-        key = str(params.get("key", ""))
-        value = params.get("value", "")
-        rec.agent.state[key] = value
-        return f"Set state '{key}'."
+    # -- Helpers --
 
-    def _get_state(self, agent_id: str, params: dict[str, Any]) -> Any:
-        rec = self._get_record(agent_id)
-        key = str(params.get("key", ""))
-        return rec.agent.state.get(key)
+    def _get_record(self, name: str) -> AgentRecord:
+        rec = self._records.get(name)
+        if rec is None:
+            raise ToolCallError(f"Unknown agent '{name}'", status_code=404)
+        return rec
 
     def _require_connection(self, sender: str, receiver: str) -> None:
         if (sender, receiver) not in self._edges:
@@ -505,55 +505,89 @@ class Runtime:
                 f"Agent '{sender}' is not connected to '{receiver}'", status_code=403
             )
 
-    async def _shutdown(self) -> None:
-        if self._outcome is None:
-            return
 
-        self._shutting_down = True
+# ---------------------------------------------------------------------------
+# @agent_process decorator
+# ---------------------------------------------------------------------------
 
-        for rec in self._records.values():
-            try:
-                entry = rec.log.append("shutdown", "server")
-                await rec.push(entry)
-            except Exception:
-                pass
+def agent_process(
+    fn: Callable[P, Awaitable[R]] | None = None,
+    *,
+    image: Image | None = None,
+    timeout: float | None = None,
+    log_dir: Path | str | None = None,
+) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[Any]]] | Callable[P, Awaitable[Any]]:
+    from functools import wraps
 
-        await asyncio.sleep(0.2)
+    def decorate(coro_fn: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[Any]]:
+        if not inspect.iscoroutinefunction(coro_fn):
+            raise TypeError("@agent_process requires an async function")
 
-        if self._server is not None:
-            await self._server.stop()
-            self._server = None
+        @wraps(coro_fn)
+        async def wrapped(*args: P.args, **kwargs: P.kwargs) -> Any:
+            parent = _current_process.get()
+            is_root = parent is None
 
-        for rec in self._records.values():
-            session_name = _agent_session_name(self.execution_id or "", rec.agent.name)
-            try:
-                await rec.agent.machine.exec(
-                    f"tmux kill-session -t {shlex.quote(session_name)} 2>/dev/null || true",
-                    timeout=5,
+            if is_root:
+                runtime = Runtime(
+                    image=image,
+                    log_dir=Path(log_dir) if log_dir else None,
                 )
-            except Exception:
-                pass
+                await runtime.start()
+            else:
+                runtime = parent.runtime
 
-        seen: set[int] = set()
-        for machine in self._machines:
-            if id(machine) in seen:
-                continue
-            seen.add(id(machine))
+            # If spawned, the handle's event stream becomes the scope's stream
+            handle = _spawn_handle.get()
+
+            scope = ProcessScope(parent=parent, runtime=runtime)
+
+            if handle is not None:
+                scope.events = handle.events
+                handle._scope = scope
+
+            token = _current_process.set(scope)
             try:
-                await machine.stop()
-            except Exception:
-                pass
+                if timeout is not None:
+                    result = await asyncio.wait_for(
+                        coro_fn(*args, **kwargs), timeout=timeout
+                    )
+                else:
+                    result = await coro_fn(*args, **kwargs)
+                scope.events.emit("done", result)
+                return result
+            except asyncio.CancelledError:
+                scope.events.emit("cancelled", None)
+                raise
+            except Exception as e:
+                scope.events.emit("failed", str(e))
+                raise
+            finally:
+                _current_process.reset(token)
+                await scope.cleanup()
+                if is_root:
+                    await runtime.close()
 
-        self.server_url = None
-        self._execution_id = None
-        self._outcome = None
+        return wrapped
+
+    if fn is None:
+        return decorate
+    return decorate(fn)
+
+
+# ---------------------------------------------------------------------------
+# Ambient functions
+# ---------------------------------------------------------------------------
+
+def _require_scope() -> ProcessScope:
+    scope = _current_process.get()
+    if scope is None:
+        raise RuntimeError("No active process. Use @agent_process.")
+    return scope
 
 
 def current_runtime() -> Runtime:
-    runtime = _CURRENT_RUNTIME.get()
-    if runtime is None or not runtime._is_active():
-        raise RuntimeError(_NO_ACTIVE_RUNTIME_ERROR)
-    return runtime
+    return _require_scope().runtime
 
 
 async def agent(
@@ -563,52 +597,87 @@ async def agent(
     image: Image | None = None,
     machine: Machine | None = None,
 ) -> Agent:
-    return await current_runtime().agent(
+    scope = _require_scope()
+    ag, spawned_machine = await scope.runtime._create_agent(
         name,
         system_prompt=system_prompt,
         image=image,
         machine=machine,
+        scope=scope,
     )
+    scope.agents.append(ag)
+    if spawned_machine is not None:
+        scope.machines.append(spawned_machine)
+    return ag
 
 
 async def machine(image: Image | None = None) -> Machine:
-    return await current_runtime().machine(image=image)
+    scope = _require_scope()
+    m = await (image or scope.runtime.image).spawn()
+    scope.machines.append(m)
+    return m
 
 
 def connect(a: Agent, b: Agent, *, direction: str = "both") -> None:
-    current_runtime().connect(a, b, direction=direction)
+    scope = _require_scope()
+    scope.runtime._connect(a, b, direction=direction)
 
 
-def exit(result: Any = None) -> None:
-    current_runtime().exit(result)
+def done(result: Any = None) -> None:
+    """Signal that this process completed successfully."""
+    scope = _require_scope()
+    if not scope._outcome.done():
+        scope._outcome.set_result(result)
 
 
 def fail(reason: str) -> None:
-    current_runtime().fail(reason)
+    """Signal that this process failed."""
+    scope = _require_scope()
+    if not scope._outcome.done():
+        scope._outcome.set_exception(ExecutionFailed(reason))
 
 
-def agent_runtime(
-    fn: Callable[P, Awaitable[R]] | None = None,
-    *,
-    image: Image | None = None,
-    timeout: float | None = None,
-) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]] | Callable[P, Awaitable[Any]]:
-    from functools import wraps
+async def wait() -> Any:
+    """Block until done() or fail() is called. Returns the done value, raises on fail."""
+    scope = _require_scope()
+    return await scope._outcome
 
-    def decorate(coro_fn: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
-        if not inspect.iscoroutinefunction(coro_fn):
-            raise TypeError("@agent_runtime requires an async function")
 
-        @wraps(coro_fn)
-        async def wrapped(*args: P.args, **kwargs: P.kwargs) -> Any:
-            async with Runtime(image=image):
-                return await _run_until_exit(
-                    coro_fn(*args, **kwargs),
-                    timeout=timeout,
-                )
+def emit(event_type: str, data: Any = None) -> None:
+    """Emit an event into this process's event stream."""
+    scope = _require_scope()
+    scope.events.emit(event_type, data)
 
-        return wrapped
 
-    if fn is None:
-        return decorate
-    return decorate(fn)
+def public(ag: Agent) -> None:
+    """Expose an agent so the parent process can interact with it."""
+    ag._public = True
+
+
+def client_event(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+    """Register a handler that the parent process can call via handle.call()."""
+    scope = _require_scope()
+    scope.client_handlers[fn.__name__] = fn
+    return fn
+
+
+def spawn(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> ProcessHandle:
+    """Run a process function in a background task. Returns a handle."""
+    events = EventStream()
+    handle = ProcessHandle(events=events)
+
+    async def run() -> None:
+        token = _spawn_handle.set(handle)
+        try:
+            await fn(*args, **kwargs)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass  # "failed" event already emitted by @agent_process decorator
+        finally:
+            _spawn_handle.reset(token)
+            if not events.closed:
+                events.close()
+
+    handle.task = asyncio.create_task(run())
+    return handle

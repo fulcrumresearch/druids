@@ -1,69 +1,53 @@
+"""Tests for the runtime, agent process decorator, and tool dispatch."""
+
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from pathlib import Path
 
 import pytest
 
-from druids import (
-    ExecutionFailed,
-    LocalImage,
-    Runtime,
+from druids import ExecutionFailed, LocalImage, Runtime
+from druids.runtime import (
+    ProcessScope,
+    _current_process,
     agent,
-    agent_runtime,
+    agent_process,
+    connect,
     current_runtime,
-    exit,
+    done,
+    fail,
+    wait,
 )
 from tests.helpers import FakeAgentClient, disable_agent_launch, wait_for_server
 
 
-async def _make_client(ctx: Runtime, agent_id: str) -> FakeAgentClient:
-    client = FakeAgentClient(ctx.server_url, ctx.execution_id or "", agent_id)
+async def _setup(tmp_path, monkeypatch):
+    runtime = Runtime(image=LocalImage(tmp_path))
+    await runtime.start()
+    scope = ProcessScope(parent=None, runtime=runtime)
+    token = _current_process.set(scope)
+    disable_agent_launch(runtime, monkeypatch)
+    return runtime, scope, token
+
+
+async def _teardown(runtime, scope, token):
+    await scope.cleanup()
+    await runtime.close()
+    _current_process.reset(token)
+
+
+async def _make_client(runtime: Runtime, agent_id: str) -> FakeAgentClient:
+    client = FakeAgentClient(runtime.server_url, runtime.execution_id or "", agent_id)
     await asyncio.to_thread(client.connect)
     return client
 
 
-def test_async_with_runtime_starts_waits_and_closes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_agent_process_decorator(tmp_path: Path, monkeypatch) -> None:
     async def run() -> None:
         monkeypatch.chdir(tmp_path)
 
-        ctx = Runtime(image=LocalImage(tmp_path / "builder"))
-        disable_agent_launch(ctx, monkeypatch)
-
-        async with ctx:
-            builder = await agent("builder")
-
-            @builder.on("submit")
-            async def submit(summary: str = "") -> str:
-                exit(summary)
-                return "submitted"
-
-            assert ctx.server_url is not None
-            await asyncio.to_thread(wait_for_server, ctx.server_url)
-
-            client = await _make_client(ctx, "builder")
-            try:
-                await asyncio.to_thread(client.register)
-
-                wait_task = asyncio.create_task(ctx.wait(timeout=5))
-                assert await asyncio.to_thread(client.tool_call, "submit", {"summary": "done"}) == "submitted"
-                assert await wait_task == "done"
-            finally:
-                await asyncio.to_thread(client.close)
-
-        assert ctx.server_url is None
-
-    asyncio.run(run())
-
-
-def test_agent_runtime_decorator(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    async def run() -> None:
-        monkeypatch.chdir(tmp_path)
-
-        @agent_runtime(image=LocalImage(tmp_path / "builder"), timeout=5)
+        @agent_process(image=LocalImage(tmp_path / "builder"), timeout=5)
         async def program() -> str:
             runtime = current_runtime()
             disable_agent_launch(runtime, monkeypatch)
@@ -71,7 +55,7 @@ def test_agent_runtime_decorator(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 
             @builder.on("submit")
             async def submit(summary: str = "") -> str:
-                exit(summary)
+                done(summary)
                 return "submitted"
 
             assert runtime.server_url is not None
@@ -85,83 +69,27 @@ def test_agent_runtime_decorator(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
                 assert await asyncio.to_thread(client.tool_call, "submit", {"summary": "done"}) == "submitted"
             finally:
                 await asyncio.to_thread(client.close)
+            return await wait()
 
         assert await program() == "done"
-        with pytest.raises(RuntimeError, match="No active runtime"):
-            current_runtime()
+        assert _current_process.get() is None
 
     asyncio.run(run())
 
 
-def test_exit_cancels_decorated_program(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_register_and_submit_flow(tmp_path: Path, monkeypatch) -> None:
     async def run() -> None:
-        monkeypatch.chdir(tmp_path)
-        state: dict[str, object] = {}
-
-        @agent_runtime(image=LocalImage(tmp_path / "builder"), timeout=5)
-        async def program() -> str:
-            runtime = current_runtime()
-            disable_agent_launch(runtime, monkeypatch)
+        runtime, scope, token = await _setup(tmp_path, monkeypatch)
+        try:
             builder = await agent("builder")
 
             @builder.on("submit")
             async def submit(summary: str = "") -> str:
-                exit(summary)
+                done(summary)
                 return "submitted"
 
-            assert runtime.server_url is not None
             await asyncio.to_thread(wait_for_server, runtime.server_url)
-
             client = await _make_client(runtime, "builder")
-            await asyncio.to_thread(client.register)
-            state["client"] = client
-
-            try:
-                await asyncio.sleep(60)
-            except asyncio.CancelledError:
-                state["cancelled"] = True
-                raise
-
-        program_task = asyncio.create_task(program())
-        try:
-            while "client" not in state:
-                if program_task.done():
-                    await program_task
-                await asyncio.sleep(0.01)
-
-            client = state["client"]
-            assert isinstance(client, FakeAgentClient)
-            assert await asyncio.to_thread(client.tool_call, "submit", {"summary": "done"}) == "submitted"
-            assert await program_task == "done"
-            assert state["cancelled"] is True
-        finally:
-            if not program_task.done():
-                program_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await program_task
-
-    asyncio.run(run())
-
-
-def test_register_and_submit_flow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    async def run() -> None:
-        monkeypatch.chdir(tmp_path)
-
-        ctx = Runtime(image=LocalImage(tmp_path / "builder"))
-        await ctx.start()
-        try:
-            disable_agent_launch(ctx, monkeypatch)
-            builder = await ctx.agent("builder")
-
-            @builder.on("submit")
-            async def submit(summary: str = "") -> str:
-                ctx.exit(summary)
-                return "submitted"
-
-            assert ctx.server_url is not None
-            await asyncio.to_thread(wait_for_server, ctx.server_url)
-
-            client = await _make_client(ctx, "builder")
             try:
                 tools = await asyncio.to_thread(client.register)
 
@@ -173,34 +101,28 @@ def test_register_and_submit_flow(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
                 assert await asyncio.to_thread(client.next_event, "message") == {"text": "Implement the thing"}
 
                 assert await asyncio.to_thread(client.tool_call, "submit", {"summary": "done"}) == "submitted"
-                assert await ctx.wait(timeout=5) == "done"
+                assert await wait() == "done"
             finally:
                 await asyncio.to_thread(client.close)
         finally:
-            await ctx.close()
+            await _teardown(runtime, scope, token)
 
     asyncio.run(run())
 
 
-def test_dynamic_tool_registration_pushes_new_tool_event(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_dynamic_tool_registration_pushes_new_tool_event(tmp_path: Path, monkeypatch) -> None:
     async def run() -> None:
-        monkeypatch.chdir(tmp_path)
-
-        ctx = Runtime(image=LocalImage(tmp_path / "builder"))
-        await ctx.start()
+        runtime, scope, token = await _setup(tmp_path, monkeypatch)
         try:
-            disable_agent_launch(ctx, monkeypatch)
-            builder = await ctx.agent("builder")
+            builder = await agent("builder")
 
             @builder.on("finish")
             async def finish() -> str:
-                ctx.exit("ok")
+                done("ok")
                 return "ok"
 
-            assert ctx.server_url is not None
-            await asyncio.to_thread(wait_for_server, ctx.server_url)
-
-            client = await _make_client(ctx, "builder")
+            await asyncio.to_thread(wait_for_server, runtime.server_url)
+            client = await _make_client(runtime, "builder")
             try:
                 await asyncio.to_thread(client.register)
 
@@ -214,37 +136,31 @@ def test_dynamic_tool_registration_pushes_new_tool_event(tmp_path: Path, monkeyp
 
                 assert await asyncio.to_thread(client.tool_call, "late_tool", {"message": "hello"}) == "HELLO"
                 assert await asyncio.to_thread(client.tool_call, "finish") == "ok"
-                assert await ctx.wait(timeout=5) == "ok"
+                assert await wait() == "ok"
             finally:
                 await asyncio.to_thread(client.close)
         finally:
-            await ctx.close()
+            await _teardown(runtime, scope, token)
 
     asyncio.run(run())
 
 
-def test_builtin_message_and_file_transfer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_builtin_message_and_file_transfer(tmp_path: Path, monkeypatch) -> None:
     async def run() -> None:
-        monkeypatch.chdir(tmp_path)
-
-        ctx = Runtime()
-        await ctx.start()
+        runtime, scope, token = await _setup(tmp_path, monkeypatch)
         try:
-            disable_agent_launch(ctx, monkeypatch)
-            builder = await ctx.agent("builder", image=LocalImage(tmp_path / "builder"))
-            reviewer = await ctx.agent("reviewer", image=LocalImage(tmp_path / "reviewer"))
-            ctx.connect(builder, reviewer)
+            builder = await agent("builder", image=LocalImage(tmp_path / "builder"))
+            reviewer = await agent("reviewer", image=LocalImage(tmp_path / "reviewer"))
+            connect(builder, reviewer)
 
             @builder.on("finish")
             async def finish() -> str:
-                ctx.exit("complete")
+                done("complete")
                 return "complete"
 
-            assert ctx.server_url is not None
-            await asyncio.to_thread(wait_for_server, ctx.server_url)
-
-            builder_client = await _make_client(ctx, "builder")
-            reviewer_client = await _make_client(ctx, "reviewer")
+            await asyncio.to_thread(wait_for_server, runtime.server_url)
+            builder_client = await _make_client(runtime, "builder")
+            reviewer_client = await _make_client(runtime, "reviewer")
             try:
                 await asyncio.to_thread(builder_client.register)
                 await asyncio.to_thread(reviewer_client.register)
@@ -276,38 +192,32 @@ def test_builtin_message_and_file_transfer(tmp_path: Path, monkeypatch: pytest.M
                 assert await reviewer.machine.read_file("copied.txt") == b"world"
 
                 assert await asyncio.to_thread(builder_client.tool_call, "finish") == "complete"
-                assert await ctx.wait(timeout=5) == "complete"
+                assert await wait() == "complete"
             finally:
                 await asyncio.to_thread(builder_client.close)
                 await asyncio.to_thread(reviewer_client.close)
         finally:
-            await ctx.close()
+            await _teardown(runtime, scope, token)
 
     asyncio.run(run())
 
 
-def test_connection_enforcement_returns_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_connection_enforcement_returns_error(tmp_path: Path, monkeypatch) -> None:
     async def run() -> None:
-        monkeypatch.chdir(tmp_path)
-
-        ctx = Runtime()
-        await ctx.start()
+        runtime, scope, token = await _setup(tmp_path, monkeypatch)
         try:
-            disable_agent_launch(ctx, monkeypatch)
-            builder = await ctx.agent("builder", image=LocalImage(tmp_path / "builder"))
-            reviewer = await ctx.agent("reviewer", image=LocalImage(tmp_path / "reviewer"))
-            ctx.connect(builder, reviewer, direction="forward")
+            builder = await agent("builder", image=LocalImage(tmp_path / "builder"))
+            reviewer = await agent("reviewer", image=LocalImage(tmp_path / "reviewer"))
+            connect(builder, reviewer, direction="forward")
 
             @builder.on("finish")
             async def finish() -> str:
-                ctx.exit("ok")
+                done("ok")
                 return "ok"
 
-            assert ctx.server_url is not None
-            await asyncio.to_thread(wait_for_server, ctx.server_url)
-
-            builder_client = await _make_client(ctx, "builder")
-            reviewer_client = await _make_client(ctx, "reviewer")
+            await asyncio.to_thread(wait_for_server, runtime.server_url)
+            builder_client = await _make_client(runtime, "builder")
+            reviewer_client = await _make_client(runtime, "reviewer")
             try:
                 await asyncio.to_thread(builder_client.register)
                 await asyncio.to_thread(reviewer_client.register)
@@ -320,129 +230,103 @@ def test_connection_enforcement_returns_error(tmp_path: Path, monkeypatch: pytes
                 assert "not connected" in error_msg
 
                 assert await asyncio.to_thread(builder_client.tool_call, "finish") == "ok"
-                assert await ctx.wait(timeout=5) == "ok"
+                assert await wait() == "ok"
             finally:
                 await asyncio.to_thread(builder_client.close)
                 await asyncio.to_thread(reviewer_client.close)
         finally:
-            await ctx.close()
+            await _teardown(runtime, scope, token)
 
     asyncio.run(run())
 
 
-def test_dynamic_agent_creation_inside_handler_is_immediate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_dynamic_agent_creation_inside_handler(tmp_path: Path, monkeypatch) -> None:
     async def run() -> None:
-        monkeypatch.chdir(tmp_path)
-
-        ctx = Runtime(image=LocalImage(tmp_path / "shared"))
-        await ctx.start()
+        runtime, scope, token = await _setup(tmp_path, monkeypatch)
         try:
-            disable_agent_launch(ctx, monkeypatch)
-            builder = await ctx.agent("builder")
+            builder = await agent("builder")
             created: dict[str, object] = {}
 
             @builder.on("spawn")
-            async def spawn() -> str:
-                reviewer = await ctx.agent("reviewer", machine=builder.machine)
+            async def spawn_agent() -> str:
+                reviewer = await agent("reviewer", machine=builder.machine)
                 created["reviewer"] = reviewer
-                ctx.exit("spawned")
+                done("spawned")
                 return reviewer.name
 
-            assert ctx.server_url is not None
-            await asyncio.to_thread(wait_for_server, ctx.server_url)
-
-            client = await _make_client(ctx, "builder")
+            await asyncio.to_thread(wait_for_server, runtime.server_url)
+            client = await _make_client(runtime, "builder")
             try:
                 await asyncio.to_thread(client.register)
                 assert await asyncio.to_thread(client.tool_call, "spawn") == "reviewer"
-
-                assert await ctx.wait(timeout=5) == "spawned"
-                reviewer = created["reviewer"]
-                assert reviewer.machine is builder.machine
+                assert await wait() == "spawned"
+                assert created["reviewer"].machine is builder.machine
             finally:
                 await asyncio.to_thread(client.close)
         finally:
-            await ctx.close()
+            await _teardown(runtime, scope, token)
 
     asyncio.run(run())
 
 
-def test_ctx_fail_raises_execution_failed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fail_raises_execution_failed(tmp_path: Path, monkeypatch) -> None:
     async def run() -> None:
-        monkeypatch.chdir(tmp_path)
-
-        ctx = Runtime(image=LocalImage(tmp_path / "builder"))
-        await ctx.start()
+        runtime, scope, token = await _setup(tmp_path, monkeypatch)
         try:
-            disable_agent_launch(ctx, monkeypatch)
-            builder = await ctx.agent("builder")
+            builder = await agent("builder")
 
             @builder.on("reject")
             async def reject(reason: str = "") -> str:
-                ctx.fail(reason)
+                fail(reason)
                 return "rejected"
 
-            assert ctx.server_url is not None
-            await asyncio.to_thread(wait_for_server, ctx.server_url)
-
-            client = await _make_client(ctx, "builder")
+            await asyncio.to_thread(wait_for_server, runtime.server_url)
+            client = await _make_client(runtime, "builder")
             try:
                 await asyncio.to_thread(client.register)
                 assert await asyncio.to_thread(client.tool_call, "reject", {"reason": "bad build"}) == "rejected"
 
                 with pytest.raises(ExecutionFailed) as exc_info:
-                    await ctx.wait(timeout=5)
+                    await wait()
                 assert exc_info.value.reason == "bad build"
             finally:
                 await asyncio.to_thread(client.close)
         finally:
-            await ctx.close()
+            await _teardown(runtime, scope, token)
 
     asyncio.run(run())
 
 
-def test_duplicate_agent_names_are_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_duplicate_agent_names_are_rejected(tmp_path: Path, monkeypatch) -> None:
     async def run() -> None:
-        monkeypatch.chdir(tmp_path)
-
-        ctx = Runtime(image=LocalImage(tmp_path / "builder"))
-        await ctx.start()
+        runtime, scope, token = await _setup(tmp_path, monkeypatch)
         try:
-            disable_agent_launch(ctx, monkeypatch)
-            await ctx.agent("builder")
+            await agent("builder")
             with pytest.raises(ValueError, match="already exists"):
-                await ctx.agent("builder")
+                await agent("builder")
         finally:
-            await ctx.close()
+            await _teardown(runtime, scope, token)
 
     asyncio.run(run())
 
 
-def test_register_validates_execution_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_register_validates_execution_id(tmp_path: Path, monkeypatch) -> None:
     async def run() -> None:
-        monkeypatch.chdir(tmp_path)
-
-        ctx = Runtime(image=LocalImage(tmp_path / "builder"))
-        await ctx.start()
+        runtime, scope, token = await _setup(tmp_path, monkeypatch)
         try:
-            disable_agent_launch(ctx, monkeypatch)
-            await ctx.agent("builder")
+            await agent("builder")
+            await asyncio.to_thread(wait_for_server, runtime.server_url)
 
-            assert ctx.server_url is not None
-            await asyncio.to_thread(wait_for_server, ctx.server_url)
-
-            client = FakeAgentClient(ctx.server_url, "wrong-execution-id", "builder")
+            client = FakeAgentClient(runtime.server_url, "wrong-execution-id", "builder")
             await asyncio.to_thread(client.connect)
             try:
                 def bad_register():
-                    # Send sync + register with wrong execution_id
                     client.sync()
                     client._send({
                         "type": "event",
                         "event_type": "register",
                         "data": {"execution_id": "wrong-execution-id"},
                     })
-                    # Should get an error entry back
                     return client._drain_until(lambda e: e.get("type") == "error")
 
                 entry = await asyncio.to_thread(bad_register)
@@ -450,6 +334,6 @@ def test_register_validates_execution_id(tmp_path: Path, monkeypatch: pytest.Mon
             finally:
                 await asyncio.to_thread(client.close)
         finally:
-            await ctx.close()
+            await _teardown(runtime, scope, token)
 
     asyncio.run(run())
