@@ -8,7 +8,8 @@ from druids.machines import Machine
 from druids.types import ExecResult
 
 if TYPE_CHECKING:
-    from druids.runtime import ProcessScope, Runtime
+    from druids.process import ProcessScope
+    from druids.runtime import Runtime
 
 
 @dataclass

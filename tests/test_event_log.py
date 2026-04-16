@@ -65,10 +65,11 @@ def test_persistence_writes_jsonl(tmp_path: Path) -> None:
 
 def test_log_entry_round_trip() -> None:
     entry = LogEntry(
+        type="tool_call",
+        data={"tool": "bash"},
         seq=5,
         ts=1713100000.0,
         origin="agent",
-        event=Event(type="tool_call", data={"tool": "bash"}),
     )
     d = entry.to_dict()
     restored = LogEntry.from_dict(d)
@@ -101,5 +102,8 @@ def test_stream_and_log_stay_in_sync() -> None:
     events = log.stream.snapshot()
     assert events == [Event(type="a", data={"x": 1}), Event(type="b", data={"x": 2})]
 
-    # Log entries wrap each event with seq/ts/origin.
-    assert [e.event for e in log.after(0)] == events
+    # Log entries carry the same type+data plus seq/ts/origin.
+    entries = log.after(0)
+    assert [(e.type, e.data) for e in entries] == [("a", {"x": 1}), ("b", {"x": 2})]
+    # A LogEntry is-an Event (inheritance).
+    assert all(isinstance(e, Event) for e in entries)

@@ -3,15 +3,19 @@
 A ``Log`` holds a ``Stream`` for local consumers plus a parallel sequence
 of ``LogEntry`` wrappers that add the metadata needed for replication:
 a monotonic ``seq``, a timestamp, and an ``origin`` tag. Each emit also
-appends to an on-disk JSONL file (if configured) and can be pushed to a
-remote subscriber via ``on_push``.
+appends to an on-disk JSONL file (if configured).
+
+The server is the single writer. Remote replicas subscribe via
+``subscribe(cb)`` and receive each new entry through
+``broadcast(entry)``. Broadcast is best-effort: a subscriber whose
+callback raises is removed; the log itself remains the source of truth.
 """
 
 from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -19,24 +23,20 @@ from druids.stream import Event, Stream
 from druids.types import to_jsonable
 
 
-@dataclass(frozen=True)
-class LogEntry:
-    """A logged Event: the event itself plus replication metadata."""
+@dataclass(frozen=True, kw_only=True)
+class LogEntry(Event):
+    """An Event plus replication metadata (seq, ts, origin).
+
+    Inherits ``type`` and ``data`` from Event. The on-wire shape is the
+    flat dataclass dict: ``{type, data, seq, ts, origin}``.
+    """
 
     seq: int
     ts: float
     origin: str  # "agent" or "server"
-    event: Event
 
     def to_dict(self) -> dict[str, Any]:
-        # Flat on-wire shape: {seq, ts, type, origin, data}.
-        return {
-            "seq": self.seq,
-            "ts": self.ts,
-            "type": self.event.type,
-            "origin": self.origin,
-            "data": self.event.data,
-        }
+        return asdict(self)
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict())
@@ -44,10 +44,11 @@ class LogEntry:
     @staticmethod
     def from_dict(d: dict[str, Any]) -> LogEntry:
         return LogEntry(
+            type=d["type"],
+            data=d.get("data", {}),
             seq=d["seq"],
             ts=d["ts"],
             origin=d["origin"],
-            event=Event(type=d["type"], data=d.get("data", {})),
         )
 
 
@@ -59,7 +60,7 @@ class Log:
         self._entries: list[LogEntry] = []
         self._next_seq: int = 1
         self._path: Path | None = path
-        self.on_push: Callable[[LogEntry], Awaitable[None]] | None = None
+        self._subscribers: list[Callable[[LogEntry], Awaitable[None]]] = []
 
         if path is not None:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -71,27 +72,48 @@ class Log:
         if event is None:
             return None
         entry = LogEntry(
+            type=event.type,
+            data=event.data,
             seq=self._next_seq,
             ts=time.time(),
             origin=origin,
-            event=event,
         )
         self._next_seq += 1
         self._entries.append(entry)
         self._persist(entry)
         return entry
 
-    async def push(self, entry: LogEntry) -> None:
-        """Forward an entry to the subscribed remote consumer, if any."""
-        if self.on_push is not None:
+    def subscribe(
+        self, cb: Callable[[LogEntry], Awaitable[None]]
+    ) -> Callable[[], None]:
+        """Register a subscriber. Returns an unsubscribe callable."""
+        self._subscribers.append(cb)
+
+        def unsubscribe() -> None:
             try:
-                await self.on_push(entry)
-            except Exception:
+                self._subscribers.remove(cb)
+            except ValueError:
                 pass
 
-    async def push_all(self, entries: list[LogEntry]) -> None:
-        for entry in entries:
-            await self.push(entry)
+        return unsubscribe
+
+    async def broadcast(self, entry: LogEntry) -> None:
+        """Send an entry to every current subscriber.
+
+        A subscriber whose callback raises is removed. The log's own state
+        is unaffected; subscribers are best-effort mirrors.
+        """
+        dead: list[Callable[[LogEntry], Awaitable[None]]] = []
+        for sub in list(self._subscribers):
+            try:
+                await sub(entry)
+            except Exception:
+                dead.append(sub)
+        for sub in dead:
+            try:
+                self._subscribers.remove(sub)
+            except ValueError:
+                pass
 
     def after(self, seq: int) -> list[LogEntry]:
         """Entries with seq strictly greater than the given value."""

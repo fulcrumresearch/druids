@@ -1,17 +1,31 @@
-"""WebSocket server for agent communication."""
+"""WebSocket server for agent communication.
+
+Wire protocol (see spec-replication.md):
+
+- Client -> server: ``{type:"event", event_type, data}`` or
+  ``{type:"sync", after:lastSeq}``.
+- Server -> client: a ``LogEntry`` encoded as JSON.
+
+The server is the sole writer of the log. Every client event is appended
+as a ``LogEntry`` (which assigns ``seq``), broadcast to all subscribers
+(including the sender), and then reacted to. Reactions may append further
+entries; each goes through the same append-then-broadcast path.
+"""
 
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 import websockets
 
 from druids.types import ToolCallError, to_jsonable
 
 if TYPE_CHECKING:
-    from druids.log import Log
+    from druids.log import Log, LogEntry
     from druids.runtime import Runtime
+
+Send = Callable[["LogEntry"], Awaitable[None]]
 
 
 class Server:
@@ -52,85 +66,94 @@ class Server:
             return
 
         log = rec.log
-        log.on_push = lambda entry: ws.send(entry.to_json())
+
+        async def send(entry: LogEntry) -> None:
+            await ws.send(entry.to_json())
+
+        unsubscribe = log.subscribe(send)
         try:
             async for raw in ws:
                 try:
                     msg = json.loads(raw)
                 except json.JSONDecodeError:
-                    await ws.send(json.dumps({"error": "invalid JSON"}))
+                    # Malformed frame: ignore. All communication happens via
+                    # log entries; there is no separate error channel.
                     continue
-                await self._dispatch(ws, agent_id, log, msg)
+                await self._dispatch(agent_id, log, send, msg)
         finally:
-            log.on_push = None
-            log.emit("disconnected", origin="agent")
+            unsubscribe()
+            await self._append(log, "disconnected", {}, origin="agent")
 
     async def _dispatch(
-        self, ws: Any, agent_id: str, log: Log, msg: dict[str, Any]
+        self, agent_id: str, log: Log, send: Send, msg: dict[str, Any]
     ) -> None:
         msg_type = msg.get("type")
 
         if msg_type == "sync":
-            entries = log.after(msg.get("after", 0))
-            await log.push_all(entries)
+            after = int(msg.get("after", 0) or 0)
+            for entry in log.after(after):
+                try:
+                    await send(entry)
+                except Exception:
+                    # Send failed: the connection will be torn down by
+                    # the websocket layer; nothing else to do here.
+                    return
+            return
 
-        elif msg_type == "event":
-            event_type = msg.get("event_type", "")
-            data = msg.get("data", {})
-            await self._handle_event(agent_id, log, event_type, data)
-
-        else:
-            await ws.send(json.dumps({"error": f"unknown message type: {msg_type}"}))
-
-    async def _handle_event(
-        self, agent_id: str, log: Log, event_type: str, data: dict[str, Any]
-    ) -> None:
-        if event_type == "register":
-            entry = log.emit("register", data, origin="agent")
+        if msg_type == "event":
+            event_type = str(msg.get("event_type", ""))
+            data = msg.get("data", {}) or {}
+            entry = await self._append(log, event_type, data, origin="agent")
             if entry is not None:
-                await log.push(entry)
+                await self._react(agent_id, log, entry)
+
+    # -- append / send helpers --
+
+    async def _append(
+        self,
+        log: Log,
+        event_type: str,
+        data: Any,
+        *,
+        origin: str = "server",
+    ) -> LogEntry | None:
+        entry = log.emit(event_type, data, origin=origin)
+        if entry is not None:
+            await log.broadcast(entry)
+        return entry
+
+    # -- reactions: the only place derived entries are produced --
+
+    async def _react(self, agent_id: str, log: Log, entry: LogEntry) -> None:
+        if entry.type == "register":
             try:
                 tools = self.runtime.register_agent(
-                    agent_id, data.get("execution_id", "")
+                    agent_id, entry.data.get("execution_id", "")
                 )
-                result_entry = log.emit(
-                    "registered", {"tools": to_jsonable(tools)}
-                )
-                if result_entry is not None:
-                    await log.push(result_entry)
+                await self._append(log, "registered", {"tools": to_jsonable(tools)})
             except ToolCallError as exc:
-                err_entry = log.emit("error", {"error": str(exc)})
-                if err_entry is not None:
-                    await log.push(err_entry)
+                await self._append(log, "error", {"error": str(exc)})
+            return
 
-        elif event_type == "tool_call":
-            entry = log.emit("tool_call", data, origin="agent")
-            if entry is not None:
-                await log.push(entry)
-
-            call_id = data.get("call_id", "")
-            tool_name = data.get("tool", "")
-            params = data.get("params", {})
-
+        if entry.type == "tool_call":
+            call_id = entry.data.get("call_id", "")
+            tool_name = entry.data.get("tool", "")
+            params = entry.data.get("params", {}) or {}
             try:
                 result = await self.runtime.handle_tool_call(
                     agent_id, tool_name, params
                 )
-                result_entry = log.emit(
+                await self._append(
+                    log,
                     "tool_result",
                     {"call_id": call_id, "result": to_jsonable(result)},
                 )
-                if result_entry is not None:
-                    await log.push(result_entry)
             except Exception as exc:
-                err_entry = log.emit(
+                await self._append(
+                    log,
                     "tool_result",
                     {"call_id": call_id, "error": str(exc)},
                 )
-                if err_entry is not None:
-                    await log.push(err_entry)
+            return
 
-        else:
-            entry = log.emit(event_type, data, origin="agent")
-            if entry is not None:
-                await log.push(entry)
+        # Other event types are logged but produce no derived entries.

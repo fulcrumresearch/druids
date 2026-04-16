@@ -1,11 +1,9 @@
 from druids.agent import Agent
 from druids.log import Log, LogEntry
 from druids.machines import Image, LocalImage, LocalMachine, Machine
-from druids.stream import Event, Stream
-from druids.runtime import (
+from druids.process import (
     ProcessHandle,
     ProcessScope,
-    Runtime,
     agent,
     agent_process,
     client_event,
@@ -19,6 +17,8 @@ from druids.runtime import (
     spawn,
     wait,
 )
+from druids.runtime import Runtime
+from druids.stream import Event, Stream
 from druids.types import ExecResult, ExecutionFailed
 
 __all__ = [

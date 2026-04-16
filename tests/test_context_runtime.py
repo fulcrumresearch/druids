@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from druids import ExecutionFailed, LocalImage, Runtime
-from druids.runtime import (
+from druids.process import (
     ProcessScope,
     _current_process,
     agent,

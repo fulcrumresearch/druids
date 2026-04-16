@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from druids import LocalImage, Runtime
-from druids.runtime import ProcessScope, _current_process, agent
+from druids.process import ProcessScope, _current_process, agent
 from tests.helpers import FakeAgentClient, disable_agent_launch, wait_for_server
 
 
@@ -42,7 +42,7 @@ def test_registered_event_set_on_register(tmp_path: Path, monkeypatch) -> None:
 
             @worker.on("finish")
             async def finish() -> str:
-                from druids.runtime import done
+                from druids.process import done
                 done("ok")
                 return "ok"
 
@@ -55,7 +55,7 @@ def test_registered_event_set_on_register(tmp_path: Path, monkeypatch) -> None:
                 await asyncio.to_thread(client.register)
                 assert rec.registered.is_set()
                 assert await asyncio.to_thread(client.tool_call, "finish") == "ok"
-                from druids.runtime import wait
+                from druids.process import wait
                 assert await wait() == "ok"
             finally:
                 await asyncio.to_thread(client.close)
@@ -77,7 +77,7 @@ def test_dynamic_agent_in_handler_is_usable(tmp_path: Path, monkeypatch) -> None
             async def spawn_agent() -> str:
                 worker = await agent("worker", machine=finder.machine)
                 created_agents["worker"] = worker
-                from druids.runtime import done
+                from druids.process import done
                 done("spawned")
                 return worker.name
 
@@ -86,7 +86,7 @@ def test_dynamic_agent_in_handler_is_usable(tmp_path: Path, monkeypatch) -> None
             try:
                 await asyncio.to_thread(client.register)
                 assert await asyncio.to_thread(client.tool_call, "spawn") == "worker"
-                from druids.runtime import wait
+                from druids.process import wait
                 assert await wait() == "spawned"
                 assert created_agents["worker"].machine is finder.machine
             finally:

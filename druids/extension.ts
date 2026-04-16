@@ -103,8 +103,18 @@ function schemaToTypeBox(schema: any): any {
 }
 
 // -- WebSocket state --
+//
+// Replication model (see spec-replication.md):
+// - `entries` is the local replica of the server's log for this agent.
+// - `lastSeq` is the seq of the last entry we've observed.
+// - The server is the sole writer. On connect we sync from `lastSeq`; on
+//   every incoming entry we append and react. Outgoing tool calls wait
+//   for a matching `tool_result` LogEntry; we do NOT reject on
+//   disconnect because results may still arrive after reconnect+sync.
 
 let ws: WebSocket | null = null;
+let shuttingDown = false;
+const entries: LogEntry[] = [];
 let lastSeq = 0;
 let callIdCounter = 0;
 
@@ -169,6 +179,12 @@ function handleLogEntry(
   ctx: ExtensionContext,
   registeredTools: Set<string>,
 ): boolean {
+  // Defensive: ignore anything we've already seen (e.g. a sync replay
+  // that overlaps entries delivered while the sync was in flight).
+  if (entry.seq <= lastSeq) {
+    return false;
+  }
+  entries.push(entry);
   lastSeq = entry.seq;
 
   switch (entry.type) {
@@ -212,6 +228,12 @@ function handleLogEntry(
     }
 
     case "shutdown": {
+      shuttingDown = true;
+      // Reject any pending calls: we won't be reconnecting.
+      for (const [callId, pending] of pendingCalls) {
+        pending.reject(new Error("druids: agent shutting down"));
+        pendingCalls.delete(callId);
+      }
       ctx.shutdown();
       return true; // signal to stop
     }
@@ -258,14 +280,13 @@ function connectWs(
 
   ws.onclose = () => {
     ws = null;
-    // Reject any pending tool calls
-    for (const [callId, pending] of pendingCalls) {
-      pending.reject(new Error("WebSocket disconnected"));
-      pendingCalls.delete(callId);
+    if (shuttingDown) {
+      return;
     }
-    // Reconnect after delay
+    // Do NOT reject pendingCalls. In-flight results may already be in
+    // the server log; we'll see them after reconnect + sync.
     setTimeout(() => {
-      connectWs(pi, ctx, registeredTools);
+      if (!shuttingDown) connectWs(pi, ctx, registeredTools);
     }, 1000);
   };
 
