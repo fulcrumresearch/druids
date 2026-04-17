@@ -170,13 +170,12 @@ under `~/.druids/logs/{execution_id}/`. The `druids` CLI uses these:
 
 ```
 druids ls                         # live runs
-druids status [--id <prefix>]     # agents, machines, connections (live)
+druids status [--id <prefix>]     # agents, machines, connections
 druids send <agent> <msg> [--id <prefix>]
 druids connect <agent> [--id <prefix>]  # tmux attach
 druids ssh <agent> [--id <prefix>]      # shell on the agent's machine
-druids logs [--id <prefix>] [--agent X] # path of a log file (live or finished)
 ```
 
 `--id` takes an execution-id prefix. Omit when there's one live run.
-`status`, `send`, `connect`, and `ssh` require the run to be live
-(socket present). `logs` works on both live and finished runs.
+All commands require the run to be live (socket present). Finished-run
+logs are at `~/.druids/logs/{execution_id}/` — read them directly.

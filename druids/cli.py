@@ -1,16 +1,16 @@
 """Druids CLI.
 
-Commands communicate with a live runtime through its Unix socket at
+Commands talk to a live runtime over its Unix socket at
 ``~/.druids/runtimes/{execution_id}.sock``. Finished runs have no
-socket; use their log files directly (``druids logs``).
+socket; their logs stay in ``~/.druids/logs/{execution_id}/``.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import shlex
+import socket
 from pathlib import Path
 from typing import Any
 
@@ -30,67 +30,59 @@ ID_OPT = typer.Option(None, "--id", "-i", help="Execution id or prefix (default:
 
 
 # ---------------------------------------------------------------------------
-# Socket client
+# Discovery
 # ---------------------------------------------------------------------------
 
 
-def live_runs() -> list[str]:
-    """Execution ids with a reachable socket."""
+def _live_ids() -> list[str]:
     if not SOCKET_DIR.exists():
         return []
-    out = []
-    for p in sorted(SOCKET_DIR.glob("*.sock")):
-        if _reachable(p):
-            out.append(p.stem)
-    return out
+    return sorted(p.stem for p in SOCKET_DIR.glob("*.sock"))
 
 
-def _reachable(path: Path) -> bool:
-    """Cheap liveness check: try to open the socket."""
-    import socket
-
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        s.connect(str(path))
-        return True
-    except (FileNotFoundError, ConnectionRefusedError, PermissionError):
-        return False
-    finally:
-        s.close()
+def pick(prefix: str | None) -> str:
+    """Resolve a live run id by prefix, or the only live run if omitted."""
+    ids = [i for i in _live_ids() if prefix is None or i.startswith(prefix)]
+    if not ids:
+        die(f"No live run matches '{prefix}'." if prefix else "No live runs.")
+    if len(ids) > 1:
+        label = "Ambiguous prefix" if prefix else "Multiple live runs; pass --id"
+        die(f"{label}:\n" + "\n".join(f"  {i[:8]}" for i in ids))
+    return ids[0]
 
 
-def resolve_id(prefix: str | None) -> str:
-    """Resolve a run by id prefix; default = the only live one."""
-    ids = live_runs()
-    if prefix is None:
-        if not ids:
-            die("No live runs.")
-        if len(ids) > 1:
-            die("Multiple live runs; pass --id <prefix>:\n" + "\n".join(f"  {i[:8]}" for i in ids))
-        return ids[0]
-    matches = [i for i in ids if i.startswith(prefix)]
-    if not matches:
-        die(f"No live run matches '{prefix}'.")
-    if len(matches) > 1:
-        die(f"Ambiguous prefix '{prefix}':\n" + "\n".join(f"  {i[:8]}" for i in matches))
-    return matches[0]
-
-
-async def _call(execution_id: str, request: dict[str, Any]) -> dict[str, Any]:
-    reader, writer = await asyncio.open_unix_connection(str(socket_path(execution_id)))
-    writer.write((json.dumps(request) + "\n").encode())
-    await writer.drain()
-    line = await reader.readline()
-    writer.close()
-    await writer.wait_closed()
-    return json.loads(line) if line else {"error": "empty reply"}
+# ---------------------------------------------------------------------------
+# Socket RPC
+# ---------------------------------------------------------------------------
 
 
 def call(execution_id: str, request: dict[str, Any]) -> dict[str, Any]:
-    reply = asyncio.run(_call(execution_id, request))
-    if "error" in reply:
-        die(reply["error"])
-    return reply
+    """Send one request to the runtime's control socket, return the reply."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.connect(str(socket_path(execution_id)))
+            s.sendall((json.dumps(request) + "\n").encode())
+            reply = _recv_line(s)
+    except (FileNotFoundError, ConnectionRefusedError) as exc:
+        die(f"Runtime unreachable: {exc}")
+    if not reply:
+        die("empty reply from runtime")
+    data = json.loads(reply)
+    if "error" in data:
+        die(data["error"])
+    return data
+
+
+def _recv_line(s: socket.socket) -> str:
+    buf = bytearray()
+    while True:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        buf.extend(chunk)
+        if b"\n" in chunk:
+            break
+    return buf.decode().rstrip("\n")
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +93,7 @@ def call(execution_id: str, request: dict[str, Any]) -> dict[str, Any]:
 @app.command("ls")
 def cmd_ls() -> None:
     """List live runs."""
-    ids = live_runs()
+    ids = _live_ids()
     if not ids:
         typer.echo("No live runs.")
         return
@@ -113,8 +105,7 @@ def cmd_ls() -> None:
 @app.command("status")
 def cmd_status(id_: str = ID_OPT) -> None:
     """Show structure of a live run: agents, machines, connections."""
-    eid = resolve_id(id_)
-    s = call(eid, {"cmd": "status"})
+    s = call(pick(id_), {"cmd": "status"})
 
     typer.echo(f"Execution: {s['execution_id']}")
     typer.echo(f"Program:   {s.get('program', '?')}")
@@ -144,15 +135,14 @@ def cmd_send(
     id_: str = ID_OPT,
 ) -> None:
     """Send a message to an agent."""
-    eid = resolve_id(id_)
-    call(eid, {"cmd": "send", "agent": agent, "text": message})
+    call(pick(id_), {"cmd": "send", "agent": agent, "text": message})
     typer.echo(f"Sent to {agent}.")
 
 
 @app.command("connect")
 def cmd_connect(agent: str = typer.Argument(...), id_: str = ID_OPT) -> None:
     """Attach to an agent's tmux session."""
-    eid = resolve_id(id_)
+    eid = pick(id_)
     info = call(eid, {"cmd": "agent", "name": agent})
     session = info.get("tmux_session") or f"druids-{eid}-{agent}"
     os.execvp("tmux", ["tmux", "attach-session", "-t", session])
@@ -161,59 +151,12 @@ def cmd_connect(agent: str = typer.Argument(...), id_: str = ID_OPT) -> None:
 @app.command("ssh")
 def cmd_ssh(agent: str = typer.Argument(...), id_: str = ID_OPT) -> None:
     """Open a shell on an agent's machine."""
-    eid = resolve_id(id_)
-    info = call(eid, {"cmd": "agent", "name": agent})
-    machine = info["machine"]
-    kind = machine.get("kind")
-    if kind != "LocalMachine":
-        die(f"ssh not supported for machine kind '{kind}' yet.")
-    workdir = machine.get("workdir", os.getcwd())
+    info = call(pick(id_), {"cmd": "agent", "name": agent})
+    m = info["machine"]
+    if m.get("kind") != "LocalMachine":
+        die(f"ssh not supported for machine kind '{m.get('kind')}' yet.")
     shell = os.environ.get("SHELL", "/bin/bash")
-    os.execvp(shell, [shell, "-c", f"cd {shlex.quote(workdir)} && exec {shell}"])
-
-
-@app.command("logs")
-def cmd_logs(
-    id_: str = ID_OPT,
-    agent: str | None = typer.Option(None, "--agent", "-a"),
-) -> None:
-    """Print the path of a log file.
-
-    Works for live runs (via the socket, to get the full id) and finished
-    runs (via id prefix match against ``~/.druids/logs``).
-    """
-    from druids.runtime import DEFAULT_LOG_DIR
-
-    eid = _resolve_any(id_)
-    log_dir = DEFAULT_LOG_DIR / eid
-    path = log_dir / (f"{agent}.jsonl" if agent else "_runtime.jsonl")
-    if not path.exists():
-        die(f"No log at {path}")
-    typer.echo(str(path))
-
-
-def _resolve_any(prefix: str | None) -> str:
-    """Resolve an id prefix against live sockets OR disk-only runs."""
-    from druids.runtime import DEFAULT_LOG_DIR
-
-    live = set(live_runs())
-    on_disk = {p.name for p in DEFAULT_LOG_DIR.iterdir()} if DEFAULT_LOG_DIR.exists() else set()
-    pool = sorted(live | on_disk)
-
-    if prefix is None:
-        live_list = [i for i in pool if i in live]
-        if len(live_list) == 1:
-            return live_list[0]
-        die("Pass --id <prefix>.")
-    matches = [i for i in pool if i.startswith(prefix)]
-    if not matches:
-        die(f"No run matches '{prefix}'.")
-    if len(matches) > 1:
-        die(f"Ambiguous prefix '{prefix}':\n" + "\n".join(f"  {i[:8]}" for i in matches))
-    return matches[0]
-
-
-# ---------------------------------------------------------------------------
+    os.execvp(shell, [shell, "-c", f"cd {shlex.quote(m.get('workdir', os.getcwd()))} && exec {shell}"])
 
 
 def die(msg: str) -> None:
