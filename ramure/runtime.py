@@ -16,18 +16,18 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from druids.agent import Agent
-from druids.context import _current_process
-from druids.control import ControlServer
-from druids.helpers import agent_session_name, build_tool_definition
-from druids.helpers import launch_agent as _launch_agent_impl
-from druids.log import Log
-from druids.machines import Image, Machine
-from druids.server import Server
-from druids.types import ToolCallError
+from ramure.agent import Agent
+from ramure.context import _current_process
+from ramure.control import ControlServer
+from ramure.helpers import agent_session_name, build_tool_definition
+from ramure.helpers import launch_agent as _launch_agent_impl
+from ramure.log import Log
+from ramure.machines import Image, Machine
+from ramure.server import Server
+from ramure.types import ToolCallError
 
 
-DEFAULT_LOG_DIR = Path.home() / ".druids" / "logs"
+DEFAULT_LOG_DIR = Path.home() / ".ramure" / "logs"
 
 
 class Runtime:

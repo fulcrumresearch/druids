@@ -1,10 +1,10 @@
 import { StringEnum, Type } from "@mariozechner/pi-ai";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@mariozechner/pi-coding-agent";
 
-const serverUrl = process.env.DRUIDS_SERVER_URL;
-const executionId = process.env.DRUIDS_EXECUTION_ID;
-const agentId = process.env.DRUIDS_AGENT_ID;
-const appendedSystemPrompt = process.env.DRUIDS_SYSTEM_PROMPT || "";
+const serverUrl = process.env.RAMURE_SERVER_URL;
+const executionId = process.env.RAMURE_EXECUTION_ID;
+const agentId = process.env.RAMURE_AGENT_ID;
+const appendedSystemPrompt = process.env.RAMURE_SYSTEM_PROMPT || "";
 
 type RemoteTool = {
   name: string;
@@ -25,9 +25,9 @@ function requireEnv(name: string, value: string | undefined): string {
   return value;
 }
 
-const baseUrl = requireEnv("DRUIDS_SERVER_URL", serverUrl);
-const currentExecutionId = requireEnv("DRUIDS_EXECUTION_ID", executionId);
-const currentAgentId = requireEnv("DRUIDS_AGENT_ID", agentId);
+const baseUrl = requireEnv("RAMURE_SERVER_URL", serverUrl);
+const currentExecutionId = requireEnv("RAMURE_EXECUTION_ID", executionId);
+const currentAgentId = requireEnv("RAMURE_AGENT_ID", agentId);
 
 // Derive ws:// URL from http:// URL
 const wsUrl = baseUrl.replace(/^http/, "ws");
@@ -246,7 +246,7 @@ function handleLogEntry(
       shuttingDown = true;
       // Reject any pending calls: we won't be reconnecting.
       for (const [callId, pending] of pendingCalls) {
-        pending.reject(new Error("druids: agent shutting down"));
+        pending.reject(new Error("ramure: agent shutting down"));
         pendingCalls.delete(callId);
       }
       ctx.shutdown();
@@ -255,7 +255,7 @@ function handleLogEntry(
 
     case "error": {
       if (ctx.hasUI) {
-        ctx.ui.notify(`druids error: ${entry.data?.error || "unknown"}`, "error");
+        ctx.ui.notify(`ramure error: ${entry.data?.error || "unknown"}`, "error");
       }
       break;
     }
@@ -308,7 +308,7 @@ function connectWs(
   ws.onerror = () => {
     // onclose will fire after this
     if (ctx.hasUI) {
-      ctx.ui.notify("druids: WebSocket error, reconnecting...", "warning");
+      ctx.ui.notify("ramure: WebSocket error, reconnecting...", "warning");
     }
   };
 }
@@ -351,7 +351,7 @@ function setupActivityForwarding(pi: ExtensionAPI): void {
 
 // -- Extension entry point --
 
-export default function druidsExtension(pi: ExtensionAPI) {
+export default function ramureExtension(pi: ExtensionAPI) {
   const registeredTools = new Set<string>();
   let started = false;
 

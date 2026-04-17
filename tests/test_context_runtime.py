@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from druids import ExecutionFailed, LocalImage, Runtime
-from druids.process import (
+from ramure import ExecutionFailed, LocalImage, Runtime
+from ramure.process import (
     ProcessScope,
     _current_process,
     agent,

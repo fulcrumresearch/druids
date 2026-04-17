@@ -1,4 +1,4 @@
-# druids
+# ramure
 
 A lightweight async multi-agent orchestration library. Agents run as [pi](https://github.com/mariozechner/pi-coding-agent) instances in tmux sessions, coordinated by Python process functions.
 
@@ -6,7 +6,7 @@ A lightweight async multi-agent orchestration library. Agents run as [pi](https:
 
 ```python
 import asyncio
-from druids import LocalImage, agent, agent_process, done, wait
+from ramure import LocalImage, agent, agent_process, done, wait
 
 
 @agent_process(image=LocalImage(), timeout=30)
@@ -107,17 +107,18 @@ async def main():
 
 Processes can emit custom events with `emit(type, data)`. Agent event logs are also async-iterable via `agent.events`.
 
-### Public agents and client events
+### Endpoints
 
-A process can expose agents and callable handlers to its parent:
+A process can expose endpoints to its parent. The parent can call them
+directly, or attach them to an agent as tools. A child's agents are
+available to the parent via ``handle.agents`` without any extra step.
 
 ```python
 @agent_process
 async def worker_pool():
-    @client_event
+    @expose
     async def submit_task(task: str) -> str:
         w = await agent(f"worker-{uuid.uuid4().hex[:8]}")
-        public(w)
         await w.send(f"Do: {task}")
         return w.name
 
@@ -127,6 +128,22 @@ handle = spawn(worker_pool)
 name = await handle.call("submit_task", task="build a server")
 worker = handle.agents[name]
 ```
+
+To let an agent consume a process's endpoints, attach the handle:
+
+```python
+@agent_process
+async def main():
+    pool = spawn(worker_pool)
+    dispatcher = await agent("dispatcher")
+    await pool.attach(dispatcher)          # all endpoints as tools
+    # or: await pool.attach(dispatcher, only=["submit_task"], prefix="pool_")
+    await dispatcher.send("Use submit_task to delegate jobs.")
+    return await wait()
+```
+
+Endpoints run inside the child process's scope, so calls to `emit`,
+`done`, and `fail` inside an endpoint affect the child.
 
 ## API
 
@@ -144,8 +161,7 @@ worker = handle.agents[name]
 - `await wait()` — block until `done()` or `fail()`
 - `emit(type, data)` — emit a process event
 - `spawn(fn, *args, **kwargs)` — run a process in background, returns `ProcessHandle`
-- `public(agent)` — expose an agent to the parent process
-- `@client_event` — register a handler callable by the parent via `handle.call()`
+- `@expose` — register an async function as an endpoint callable via `handle.call()` or attachable via `handle.attach()`
 - `current_runtime()` — access the runtime (rarely needed)
 
 ### Agent methods
@@ -158,24 +174,25 @@ worker = handle.agents[name]
 ### ProcessHandle
 
 - `handle.events` — async-iterable stream of process events
-- `handle.agents` — dict of public agents
-- `handle.call(name, **kwargs)` — call a client event handler
+- `handle.agents` — dict of the child's agents
+- `await handle.call(name, **kwargs)` — call an endpoint
+- `await handle.attach(agent, only=, prefix=)` — register endpoints as tools on an agent
 - `handle.cancel()` — cancel the process
 
 ## CLI
 
 Running an `@agent_process` opens a Unix socket at
-`~/.druids/runtimes/{execution_id}.sock` and writes a per-run log tree
-under `~/.druids/logs/{execution_id}/`. The `druids` CLI uses these:
+`~/.ramure/runtimes/{execution_id}.sock` and writes a per-run log tree
+under `~/.ramure/logs/{execution_id}/`. The `ramure` CLI uses these:
 
 ```
-druids ls                         # live runs
-druids status [--id <prefix>]     # agents, machines, connections
-druids send <agent> <msg> [--id <prefix>]
-druids connect <agent> [--id <prefix>]  # tmux attach
-druids ssh <agent> [--id <prefix>]      # shell on the agent's machine
+ramure ls                         # live runs
+ramure status [--id <prefix>]     # agents, machines, connections
+ramure send <agent> <msg> [--id <prefix>]
+ramure connect <agent> [--id <prefix>]  # tmux attach
+ramure ssh <agent> [--id <prefix>]      # shell on the agent's machine
 ```
 
 `--id` takes an execution-id prefix. Omit when there's one live run.
 All commands require the run to be live (socket present). Finished-run
-logs are at `~/.druids/logs/{execution_id}/` — read them directly.
+logs are at `~/.ramure/logs/{execution_id}/` — read them directly.

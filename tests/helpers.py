@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 import websockets.sync.client
 
 if TYPE_CHECKING:
-    from druids.runtime import Runtime
+    from ramure.runtime import Runtime
 
 
 class FakeAgentClient:

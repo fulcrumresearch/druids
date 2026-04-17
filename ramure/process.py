@@ -16,16 +16,16 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Awaitable, Callable, ParamSpec, TypeVar
 
-from druids.agent import Agent
-from druids.context import _current_process
-from druids.helpers import kill_agent
-from druids.machines import Image, LocalImage, Machine
-from druids.runtime import Runtime
-from druids.stream import Stream
-from druids.types import ExecutionFailed
+from ramure.agent import Agent
+from ramure.context import _current_process
+from ramure.helpers import kill_agent
+from ramure.machines import Image, LocalImage, Machine
+from ramure.runtime import Runtime
+from ramure.stream import Stream
+from ramure.types import ExecutionFailed
 
 _spawn_handle: ContextVar["ProcessHandle | None"] = ContextVar(
-    "druids_spawn_handle", default=None
+    "ramure_spawn_handle", default=None
 )
 
 P = ParamSpec("P")
@@ -47,7 +47,7 @@ class ProcessScope:
     agents: list[Agent] = field(default_factory=list)
     machines: list[Machine] = field(default_factory=list)
     events: Stream = field(default_factory=Stream)
-    client_handlers: dict[str, Callable[..., Awaitable[Any]]] = field(
+    endpoints: dict[str, Callable[..., Awaitable[Any]]] = field(
         default_factory=dict
     )
     _outcome: asyncio.Future | None = field(default=None, repr=False)
@@ -99,27 +99,81 @@ class ProcessHandle:
         self.events = events
         self.task: asyncio.Task | None = None
         self._scope: ProcessScope | None = None
+        self._scope_ready: asyncio.Event = asyncio.Event()
+
+    def _bind_scope(self, scope: ProcessScope) -> None:
+        self._scope = scope
+        self._scope_ready.set()
+
+    async def _await_scope(self) -> ProcessScope:
+        await self._scope_ready.wait()
+        assert self._scope is not None
+        return self._scope
 
     @property
     def agents(self) -> dict[str, Agent]:
-        """Public agents exposed by the child process."""
+        """Agents owned by the child process (populated once it starts)."""
         if self._scope is None:
             return {}
-        return {ag.name: ag for ag in self._scope.agents if ag.is_public}
+        return {ag.name: ag for ag in self._scope.agents}
 
-    async def call(self, event_name: str, **kwargs: Any) -> Any:
-        """Call a client event handler defined by the child process."""
-        if self._scope is None:
-            raise RuntimeError("Process scope not yet initialized")
-        handler = self._scope.client_handlers.get(event_name)
+    async def call(self, name: str, **kwargs: Any) -> Any:
+        """Call an endpoint defined by the child process via ``@expose``."""
+        scope = await self._await_scope()
+        handler = scope.endpoints.get(name)
         if handler is None:
-            raise ValueError(f"No client event '{event_name}'")
-        return await handler(**kwargs)
+            raise ValueError(f"No endpoint '{name}'")
+        return await _invoke_in_scope(scope, handler, kwargs)
+
+    async def attach(
+        self,
+        ag: Agent,
+        *,
+        only: list[str] | None = None,
+        prefix: str = "",
+    ) -> None:
+        """Register this process's endpoints as tools on ``ag``.
+
+        The agent can then invoke them like any other tool. Each call runs
+        inside the child process's scope, so ``emit()``/``done()``/``fail()``
+        inside an endpoint affect the child, not the caller.
+        """
+        scope = await self._await_scope()
+        names = list(scope.endpoints.keys()) if only is None else list(only)
+        for name in names:
+            handler = scope.endpoints.get(name)
+            if handler is None:
+                raise ValueError(f"No endpoint '{name}'")
+            tool_name = f"{prefix}{name}"
+            ag.register_handler(tool_name, _make_endpoint_tool(scope, handler))
 
     def cancel(self) -> None:
         """Cancel the process. Triggers cleanup."""
         if self.task is not None:
             self.task.cancel()
+
+
+async def _invoke_in_scope(
+    scope: ProcessScope,
+    handler: Callable[..., Awaitable[Any]],
+    kwargs: dict[str, Any],
+) -> Any:
+    token = _current_process.set(scope)
+    try:
+        return await handler(**kwargs)
+    finally:
+        _current_process.reset(token)
+
+
+def _make_endpoint_tool(
+    scope: ProcessScope,
+    handler: Callable[..., Awaitable[Any]],
+) -> Callable[..., Awaitable[Any]]:
+    @wraps(handler)
+    async def tool(**kwargs: Any) -> Any:
+        return await _invoke_in_scope(scope, handler, kwargs)
+
+    return tool
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +217,7 @@ def agent_process(
 
             if handle is not None:
                 scope.events = handle.events
-                handle._scope = scope
+                handle._bind_scope(scope)
 
             token = _current_process.set(scope)
             try:
@@ -270,15 +324,16 @@ def emit(event_type: str, data: Any = None) -> None:
     scope.events.emit(event_type, data)
 
 
-def public(ag: Agent) -> None:
-    """Expose an agent so the parent process can interact with it."""
-    ag.is_public = True
+def expose(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+    """Register an async function as an endpoint of this process.
 
-
-def client_event(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
-    """Register a handler that the parent process can call via handle.call()."""
+    The parent can invoke it via ``handle.call(name, ...)`` or install it
+    as a tool on an agent via ``handle.attach(agent)``.
+    """
+    if not inspect.iscoroutinefunction(fn):
+        raise TypeError("@expose requires an async function")
     scope = _require_scope()
-    scope.client_handlers[fn.__name__] = fn
+    scope.endpoints[fn.__name__] = fn
     return fn
 
 

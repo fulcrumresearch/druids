@@ -13,14 +13,14 @@ import inspect
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
-from druids.helpers.schema import build_tool_definition
-from druids.log import Log
-from druids.machines import Machine
-from druids.stream import Stream
-from druids.types import ExecResult
+from ramure.helpers.schema import build_tool_definition
+from ramure.log import Log
+from ramure.machines import Machine
+from ramure.stream import Stream
+from ramure.types import ExecResult
 
 if TYPE_CHECKING:
-    from druids.process import ProcessScope
+    from ramure.process import ProcessScope
 
 
 Handler = Callable[..., Awaitable[Any]]
@@ -35,7 +35,6 @@ class Agent:
     handlers: dict[str, Handler] = field(default_factory=dict)
     registered: asyncio.Event = field(default_factory=asyncio.Event)
     scope: "ProcessScope | None" = field(default=None, repr=False)
-    is_public: bool = field(default=False, repr=False)
 
     @property
     def events(self) -> Stream:

@@ -6,18 +6,18 @@ import shlex
 import shutil
 from typing import TYPE_CHECKING
 
-from druids.extension import extension_source
+from ramure.extension import extension_source
 
 if TYPE_CHECKING:
-    from druids.agent import Agent
+    from ramure.agent import Agent
 
 
 def agent_extension_path(execution_id: str, agent_name: str) -> str:
-    return f"/tmp/druids-extension-{execution_id}-{agent_name}.ts"
+    return f"/tmp/ramure-extension-{execution_id}-{agent_name}.ts"
 
 
 def agent_session_name(execution_id: str, agent_name: str) -> str:
-    return f"druids-{execution_id}-{agent_name}"
+    return f"ramure-{execution_id}-{agent_name}"
 
 
 def build_agent_launch_command(
@@ -56,10 +56,10 @@ async def launch_agent(agent: Agent, *, server_url: str, execution_id: str) -> s
     await agent.machine.write_file(extension_path, extension_source())
 
     env = {
-        "DRUIDS_SERVER_URL": server_url,
-        "DRUIDS_EXECUTION_ID": execution_id,
-        "DRUIDS_AGENT_ID": agent.name,
-        "DRUIDS_SYSTEM_PROMPT": agent.system_prompt or "",
+        "RAMURE_SERVER_URL": server_url,
+        "RAMURE_EXECUTION_ID": execution_id,
+        "RAMURE_AGENT_ID": agent.name,
+        "RAMURE_SYSTEM_PROMPT": agent.system_prompt or "",
     }
     session_name = agent_session_name(execution_id, agent.name)
     command = build_agent_launch_command(

@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "druids"
+name = "ramure"
 version = "0.1.0"
 description = "A simpler in-process multi-agent orchestration runtime"
 readme = "README.md"
@@ -14,11 +14,11 @@ dependencies = [
 ]
 
 [project.scripts]
-druids = "druids.cli:app"
+ramure = "ramure.cli:app"
 
 [tool.hatch.build.targets.wheel]
-packages = ["druids"]
-include = ["druids/extension.ts"]
+packages = ["ramure"]
+include = ["ramure/extension.ts"]
 
 [dependency-groups]
 dev = [

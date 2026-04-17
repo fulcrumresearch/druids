@@ -1,8 +1,8 @@
-"""Druids CLI.
+"""Ramure CLI.
 
 Commands talk to a live runtime over its Unix socket at
-``~/.druids/runtimes/{execution_id}.sock``. Finished runs have no
-socket; their logs stay in ``~/.druids/logs/{execution_id}/``.
+``~/.ramure/runtimes/{execution_id}.sock``. Finished runs have no
+socket; their logs stay in ``~/.ramure/logs/{execution_id}/``.
 """
 
 from __future__ import annotations
@@ -16,12 +16,12 @@ from typing import Any
 
 import typer
 
-from druids.control import SOCKET_DIR, socket_path
+from ramure.control import SOCKET_DIR, socket_path
 
 
 app = typer.Typer(
-    name="druids",
-    help="Inspect and interact with druids executions.",
+    name="ramure",
+    help="Inspect and interact with ramure executions.",
     no_args_is_help=True,
     add_completion=False,
 )
@@ -144,7 +144,7 @@ def cmd_connect(agent: str = typer.Argument(...), id_: str = ID_OPT) -> None:
     """Attach to an agent's tmux session."""
     eid = pick(id_)
     info = call(eid, {"cmd": "agent", "name": agent})
-    session = info.get("tmux_session") or f"druids-{eid}-{agent}"
+    session = info.get("tmux_session") or f"ramure-{eid}-{agent}"
     os.execvp("tmux", ["tmux", "attach-session", "-t", session])
 
 

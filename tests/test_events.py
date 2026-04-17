@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
-from druids.stream import Event, Stream
+from ramure.stream import Event, Stream
 
 
 def test_emit_and_iterate() -> None:

@@ -1,6 +1,6 @@
 """Unix-socket control server for CLI interaction.
 
-The runtime listens on ``~/.druids/runtimes/{execution_id}.sock``.
+The runtime listens on ``~/.ramure/runtimes/{execution_id}.sock``.
 The CLI connects, sends one line of JSON, reads one line back, closes.
 
 Commands:
@@ -21,13 +21,13 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from druids.helpers import agent_session_name
+from ramure.helpers import agent_session_name
 
 if TYPE_CHECKING:
-    from druids.runtime import Runtime
+    from ramure.runtime import Runtime
 
 
-SOCKET_DIR = Path.home() / ".druids" / "runtimes"
+SOCKET_DIR = Path.home() / ".ramure" / "runtimes"
 
 
 def socket_path(execution_id: str) -> Path:
