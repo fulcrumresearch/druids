@@ -27,7 +27,6 @@ async def worker_pool() -> str:
     async def submit_task(task: str) -> str:
         """Create a fresh worker to handle a task. Returns the worker name."""
         w = await agent(f"worker-{uuid.uuid4().hex[:8]}")
-        expose(w)
         await w.send(f"Do this: {task}")
         return w.name
 

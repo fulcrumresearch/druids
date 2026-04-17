@@ -399,21 +399,6 @@ def test_emit_shows_on_process_events() -> None:
 # expose / endpoints / attach
 # ---------------------------------------------------------------------------
 
-def test_expose_agent_marks_public(tmp_path: Path, monkeypatch) -> None:
-    async def run() -> None:
-        runtime, scope, token = await _setup_runtime(tmp_path, monkeypatch)
-        try:
-            a = await agent("alice")
-            assert a.is_public is False
-            returned = expose(a)
-            assert returned is a
-            assert a.is_public is True
-        finally:
-            await _teardown_runtime(runtime, scope, token)
-
-    asyncio.run(run())
-
-
 def test_expose_function_registers_endpoint() -> None:
     async def run() -> None:
         @agent_process(image=LocalImage())
@@ -446,9 +431,7 @@ def test_expose_rejects_non_async_function() -> None:
         @agent_process(image=LocalImage())
         async def proc():
             with pytest.raises(TypeError):
-                expose(lambda: None)          # not async, not an Agent
-            with pytest.raises(TypeError):
-                expose(42)
+                expose(lambda: None)          # not async
             done(None)
             return await wait()
 

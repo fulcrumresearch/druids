@@ -107,10 +107,11 @@ async def main():
 
 Processes can emit custom events with `emit(type, data)`. Agent event logs are also async-iterable via `agent.events`.
 
-### Exposed agents and endpoints
+### Endpoints
 
-A process can expose agents and endpoints to its parent. The parent can
-call endpoints directly, or attach them to an agent as tools.
+A process can expose endpoints to its parent. The parent can call them
+directly, or attach them to an agent as tools. A child's agents are
+available to the parent via ``handle.agents`` without any extra step.
 
 ```python
 @agent_process
@@ -118,7 +119,6 @@ async def worker_pool():
     @expose
     async def submit_task(task: str) -> str:
         w = await agent(f"worker-{uuid.uuid4().hex[:8]}")
-        expose(w)
         await w.send(f"Do: {task}")
         return w.name
 
@@ -161,8 +161,7 @@ Endpoints run inside the child process's scope, so calls to `emit`,
 - `await wait()` — block until `done()` or `fail()`
 - `emit(type, data)` — emit a process event
 - `spawn(fn, *args, **kwargs)` — run a process in background, returns `ProcessHandle`
-- `expose(agent)` — expose an agent to the parent (available via `handle.agents`)
-- `@expose` on an async function — register an endpoint callable via `handle.call()` or attachable via `handle.attach()`
+- `@expose` — register an async function as an endpoint callable via `handle.call()` or attachable via `handle.attach()`
 - `current_runtime()` — access the runtime (rarely needed)
 
 ### Agent methods
@@ -175,7 +174,7 @@ Endpoints run inside the child process's scope, so calls to `emit`,
 ### ProcessHandle
 
 - `handle.events` — async-iterable stream of process events
-- `handle.agents` — dict of exposed agents
+- `handle.agents` — dict of the child's agents
 - `await handle.call(name, **kwargs)` — call an endpoint
 - `await handle.attach(agent, only=, prefix=)` — register endpoints as tools on an agent
 - `handle.cancel()` — cancel the process

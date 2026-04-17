@@ -112,10 +112,10 @@ class ProcessHandle:
 
     @property
     def agents(self) -> dict[str, Agent]:
-        """Exposed agents from the child process (populated once it starts)."""
+        """Agents owned by the child process (populated once it starts)."""
         if self._scope is None:
             return {}
-        return {ag.name: ag for ag in self._scope.agents if ag.is_public}
+        return {ag.name: ag for ag in self._scope.agents}
 
     async def call(self, name: str, **kwargs: Any) -> Any:
         """Call an endpoint defined by the child process via ``@expose``."""
@@ -324,27 +324,17 @@ def emit(event_type: str, data: Any = None) -> None:
     scope.events.emit(event_type, data)
 
 
-def expose(target: Any) -> Any:
-    """Expose something from this process to its parent.
+def expose(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+    """Register an async function as an endpoint of this process.
 
-    Two forms:
-
-    * ``expose(agent)`` — mark an agent as accessible via ``handle.agents``.
-    * ``@expose`` on an async function — register an endpoint callable via
-      ``handle.call(name, ...)`` or attachable as an agent tool via
-      ``handle.attach(agent)``.
+    The parent can invoke it via ``handle.call(name, ...)`` or install it
+    as a tool on an agent via ``handle.attach(agent)``.
     """
-    if isinstance(target, Agent):
-        target.is_public = True
-        return target
-    if inspect.iscoroutinefunction(target):
-        scope = _require_scope()
-        scope.endpoints[target.__name__] = target
-        return target
-    raise TypeError(
-        "expose() takes an Agent or an async function; "
-        f"got {type(target).__name__}"
-    )
+    if not inspect.iscoroutinefunction(fn):
+        raise TypeError("@expose requires an async function")
+    scope = _require_scope()
+    scope.endpoints[fn.__name__] = fn
+    return fn
 
 
 def spawn(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> ProcessHandle:
