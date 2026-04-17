@@ -1,7 +1,7 @@
-from druids.agent import Agent
-from druids.log import Log, LogEntry
-from druids.machines import Image, LocalImage, LocalMachine, Machine
-from druids.process import (
+from ramure.agent import Agent
+from ramure.log import Log, LogEntry
+from ramure.machines import Image, LocalImage, LocalMachine, Machine
+from ramure.process import (
     ProcessHandle,
     ProcessScope,
     agent,
@@ -16,9 +16,9 @@ from druids.process import (
     spawn,
     wait,
 )
-from druids.runtime import Runtime
-from druids.stream import Event, Stream
-from druids.types import ExecResult, ExecutionFailed
+from ramure.runtime import Runtime
+from ramure.stream import Event, Stream
+from ramure.types import ExecResult, ExecutionFailed
 
 __all__ = [
     "Agent",

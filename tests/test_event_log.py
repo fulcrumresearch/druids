@@ -5,8 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from druids.log import Log, LogEntry
-from druids.stream import Event
+from ramure.log import Log, LogEntry
+from ramure.stream import Event
 
 
 def test_emit_assigns_sequential_ids() -> None:

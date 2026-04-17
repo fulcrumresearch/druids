@@ -26,8 +26,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from druids.stream import Event, Stream
-from druids.types import to_jsonable
+from ramure.stream import Event, Stream
+from ramure.types import to_jsonable
 
 
 Subscriber = Callable[["LogEntry"], Awaitable[None]]

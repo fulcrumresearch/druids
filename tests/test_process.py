@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from druids import LocalImage, Runtime
-from druids.process import (
+from ramure import LocalImage, Runtime
+from ramure.process import (
     ProcessHandle,
     ProcessScope,
     _current_process,
@@ -22,7 +22,7 @@ from druids.process import (
     spawn,
     wait,
 )
-from druids.stream import Stream
+from ramure.stream import Stream
 from tests.helpers import FakeAgentClient, disable_agent_launch, wait_for_server
 
 
@@ -97,7 +97,7 @@ def test_fail_and_wait(tmp_path: Path, monkeypatch) -> None:
             try:
                 await asyncio.to_thread(client.register)
                 await asyncio.to_thread(client.tool_call, "abort", {"reason": "bad input"})
-                from druids.types import ExecutionFailed
+                from ramure.types import ExecutionFailed
                 with pytest.raises(ExecutionFailed, match="bad input"):
                     await wait()
             finally:
@@ -190,7 +190,7 @@ def test_agent_process_emits_done_event() -> None:
         # Simulate spawn by setting handle
         token = _current_process.set(None)
         spawn_token = None
-        from druids.process import _spawn_handle
+        from ramure.process import _spawn_handle
         spawn_token = _spawn_handle.set(handle)
         try:
             await my_process()
@@ -239,7 +239,7 @@ def test_scope_tracks_machines(tmp_path: Path, monkeypatch) -> None:
             assert len(scope.machines) == 1
 
             # agent() with explicit machine does NOT add to scope.machines
-            from druids import machine as create_machine
+            from ramure import machine as create_machine
             m = await create_machine()
             machines_before = len(scope.machines)
             b = await agent("worker2", machine=m)

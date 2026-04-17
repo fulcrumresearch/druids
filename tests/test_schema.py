@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from druids.helpers.schema import build_tool_definition
+from ramure.helpers.schema import build_tool_definition
 
 
 def test_build_tool_definition_uses_docstring_and_types() -> None:

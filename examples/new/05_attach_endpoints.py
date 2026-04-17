@@ -9,7 +9,7 @@ call ``submit_task`` like any other tool.
 import asyncio
 import uuid
 
-from druids import (
+from ramure import (
     LocalImage,
     agent,
     agent_process,

@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Mapping
 
-from druids.types import ExecResult
+from ramure.types import ExecResult
 
 
 def _decode(data: bytes | None) -> str:

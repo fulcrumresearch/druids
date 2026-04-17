@@ -16,16 +16,16 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Awaitable, Callable, ParamSpec, TypeVar
 
-from druids.agent import Agent
-from druids.context import _current_process
-from druids.helpers import kill_agent
-from druids.machines import Image, LocalImage, Machine
-from druids.runtime import Runtime
-from druids.stream import Stream
-from druids.types import ExecutionFailed
+from ramure.agent import Agent
+from ramure.context import _current_process
+from ramure.helpers import kill_agent
+from ramure.machines import Image, LocalImage, Machine
+from ramure.runtime import Runtime
+from ramure.stream import Stream
+from ramure.types import ExecutionFailed
 
 _spawn_handle: ContextVar["ProcessHandle | None"] = ContextVar(
-    "druids_spawn_handle", default=None
+    "ramure_spawn_handle", default=None
 )
 
 P = ParamSpec("P")

@@ -8,9 +8,9 @@ from pathlib import Path
 
 import pytest
 
-from druids import LocalImage, Runtime
-from druids.control import socket_path
-from druids.process import ProcessScope, _current_process, agent, connect
+from ramure import LocalImage, Runtime
+from ramure.control import socket_path
+from ramure.process import ProcessScope, _current_process, agent, connect
 from tests.helpers import disable_agent_launch
 
 
@@ -21,7 +21,7 @@ def isolated_socket_dir(tmp_path_factory, monkeypatch):
     import tempfile
 
     d = Path(tempfile.mkdtemp(prefix="drudtest-"))
-    monkeypatch.setattr("druids.control.SOCKET_DIR", d)
+    monkeypatch.setattr("ramure.control.SOCKET_DIR", d)
     yield d
     import shutil
 

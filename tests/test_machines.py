@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from druids import LocalImage
+from ramure import LocalImage
 
 
 def test_local_image_machine_exec_and_files(tmp_path: Path) -> None:

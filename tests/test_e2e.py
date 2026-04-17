@@ -31,7 +31,7 @@ import asyncio
 import logging, sys
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 
-from druids import LocalImage, agent, agent_process, done, wait
+from ramure import LocalImage, agent, agent_process, done, wait
 
 @agent_process(image=LocalImage(), timeout=60)
 async def run_agents():
@@ -44,7 +44,7 @@ async def run_agents():
         return "Done."
 
     await worker.send(
-        "Call the finish tool with result='hello-druids'. Do not say anything else, just call the tool immediately."
+        "Call the finish tool with result='hello-ramure'. Do not say anything else, just call the tool immediately."
     )
     return await wait()
 
@@ -60,7 +60,7 @@ def test_single_agent_tool_call():
     """Single agent receives a message, calls a tool, and done() ends the run."""
     proc = _run_program(SINGLE_AGENT, timeout=90)
     assert proc.returncode == 0, f"Failed:\nSTDOUT: {proc.stdout}\nSTDERR: {proc.stderr}"
-    assert "RESULT:hello-druids" in proc.stdout
+    assert "RESULT:hello-ramure" in proc.stdout
 
 
 TWO_AGENTS = '''
@@ -68,7 +68,7 @@ import asyncio
 import logging, sys
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 
-from druids import LocalImage, agent, agent_process, connect, done, wait
+from ramure import LocalImage, agent, agent_process, connect, done, wait
 
 @agent_process(image=LocalImage(), timeout=90)
 async def run_agents():
@@ -118,7 +118,7 @@ import asyncio
 import logging, sys
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 
-from druids import ExecutionFailed, LocalImage, agent, agent_process, fail, wait
+from ramure import ExecutionFailed, LocalImage, agent, agent_process, fail, wait
 
 @agent_process(image=LocalImage(), timeout=60)
 async def run_agents():

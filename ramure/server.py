@@ -19,11 +19,11 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 import websockets
 
-from druids.types import ToolCallError, to_jsonable
+from ramure.types import ToolCallError, to_jsonable
 
 if TYPE_CHECKING:
-    from druids.log import Log, LogEntry
-    from druids.runtime import Runtime
+    from ramure.log import Log, LogEntry
+    from ramure.runtime import Runtime
 
 Send = Callable[["LogEntry"], Awaitable[None]]
 
