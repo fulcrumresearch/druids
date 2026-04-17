@@ -17,6 +17,7 @@ from druids.process import (
     connect,
     done,
     emit,
+    expose,
     fail,
     spawn,
     wait,
@@ -390,6 +391,251 @@ def test_emit_shows_on_process_events() -> None:
             return "ok"
 
         assert await outer() == "ok"
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# expose / endpoints / attach
+# ---------------------------------------------------------------------------
+
+def test_expose_agent_marks_public(tmp_path: Path, monkeypatch) -> None:
+    async def run() -> None:
+        runtime, scope, token = await _setup_runtime(tmp_path, monkeypatch)
+        try:
+            a = await agent("alice")
+            assert a.is_public is False
+            returned = expose(a)
+            assert returned is a
+            assert a.is_public is True
+        finally:
+            await _teardown_runtime(runtime, scope, token)
+
+    asyncio.run(run())
+
+
+def test_expose_function_registers_endpoint() -> None:
+    async def run() -> None:
+        @agent_process(image=LocalImage())
+        async def inner():
+            @expose
+            async def add(a: int, b: int) -> int:
+                return a + b
+
+            emit("ready", None)
+            return await wait()
+
+        @agent_process(image=LocalImage())
+        async def outer():
+            handle = spawn(inner)
+            # Wait for the endpoint to be registered.
+            async for event in handle.events:
+                if event.type == "ready":
+                    break
+            assert await handle.call("add", a=2, b=3) == 5
+            handle.cancel()
+            return "ok"
+
+        assert await outer() == "ok"
+
+    asyncio.run(run())
+
+
+def test_expose_rejects_non_async_function() -> None:
+    async def run() -> None:
+        @agent_process(image=LocalImage())
+        async def proc():
+            with pytest.raises(TypeError):
+                expose(lambda: None)          # not async, not an Agent
+            with pytest.raises(TypeError):
+                expose(42)
+            done(None)
+            return await wait()
+
+        await proc()
+
+    asyncio.run(run())
+
+
+def test_call_awaits_scope_ready() -> None:
+    """handle.call() before the spawned task has started should not race."""
+    async def run() -> None:
+        started = asyncio.Event()
+
+        @agent_process(image=LocalImage())
+        async def inner():
+            @expose
+            async def ping() -> str:
+                return "pong"
+
+            started.set()
+            return await wait()
+
+        @agent_process(image=LocalImage())
+        async def outer():
+            handle = spawn(inner)
+            # Call immediately, before the inner task has run.
+            assert not started.is_set()
+            result = await handle.call("ping")
+            assert result == "pong"
+            handle.cancel()
+            return "ok"
+
+        assert await outer() == "ok"
+
+    asyncio.run(run())
+
+
+def test_call_unknown_endpoint_raises() -> None:
+    async def run() -> None:
+        @agent_process(image=LocalImage())
+        async def inner():
+            return await wait()
+
+        @agent_process(image=LocalImage())
+        async def outer():
+            handle = spawn(inner)
+            with pytest.raises(ValueError, match="No endpoint"):
+                await handle.call("nope")
+            handle.cancel()
+            return "ok"
+
+        assert await outer() == "ok"
+
+    asyncio.run(run())
+
+
+def test_endpoint_runs_in_child_scope() -> None:
+    """emit() inside an endpoint goes to the child's stream, not the caller's."""
+    async def run() -> None:
+        @agent_process(image=LocalImage())
+        async def inner():
+            @expose
+            async def tick() -> str:
+                emit("tick", {"n": 1})
+                return "ok"
+
+            emit("ready", None)
+            return await wait()
+
+        @agent_process(image=LocalImage())
+        async def outer():
+            handle = spawn(inner)
+            async for event in handle.events:
+                if event.type == "ready":
+                    break
+            await handle.call("tick")
+            # The "tick" event should appear on the child's stream.
+            saw_tick = False
+            async for event in handle.events:
+                if event.type == "tick":
+                    saw_tick = True
+                    break
+            assert saw_tick
+            handle.cancel()
+            return "ok"
+
+        assert await outer() == "ok"
+
+    asyncio.run(run())
+
+
+def test_attach_registers_endpoints_as_tools(tmp_path: Path, monkeypatch) -> None:
+    """handle.attach(agent) should install endpoints as invokable tools."""
+    async def run() -> None:
+        runtime, scope, token = await _setup_runtime(tmp_path, monkeypatch)
+        try:
+            @agent_process(image=LocalImage())
+            async def pool():
+                @expose
+                async def add(a: int, b: int) -> int:
+                    return a + b
+
+                @expose
+                async def echo(msg: str) -> str:
+                    return msg
+
+                emit("ready", None)
+                return await wait()
+
+            handle = spawn(pool)
+            # Wait until endpoints are registered.
+            async for event in handle.events:
+                if event.type == "ready":
+                    break
+
+            dispatcher = await agent("dispatcher")
+            await handle.attach(dispatcher)
+            assert "add" in dispatcher.handlers
+            assert "echo" in dispatcher.handlers
+
+            # Tool handlers route into the child scope and return correctly.
+            assert await dispatcher.handlers["add"](a=2, b=3) == 5
+            assert await dispatcher.handlers["echo"](msg="hi") == "hi"
+
+            handle.cancel()
+        finally:
+            await _teardown_runtime(runtime, scope, token)
+
+    asyncio.run(run())
+
+
+def test_attach_respects_only_and_prefix(tmp_path: Path, monkeypatch) -> None:
+    async def run() -> None:
+        runtime, scope, token = await _setup_runtime(tmp_path, monkeypatch)
+        try:
+            @agent_process(image=LocalImage())
+            async def pool():
+                @expose
+                async def submit_task(task: str) -> str:
+                    return task
+
+                @expose
+                async def cancel_task(task_id: str) -> str:
+                    return task_id
+
+                emit("ready", None)
+                return await wait()
+
+            handle = spawn(pool)
+            async for event in handle.events:
+                if event.type == "ready":
+                    break
+
+            dispatcher = await agent("dispatcher")
+            await handle.attach(dispatcher, only=["submit_task"], prefix="pool_")
+            assert "pool_submit_task" in dispatcher.handlers
+            assert "pool_cancel_task" not in dispatcher.handlers
+            assert "submit_task" not in dispatcher.handlers
+
+            handle.cancel()
+        finally:
+            await _teardown_runtime(runtime, scope, token)
+
+    asyncio.run(run())
+
+
+def test_attach_unknown_endpoint_raises(tmp_path: Path, monkeypatch) -> None:
+    async def run() -> None:
+        runtime, scope, token = await _setup_runtime(tmp_path, monkeypatch)
+        try:
+            @agent_process(image=LocalImage())
+            async def pool():
+                emit("ready", None)
+                return await wait()
+
+            handle = spawn(pool)
+            async for event in handle.events:
+                if event.type == "ready":
+                    break
+
+            dispatcher = await agent("dispatcher")
+            with pytest.raises(ValueError, match="No endpoint"):
+                await handle.attach(dispatcher, only=["ghost"])
+
+            handle.cancel()
+        finally:
+            await _teardown_runtime(runtime, scope, token)
 
     asyncio.run(run())
 
