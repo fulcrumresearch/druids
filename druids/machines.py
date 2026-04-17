@@ -4,7 +4,7 @@ import asyncio
 import os
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 
 from druids.types import ExecResult
 
@@ -32,6 +32,10 @@ class Machine(ABC):
     async def stop(self) -> None:
         raise NotImplementedError
 
+    def describe(self) -> dict[str, Any]:
+        """JSON-safe summary for logging. Subclasses extend as needed."""
+        return {"kind": type(self).__name__}
+
 
 class Image(ABC):
     """A snapshot that can spawn into a running machine."""
@@ -48,6 +52,9 @@ class LocalMachine(Machine):
         self.workdir = Path(workdir or os.getcwd())
         self.env = dict(env or {})
         self.workdir.mkdir(parents=True, exist_ok=True)
+
+    def describe(self) -> dict[str, Any]:
+        return {"kind": "LocalMachine", "workdir": str(self.workdir)}
 
     def _resolve_path(self, path: str) -> Path:
         target = Path(path)

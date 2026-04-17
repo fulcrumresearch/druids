@@ -1,14 +1,17 @@
 """The ``Runtime``: server, agent registry, and tool dispatch.
 
 One ``Runtime`` is created per root ``@agent_process`` invocation. It
-owns the WebSocket server that agents connect to, the map of agent
-records (keyed by agent name), and the edge set that authorizes
-inter-agent messages.
+owns the WebSocket server that agents connect to, the map of agents
+(keyed by name), the edge set that authorizes inter-agent messages, and
+a runtime-level ``Log`` recording execution-scope events (agent
+lifecycle, connections, machine info).
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -37,19 +40,43 @@ class Runtime:
         self.edges: set[tuple[str, str]] = set()
         self.log_dir_root = Path(log_dir) if log_dir else None
         self.server_instance: Server | None = None
+        self.log: Log | None = None  # runtime-scope log; set in start()
+        self.started_at: float | None = None
 
     async def start(self) -> None:
         self.execution_id = str(uuid.uuid4())
+        self.started_at = time.time()
+
+        log_path: Path | None = None
+        if self.log_dir_root is not None:
+            log_path = self.log_dir_root / self.execution_id / "_runtime.jsonl"
+        self.log = Log(path=log_path)
+
         self.server_instance = Server(self)
         await self.server_instance.start()
         self.server_url = f"ws://127.0.0.1:{self.server_instance.port}"
 
+        self.log.emit(
+            "execution_started",
+            {
+                "execution_id": self.execution_id,
+                "server_url": self.server_url,
+                "pid": os.getpid(),
+                "started_at": self.started_at,
+            },
+        )
+
     async def close(self) -> None:
+        if self.log is not None:
+            self.log.emit("execution_ended", {"execution_id": self.execution_id})
+            self.log.close()
+            self.log = None
         if self.server_instance is not None:
             await self.server_instance.stop()
             self.server_instance = None
         self.server_url = None
         self.execution_id = None
+        self.started_at = None
 
     # -- Agent creation (called by ambient agent()) --
 
@@ -91,7 +118,15 @@ class Runtime:
 
         self.agents[name] = ag
         self._register_builtins(ag)
-        ag.log.emit("agent_created", {"agent": name})
+        if self.log is not None:
+            self.log.emit(
+                "agent_created",
+                {
+                    "agent": name,
+                    "machine": resolved_machine.describe(),
+                    "system_prompt": bool(system_prompt),
+                },
+            )
 
         try:
             await self.spawn_agent(ag)
@@ -142,6 +177,11 @@ class Runtime:
         self.edges.add((a.name, b.name))
         if direction == "both":
             self.edges.add((b.name, a.name))
+        if self.log is not None:
+            self.log.emit(
+                "connection_added",
+                {"a": a.name, "b": b.name, "direction": direction},
+            )
 
     # -- Agent spawn / registration --
 
@@ -164,10 +204,11 @@ class Runtime:
         session_name = await _launch_agent_impl(
             agent, server_url=server_url, execution_id=self.execution_id or ""
         )
-        agent.log.emit(
-            "agent_spawned",
-            {"agent": agent.name, "tmux_session": session_name},
-        )
+        if self.log is not None:
+            self.log.emit(
+                "agent_spawned",
+                {"agent": agent.name, "tmux_session": session_name},
+            )
         return True
 
     def register_agent(self, agent_id: str, execution_id: str) -> list[dict[str, Any]]:

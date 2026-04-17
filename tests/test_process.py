@@ -272,11 +272,16 @@ def test_agent_events_stream(tmp_path: Path, monkeypatch) -> None:
                 await asyncio.to_thread(client.register)
                 await asyncio.to_thread(client.tool_call, "ping")
 
-                # Check that events appeared in the agent's event stream
-                types = [e.type for e in worker.events.snapshot()]
-                assert "agent_created" in types
-                assert "tool_call" in types
-                assert "tool_result" in types
+                # Agent-scope events live on the agent's own log.
+                agent_types = [e.type for e in worker.events.snapshot()]
+                assert "tool_call" in agent_types
+                assert "tool_result" in agent_types
+
+                # Runtime-scope events (agent lifecycle, connections)
+                # live on the runtime log.
+                runtime_types = [e.type for e in runtime.log.stream.snapshot()]
+                assert "execution_started" in runtime_types
+                assert "agent_created" in runtime_types
             finally:
                 await asyncio.to_thread(client.close)
         finally:

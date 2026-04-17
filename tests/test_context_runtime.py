@@ -337,3 +337,55 @@ def test_register_validates_execution_id(tmp_path: Path, monkeypatch) -> None:
             await _teardown(runtime, scope, token)
 
     asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Runtime log
+# ---------------------------------------------------------------------------
+
+
+def test_runtime_log_records_lifecycle_and_structure(tmp_path: Path, monkeypatch) -> None:
+    """The runtime log captures execution_started, agent_created,
+    agent_spawned, connection_added, and execution_ended."""
+    async def run() -> None:
+        runtime = Runtime(log_dir=tmp_path / "logs")
+        await runtime.start()
+        scope = ProcessScope(parent=None, runtime=runtime, image=LocalImage(tmp_path))
+        token = _current_process.set(scope)
+        disable_agent_launch(runtime, monkeypatch)
+        try:
+            assert runtime.log is not None
+
+            a = await agent("alpha")
+            b = await agent("beta")
+            connect(a, b)
+
+            entries = runtime.log.after(0)
+            types = [e.type for e in entries]
+            assert types[0] == "execution_started"
+            assert "agent_created" in types
+            assert "connection_added" in types
+            # `agent_spawned` would appear after a real launch; tests
+            # using ``disable_agent_launch`` skip that path.
+
+            # agent_created carries machine.describe() info
+            created = next(e for e in entries if e.type == "agent_created" and e.data["agent"] == "alpha")
+            assert created.data["machine"]["kind"] == "LocalMachine"
+
+            # connection_added carries the edge
+            conn = next(e for e in entries if e.type == "connection_added")
+            assert {conn.data["a"], conn.data["b"]} == {"alpha", "beta"}
+            assert conn.data["direction"] == "both"
+        finally:
+            await scope.cleanup()
+            await runtime.close()
+            _current_process.reset(token)
+
+        # After close, the runtime log is persisted on disk.
+        log_files = list((tmp_path / "logs").rglob("_runtime.jsonl"))
+        assert len(log_files) == 1
+        content = log_files[0].read_text().splitlines()
+        assert any('"execution_started"' in line for line in content)
+        assert any('"execution_ended"' in line for line in content)
+
+    asyncio.run(run())
