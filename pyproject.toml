@@ -10,7 +10,11 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "websockets>=13.0",
+    "typer>=0.12",
 ]
+
+[project.scripts]
+druids = "druids.cli:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["druids"]

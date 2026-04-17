@@ -18,12 +18,16 @@ from typing import Any
 
 from druids.agent import Agent
 from druids.context import _current_process
+from druids.control import ControlServer
 from druids.helpers import agent_session_name, build_tool_definition
 from druids.helpers import launch_agent as _launch_agent_impl
 from druids.log import Log
 from druids.machines import Image, Machine
 from druids.server import Server
 from druids.types import ToolCallError
+
+
+DEFAULT_LOG_DIR = Path.home() / ".druids" / "logs"
 
 
 class Runtime:
@@ -38,23 +42,25 @@ class Runtime:
         self.server_url: str | None = None
         self.agents: dict[str, Agent] = {}
         self.edges: set[tuple[str, str]] = set()
-        self.log_dir_root = Path(log_dir) if log_dir else None
+        self.log_dir_root = Path(log_dir) if log_dir else DEFAULT_LOG_DIR
         self.server_instance: Server | None = None
         self.log: Log | None = None  # runtime-scope log; set in start()
         self.started_at: float | None = None
+        self.control: ControlServer | None = None
 
     async def start(self) -> None:
         self.execution_id = str(uuid.uuid4())
         self.started_at = time.time()
 
-        log_path: Path | None = None
-        if self.log_dir_root is not None:
-            log_path = self.log_dir_root / self.execution_id / "_runtime.jsonl"
+        log_path = self.log_dir_root / self.execution_id / "_runtime.jsonl"
         self.log = Log(path=log_path)
 
         self.server_instance = Server(self)
         await self.server_instance.start()
         self.server_url = f"ws://127.0.0.1:{self.server_instance.port}"
+
+        self.control = ControlServer(self)
+        await self.control.start()
 
         self.log.emit(
             "execution_started",
@@ -67,6 +73,9 @@ class Runtime:
         )
 
     async def close(self) -> None:
+        if self.control is not None:
+            await self.control.stop()
+            self.control = None
         if self.log is not None:
             self.log.emit("execution_ended", {"execution_id": self.execution_id})
             self.log.close()
