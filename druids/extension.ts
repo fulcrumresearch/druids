@@ -173,17 +173,32 @@ function registerRemoteTool(pi: ExtensionAPI, tool: RemoteTool, registeredTools:
 
 // -- Log entry handling --
 
+// Replication contract (see spec-replication.md):
+// - Server assigns ``seq`` strictly monotonically.
+// - Client applies entries in strict seq order (``lastSeq + 1`` only).
+// - Gaps trigger a resync. Duplicates are dropped.
+// This makes the client self-heal from any out-of-order or lost delivery
+// on the server side.
+
 function handleLogEntry(
   entry: LogEntry,
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   registeredTools: Set<string>,
 ): boolean {
-  // Defensive: ignore anything we've already seen (e.g. a sync replay
-  // that overlaps entries delivered while the sync was in flight).
   if (entry.seq <= lastSeq) {
+    // Already applied. Server shouldn't produce these, but ignore defensively.
     return false;
   }
+
+  if (entry.seq > lastSeq + 1) {
+    // Gap detected: some entry in (lastSeq, entry.seq) is missing. Request
+    // a resync and drop this entry; it will be re-sent in order by the
+    // server's ``log.after(lastSeq)`` reply.
+    sendSync();
+    return false;
+  }
+
   entries.push(entry);
   lastSeq = entry.seq;
 
