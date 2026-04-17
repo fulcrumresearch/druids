@@ -161,3 +161,22 @@ worker = handle.agents[name]
 - `handle.agents` — dict of public agents
 - `handle.call(name, **kwargs)` — call a client event handler
 - `handle.cancel()` — cancel the process
+
+## CLI
+
+Running an `@agent_process` opens a Unix socket at
+`~/.druids/runtimes/{execution_id}.sock` and writes a per-run log tree
+under `~/.druids/logs/{execution_id}/`. The `druids` CLI uses these:
+
+```
+druids ls                         # live runs
+druids status [--id <prefix>]     # agents, machines, connections (live)
+druids send <agent> <msg> [--id <prefix>]
+druids connect <agent> [--id <prefix>]  # tmux attach
+druids ssh <agent> [--id <prefix>]      # shell on the agent's machine
+druids logs [--id <prefix>] [--agent X] # path of a log file (live or finished)
+```
+
+`--id` takes an execution-id prefix. Omit when there's one live run.
+`status`, `send`, `connect`, and `ssh` require the run to be live
+(socket present). `logs` works on both live and finished runs.
