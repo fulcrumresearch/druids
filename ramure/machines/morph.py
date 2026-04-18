@@ -1,0 +1,441 @@
+"""MorphCloud backend.
+
+Adapted from ``druids_server.lib.sandbox.morph`` in
+github.com/fulcrumresearch/druids (the production-grade server-side
+MorphCloud Sandbox), fitted to codex-druids' lightweight
+``Machine`` / ``Image`` interface.
+
+The ``morphcloud`` SDK is imported lazily so it stays an optional extra
+(``pip install ramure[morph]``).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import logging
+import os
+import posixpath
+import tempfile
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Mapping
+
+from ramure.machines.base import Image, Machine, SSHCredentials
+from ramure.types import ExecResult
+
+if TYPE_CHECKING:
+    from morphcloud.api import Instance, MorphCloudClient
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Default "pi-ready" recipe
+# ---------------------------------------------------------------------------
+
+#: Shell recipe used by ``MorphImage()`` when no ``recipe`` / ``snapshot_id``
+#: is provided. Installs node, tmux, pi + pi-coding-agent, uv, gh, and a
+#: non-root ``agent`` user that can sudo -- everything druids needs on the
+#: VM to launch an agent. Adapted from the ``_DRUIDS_BASE_RECIPE`` in
+#: fulcrumresearch/druids.
+DEFAULT_MORPH_RECIPE = """\
+set -e
+apt-get update && apt-get install -y git curl ca-certificates sudo vim tmux python3-pip
+curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
+apt-get install -y nodejs
+
+# uv for Python package management
+curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+
+# GitHub CLI
+curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+apt-get update && apt-get install -y gh
+
+# pi coding agent (ships the `pi` CLI druids uses to launch agents) + claude-code
+npm install -g @anthropic-ai/claude-code@latest @mariozechner/pi-coding-agent@latest
+
+# Non-root user with passwordless sudo (druids launches agents as `agent`)
+useradd -m -s /bin/bash agent
+echo 'agent ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/agent
+chmod 440 /etc/sudoers.d/agent
+
+# Flush filesystem buffers so the resulting snapshot sees all written files
+sync
+"""
+
+#: Version tag bumped whenever ``DEFAULT_MORPH_RECIPE`` changes in a way that
+#: requires rebuilding the snapshot.
+DEFAULT_MORPH_RECIPE_VERSION = "druids-codex-agent-v1"
+
+
+# ---------------------------------------------------------------------------
+# Client pool + retry
+# ---------------------------------------------------------------------------
+
+_CLIENTS: list["MorphCloudClient"] = []
+_CLIENT_IDX: int = 0
+_POOL_SIZE = int(os.environ.get("MORPH_CLIENT_POOL_SIZE", "4"))
+
+
+def _get_client(api_key: str | None = None) -> "MorphCloudClient":
+    """Round-robin a pool of MorphCloud clients.
+
+    Each client has its own httpx connection pool; spreading work across
+    several prevents a single pool from becoming a bottleneck under high
+    concurrency. The ``morphcloud`` package is imported here so it stays
+    an optional dependency.
+    """
+    global _CLIENT_IDX
+    try:
+        from morphcloud.api import MorphCloudClient
+    except ImportError as exc:  # pragma: no cover - exercised by extras tests
+        raise ImportError(
+            "The MorphCloud backend requires the 'morphcloud' package. "
+            "Install it with `pip install ramure[morph]` or `pip install morphcloud`."
+        ) from exc
+
+    if not _CLIENTS:
+        for _ in range(_POOL_SIZE):
+            _CLIENTS.append(
+                MorphCloudClient(api_key=api_key) if api_key else MorphCloudClient()
+            )
+    client = _CLIENTS[_CLIENT_IDX % len(_CLIENTS)]
+    _CLIENT_IDX += 1
+    return client
+
+
+async def _retry(fn, retries: int = 3, backoff: float = 1.0):
+    """Retry a MorphCloud API call on 502/503/timeout."""
+    from morphcloud.api import ApiError
+
+    for attempt in range(retries):
+        try:
+            return await fn()
+        except ApiError as exc:
+            if exc.status_code in (502, 503) and attempt < retries - 1:
+                logger.warning(
+                    "MorphCloud %d, retry %d/%d", exc.status_code, attempt + 1, retries
+                )
+                await asyncio.sleep(backoff * (attempt + 1))
+                continue
+            raise
+        except (TimeoutError, OSError) as exc:
+            if attempt < retries - 1:
+                logger.warning(
+                    "MorphCloud %s, retry %d/%d",
+                    type(exc).__name__,
+                    attempt + 1,
+                    retries,
+                )
+                await asyncio.sleep(backoff * (attempt + 1))
+                continue
+            raise
+
+
+def _shell_quote(s: str) -> str:
+    """Quote a string for embedding in ``bash -c '...'``."""
+    return "'" + s.replace("'", "'\"'\"'") + "'"
+
+
+# ---------------------------------------------------------------------------
+# MorphMachine
+# ---------------------------------------------------------------------------
+
+
+class MorphMachine(Machine):
+    """Machine backed by a MorphCloud VM instance."""
+
+    def __init__(
+        self,
+        instance: "Instance",
+        *,
+        workdir: str | None = None,
+    ) -> None:
+        self._instance = instance
+        self.instance_id = instance.id
+        self.workdir = workdir
+
+    # -- factories ---------------------------------------------------------
+
+    @classmethod
+    async def attach(
+        cls,
+        instance_id: str,
+        *,
+        api_key: str | None = None,
+        workdir: str | None = None,
+    ) -> "MorphMachine":
+        """Attach to an existing MorphCloud instance without booting a new one."""
+        client = _get_client(api_key)
+        instance = await client.instances.aget(instance_id)
+        return cls(instance, workdir=workdir)
+
+    # -- Machine interface -------------------------------------------------
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "kind": "MorphMachine",
+            "instance_id": self.instance_id,
+            "workdir": self.workdir,
+        }
+
+    def _resolve_path(self, path: str) -> str:
+        if posixpath.isabs(path):
+            return posixpath.normpath(path)
+        base = self.workdir or "/"
+        return posixpath.normpath(posixpath.join(base, path))
+
+    async def exec(
+        self,
+        command: str,
+        *,
+        user: str = "agent",
+        timeout: int | None = None,
+    ) -> ExecResult:
+        await self._ensure_running()
+        if user and user != "root":
+            wrapped = f"sudo -u {user} bash -c {_shell_quote(command)}"
+        else:
+            wrapped = command
+
+        exec_timeout = timeout if timeout is not None else 300
+        try:
+            result = await _retry(
+                lambda: self._instance.aexec(wrapped, timeout=exec_timeout)
+            )
+        except asyncio.TimeoutError:
+            return ExecResult(
+                exit_code=124,
+                stdout="",
+                stderr=f"Timed out after {exec_timeout}s",
+                command=command,
+            )
+
+        stdout = getattr(result, "stdout", None)
+        stderr = getattr(result, "stderr", None)
+        return ExecResult(
+            exit_code=result.exit_code,
+            stdout=stdout if stdout is not None else str(result),
+            stderr=stderr if stderr is not None else "",
+            command=command,
+        )
+
+    async def read_file(self, path: str) -> bytes:
+        resolved = self._resolve_path(path)
+        fd, local_path = tempfile.mkstemp(prefix="druids-morph-")
+        os.close(fd)
+        try:
+            await self._instance.adownload(resolved, local_path)
+            return await asyncio.to_thread(Path(local_path).read_bytes)
+        finally:
+            try:
+                os.unlink(local_path)
+            except FileNotFoundError:
+                pass
+
+    async def write_file(self, path: str, content: bytes | str) -> None:
+        resolved = self._resolve_path(path)
+        data = content.encode("utf-8") if isinstance(content, str) else content
+
+        parent = resolved.rsplit("/", 1)[0] if "/" in resolved else "/"
+        await self._instance.aexec(f"mkdir -p {parent}")
+
+        fd, local_path = tempfile.mkstemp(prefix="druids-morph-")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+            await self._instance.aupload(local_path, resolved)
+        finally:
+            try:
+                os.unlink(local_path)
+            except FileNotFoundError:
+                pass
+
+    async def stop(self) -> None:
+        await self._instance.astop()
+        logger.info("MorphMachine.stop instance=%s", self.instance_id)
+
+    # -- Morph-specific capabilities --------------------------------------
+
+    async def ssh_credentials(self) -> SSHCredentials:
+        key = await self._instance.assh_key()
+        return SSHCredentials(
+            host="ssh.cloud.morph.so",
+            port=22,
+            username=self.instance_id,
+            private_key=key.private_key,
+            password=getattr(key, "password", None),
+        )
+
+    async def expose_http_service(self, name: str, port: int) -> str:
+        """Expose ``port`` on the VM as a public HTTPS URL; idempotent."""
+        from morphcloud.api import ApiError
+
+        try:
+            return await self._instance.aexpose_http_service(name, port)
+        except ApiError as exc:
+            if exc.status_code != 409:
+                raise
+            await self._instance._refresh_async()
+            return next(
+                svc.url
+                for svc in self._instance.networking.http_services
+                if svc.name == name
+            )
+
+    async def snapshot(self) -> str:
+        """Snapshot the current VM state; returns the snapshot ID."""
+        await self._instance.aexec("sync")
+        snap = await self._instance.asnapshot()
+        return snap.id
+
+    async def fork(
+        self,
+        *,
+        metadata: dict[str, str] | None = None,
+        workdir: str | None = None,
+        ttl_seconds: int | None = None,
+        ttl_action: str = "pause",
+    ) -> "MorphMachine":
+        """Create a copy-on-write child VM from this one.
+
+        The child inherits ``workdir`` unless overridden. Setting
+        ``ttl_seconds`` is recommended so the child pauses itself if the
+        caller forgets to stop it.
+        """
+        await self._ensure_running()
+        _, children = await _retry(lambda: self._instance.abranch(1))
+        child = children[0]
+        if metadata:
+            await child.aset_metadata(metadata)
+        if ttl_seconds is not None and ttl_seconds > 0:
+            try:
+                await child.aset_ttl(ttl_seconds=ttl_seconds, ttl_action=ttl_action)
+            except Exception:  # pragma: no cover - best effort
+                logger.warning(
+                    "MorphMachine.fork: failed to set TTL on child %s",
+                    child.id,
+                    exc_info=True,
+                )
+        await child.await_until_ready()
+        logger.info(
+            "MorphMachine.fork child=%s parent=%s ttl=%s",
+            child.id,
+            self.instance_id,
+            ttl_seconds,
+        )
+        return MorphMachine(child, workdir=workdir or self.workdir)
+
+    async def resume(self) -> None:
+        """Resume the instance if it is currently paused."""
+        await self._instance._refresh_async()
+        if self._instance.status == "paused":
+            logger.info("MorphMachine.resume instance=%s", self.instance_id)
+            await self._instance.aresume()
+            await self._instance.await_until_ready()
+
+    async def _ensure_running(self) -> None:
+        await self._instance._refresh_async()
+        if self._instance.status == "paused":
+            await self.resume()
+
+
+# ---------------------------------------------------------------------------
+# MorphImage
+# ---------------------------------------------------------------------------
+
+
+class MorphImage(Image):
+    """Image that spawns a MorphCloud VM.
+
+    Construct with a ``snapshot_id`` to boot a specific snapshot, or with a
+    ``recipe`` (shell script) to build + cache a snapshot keyed on
+    ``base_image`` + ``version`` + a hash of the recipe. With no arguments
+    the default pi-ready recipe is used so ``MorphImage()`` "just works".
+    """
+
+    #: Default base image used when building snapshots by recipe.
+    DEFAULT_BASE_IMAGE = "morphvm-minimal"
+
+    def __init__(
+        self,
+        *,
+        snapshot_id: str | None = None,
+        recipe: str | None = None,
+        version: str = "druids-v1",
+        base_image: str = DEFAULT_BASE_IMAGE,
+        vcpus: int = 2,
+        memory: int = 4096,
+        disk_size: int = 10240,
+        api_key: str | None = None,
+        ttl_seconds: int | None = None,
+        ttl_action: str = "pause",
+        metadata: Mapping[str, str] | None = None,
+        workdir: str | None = None,
+    ) -> None:
+        if snapshot_id is None and recipe is None:
+            # Fall back to the druids default agent recipe so `MorphImage()`
+            # with no args boots a pi-ready VM.
+            recipe = DEFAULT_MORPH_RECIPE
+            if version == "druids-v1":
+                version = DEFAULT_MORPH_RECIPE_VERSION
+        self.snapshot_id = snapshot_id
+        self.recipe = recipe
+        self.version = version
+        self.base_image = base_image
+        self.vcpus = vcpus
+        self.memory = memory
+        self.disk_size = disk_size
+        self.api_key = api_key or os.environ.get("MORPH_API_KEY")
+        self.ttl_seconds = ttl_seconds
+        self.ttl_action = ttl_action
+        self.metadata = dict(metadata or {})
+        self.workdir = workdir
+
+    async def _resolve_snapshot_id(self) -> str:
+        if self.snapshot_id:
+            return self.snapshot_id
+        assert self.recipe is not None
+        client = _get_client(self.api_key)
+        digest = (
+            f"{self.version}-"
+            f"{hashlib.sha256(self.recipe.encode()).hexdigest()[:12]}"
+        )
+        base = await client.snapshots.acreate(
+            image_id=self.base_image,
+            vcpus=self.vcpus,
+            memory=self.memory,
+            disk_size=self.disk_size,
+            digest=digest,
+        )
+        snapshot = await base.abuild([self.recipe])
+        return snapshot.id
+
+    async def spawn(self) -> MorphMachine:
+        snapshot_id = await self._resolve_snapshot_id()
+        client = _get_client(self.api_key)
+
+        kwargs: dict[str, Any] = {"metadata": self.metadata or None}
+        if self.ttl_seconds is not None and self.ttl_seconds > 0:
+            kwargs["ttl_seconds"] = self.ttl_seconds
+            kwargs["ttl_action"] = self.ttl_action
+
+        # If we just built the snapshot with our own resource spec, start;
+        # otherwise boot with our spec so snapshot defaults don't override.
+        if self.snapshot_id is None:
+            instance = await _retry(lambda: client.instances.astart(snapshot_id, **kwargs))
+        else:
+            instance = await _retry(
+                lambda: client.instances.aboot(
+                    snapshot_id,
+                    vcpus=self.vcpus,
+                    memory=self.memory,
+                    disk_size=self.disk_size,
+                    **kwargs,
+                )
+            )
+        await instance.await_until_ready()
+        logger.info("MorphImage.spawn instance=%s snapshot=%s", instance.id, snapshot_id)
+        return MorphMachine(instance, workdir=self.workdir)

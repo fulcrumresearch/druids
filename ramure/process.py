@@ -19,7 +19,8 @@ from typing import Any, Awaitable, Callable, ParamSpec, TypeVar
 from ramure.agent import Agent
 from ramure.context import _current_process
 from ramure.helpers import kill_agent
-from ramure.machines import Image, LocalImage, Machine
+from ramure.machines.base import Image, Machine
+from ramure.machines.local import LocalImage
 from ramure.runtime import Runtime
 from ramure.stream import Stream
 from ramure.types import ExecutionFailed
@@ -187,6 +188,9 @@ def agent_process(
     image: Image | None = None,
     timeout: float | None = None,
     log_dir: Path | str | None = None,
+    host: str = "127.0.0.1",
+    port: int = 0,
+    base_url: str | None = None,
 ) -> (
     Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[Any]]]
     | Callable[P, Awaitable[Any]]
@@ -203,6 +207,9 @@ def agent_process(
             if is_root:
                 runtime = Runtime(
                     log_dir=Path(log_dir) if log_dir else None,
+                    host=host,
+                    port=port,
+                    base_url=base_url,
                 )
                 await runtime.start()
             else:

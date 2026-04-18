@@ -1,6 +1,7 @@
 from ramure.agent import Agent
 from ramure.log import Log, LogEntry
-from ramure.machines import Image, LocalImage, LocalMachine, Machine
+from ramure.machines.base import Image, Machine
+from ramure.machines.local import LocalImage, LocalMachine
 from ramure.process import (
     ProcessHandle,
     ProcessScope,
