@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from ramure.helpers.schema import build_tool_definition
 from ramure.log import Log
-from ramure.machines import Machine
+from ramure.machines.base import Machine
 from ramure.stream import Stream
 from ramure.types import ExecResult
 

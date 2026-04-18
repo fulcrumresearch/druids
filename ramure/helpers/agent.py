@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shlex
 import shutil
 from typing import TYPE_CHECKING
@@ -61,6 +62,17 @@ async def launch_agent(agent: Agent, *, server_url: str, execution_id: str) -> s
         "RAMURE_AGENT_ID": agent.name,
         "RAMURE_SYSTEM_PROMPT": agent.system_prompt or "",
     }
+    # Forward provider credentials from the host so pi on the remote machine
+    # can authenticate. Silently skipped if unset.
+    for key in (
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+    ):
+        value = os.environ.get(key)
+        if value:
+            env[key] = value
     session_name = agent_session_name(execution_id, agent.name)
     command = build_agent_launch_command(
         pi_command=pi_command,

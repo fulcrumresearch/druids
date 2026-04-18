@@ -22,7 +22,7 @@ from ramure.control import ControlServer
 from ramure.helpers import agent_session_name, build_tool_definition
 from ramure.helpers import launch_agent as _launch_agent_impl
 from ramure.log import Log
-from ramure.machines import Image, Machine
+from ramure.machines.base import Image, Machine
 from ramure.server import Server
 from ramure.types import ToolCallError
 
@@ -37,7 +37,28 @@ class Runtime:
     infrastructure that process scopes share.
     """
 
-    def __init__(self, *, log_dir: Path | str | None = None):
+    def __init__(
+        self,
+        *,
+        log_dir: Path | str | None = None,
+        host: str = "127.0.0.1",
+        port: int = 0,
+        base_url: str | None = None,
+    ):
+        """Create a Runtime.
+
+        Args:
+            log_dir: Directory for log files. Defaults to ``~/.ramure/logs``.
+            host: Interface the WebSocket server binds to. Default
+                ``127.0.0.1``. Pass ``0.0.0.0`` to accept connections from
+                other hosts (e.g. agents on a remote VM).
+            port: Port to bind to. Default ``0`` (pick a free port).
+            base_url: URL advertised to agents as ``DRUIDS_SERVER_URL``.
+                If unset, advertises ``ws://<host>:<port>`` using the
+                actual bound port -- fine for local-only runs. Set this
+                when a proxy in front of the runtime has a different
+                public hostname, e.g. ``wss://me.example.com``.
+        """
         self.execution_id: str | None = None
         self.server_url: str | None = None
         self.agents: dict[str, Agent] = {}
@@ -47,6 +68,9 @@ class Runtime:
         self.log: Log | None = None  # runtime-scope log; set in start()
         self.started_at: float | None = None
         self.control: ControlServer | None = None
+        self.host = host
+        self.port = port
+        self.base_url = base_url
 
     async def start(self) -> None:
         self.execution_id = str(uuid.uuid4())
@@ -56,8 +80,11 @@ class Runtime:
         self.log = Log(path=log_path)
 
         self.server_instance = Server(self)
-        await self.server_instance.start()
-        self.server_url = f"ws://127.0.0.1:{self.server_instance.port}"
+        await self.server_instance.start(host=self.host, port=self.port)
+        self.server_url = (
+            self.base_url
+            or f"ws://{self.host}:{self.server_instance.port}"
+        )
 
         self.control = ControlServer(self)
         await self.control.start()

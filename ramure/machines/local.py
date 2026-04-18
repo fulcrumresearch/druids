@@ -1,54 +1,24 @@
+"""LocalMachine / LocalImage: run on the host that started the runtime."""
+
 from __future__ import annotations
 
 import asyncio
 import os
-from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Mapping
 
+from ramure.machines.base import Image, Machine, _decode
 from ramure.types import ExecResult
-
-
-def _decode(data: bytes | None) -> str:
-    return (data or b"").decode("utf-8", errors="replace")
-
-
-class Machine(ABC):
-    """A running environment."""
-
-    @abstractmethod
-    async def exec(self, command: str, *, user: str = "agent", timeout: int | None = None) -> ExecResult:
-        raise NotImplementedError
-
-    @abstractmethod
-    async def write_file(self, path: str, content: bytes | str) -> None:
-        raise NotImplementedError
-
-    @abstractmethod
-    async def read_file(self, path: str) -> bytes:
-        raise NotImplementedError
-
-    @abstractmethod
-    async def stop(self) -> None:
-        raise NotImplementedError
-
-    def describe(self) -> dict[str, Any]:
-        """JSON-safe summary for logging. Subclasses extend as needed."""
-        return {"kind": type(self).__name__}
-
-
-class Image(ABC):
-    """A snapshot that can spawn into a running machine."""
-
-    @abstractmethod
-    async def spawn(self) -> Machine:
-        raise NotImplementedError
 
 
 class LocalMachine(Machine):
     """Machine implementation backed by the local host."""
 
-    def __init__(self, workdir: str | Path | None = None, env: Mapping[str, str] | None = None):
+    def __init__(
+        self,
+        workdir: str | Path | None = None,
+        env: Mapping[str, str] | None = None,
+    ):
         self.workdir = Path(workdir or os.getcwd())
         self.env = dict(env or {})
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -62,7 +32,13 @@ class LocalMachine(Machine):
             return target
         return (self.workdir / target).resolve()
 
-    async def exec(self, command: str, *, user: str = "agent", timeout: int | None = None) -> ExecResult:
+    async def exec(
+        self,
+        command: str,
+        *,
+        user: str = "agent",
+        timeout: int | None = None,
+    ) -> ExecResult:
         env = os.environ.copy()
         env.update(self.env)
         process = await asyncio.create_subprocess_shell(
@@ -122,9 +98,13 @@ class LocalMachine(Machine):
 class LocalImage(Image):
     """Image that spawns a local working directory machine."""
 
-    def __init__(self, workdir: str | Path | None = None, env: Mapping[str, str] | None = None):
+    def __init__(
+        self,
+        workdir: str | Path | None = None,
+        env: Mapping[str, str] | None = None,
+    ):
         self.workdir = Path(workdir or os.getcwd())
         self.env = dict(env or {})
 
-    async def spawn(self) -> Machine:
+    async def spawn(self) -> LocalMachine:
         return LocalMachine(self.workdir, self.env)
