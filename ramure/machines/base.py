@@ -58,6 +58,28 @@ class Machine(ABC):
         """SSH credentials, if the backend supports SSH. Default: no SSH."""
         return None
 
+    async def fork(self, **kwargs: Any) -> "Machine":
+        """Create a copy of this running machine.
+
+        Backends that support cheap state duplication (e.g. MorphCloud COW
+        branches) override this. The default raises ``NotImplementedError``.
+        Keyword arguments are backend-specific.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support forking"
+        )
+
+    async def snapshot(self, **kwargs: Any) -> "Image":
+        """Freeze current state into a reusable :class:`Image`.
+
+        Backends that support snapshotting (e.g. MorphCloud) override this.
+        The returned ``Image`` can be passed to ``agent(..., image=...)`` or
+        any other API that takes an ``Image`` to respawn the frozen state.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support snapshots"
+        )
+
 
 class Image(ABC):
     """A snapshot that can spawn into a running machine."""

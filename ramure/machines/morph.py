@@ -285,11 +285,27 @@ class MorphMachine(Machine):
                 if svc.name == name
             )
 
-    async def snapshot(self) -> str:
-        """Snapshot the current VM state; returns the snapshot ID."""
+    async def snapshot(self, **kwargs: Any) -> "MorphImage":
+        """Freeze current VM state into a :class:`MorphImage`.
+
+        The returned image can be passed to ``agent(image=...)`` or
+        ``machine(image=...)`` to respawn the frozen state. The image
+        inherits the VM's resource spec and this machine's ``workdir``
+        (override via ``workdir=`` kwarg).
+        """
         await self._instance.aexec("sync")
-        snap = await self._instance.asnapshot()
-        return snap.id
+        snap = await _retry(lambda: self._instance.asnapshot())
+        spec = getattr(self._instance, "spec", None)
+        image_kwargs: dict[str, Any] = {
+            "snapshot_id": snap.id,
+            "workdir": kwargs.pop("workdir", self.workdir),
+        }
+        if spec is not None:
+            image_kwargs.setdefault("vcpus", getattr(spec, "vcpus", 2))
+            image_kwargs.setdefault("memory", getattr(spec, "memory", 4096))
+            image_kwargs.setdefault("disk_size", getattr(spec, "disk_size", 10240))
+        image_kwargs.update(kwargs)
+        return MorphImage(**image_kwargs)
 
     async def fork(
         self,
@@ -298,12 +314,20 @@ class MorphMachine(Machine):
         workdir: str | None = None,
         ttl_seconds: int | None = None,
         ttl_action: str = "pause",
+        clean_agents: bool = True,
     ) -> "MorphMachine":
         """Create a copy-on-write child VM from this one.
 
         The child inherits ``workdir`` unless overridden. Setting
         ``ttl_seconds`` is recommended so the child pauses itself if the
         caller forgets to stop it.
+
+        ``clean_agents`` (default ``True``) kills any ramure agent tmux
+        sessions left over on the forked VM from the parent's process
+        tree. MorphCloud's ``abranch`` preserves running processes, so
+        without this the child would inherit a zombie ``pi`` agent still
+        trying to impersonate the parent agent on the runtime. User
+        processes and non-ramure tmux sessions are left untouched.
         """
         await self._ensure_running()
         _, children = await _retry(lambda: self._instance.abranch(1))
@@ -320,13 +344,37 @@ class MorphMachine(Machine):
                     exc_info=True,
                 )
         await child.await_until_ready()
+        forked = MorphMachine(child, workdir=workdir or self.workdir)
+        if clean_agents:
+            await forked._kill_ramure_agents()
         logger.info(
             "MorphMachine.fork child=%s parent=%s ttl=%s",
             child.id,
             self.instance_id,
             ttl_seconds,
         )
-        return MorphMachine(child, workdir=workdir or self.workdir)
+        return forked
+
+    async def _kill_ramure_agents(self) -> None:
+        """Kill any ramure-* tmux sessions inherited from a COW parent.
+
+        Best-effort: failures are logged but never raised. This only
+        touches sessions whose name matches ``ramure-*``; anything else
+        the user was running is preserved.
+        """
+        try:
+            await self._instance.aexec(
+                "tmux list-sessions -F '#{session_name}' 2>/dev/null "
+                "| grep '^ramure-' "
+                "| xargs -r -I{} tmux kill-session -t {} "
+                "2>/dev/null || true"
+            )
+        except Exception:  # pragma: no cover - best effort
+            logger.warning(
+                "MorphMachine.fork: failed to clean ramure agents on %s",
+                self.instance_id,
+                exc_info=True,
+            )
 
     async def resume(self) -> None:
         """Resume the instance if it is currently paused."""

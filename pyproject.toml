@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "ramure"
 version = "0.0.1"
-description = "A simpler in-process multi-agent orchestration runtime"
+description = "A multi-agent orchestration runtime"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -28,6 +28,7 @@ include = ["ramure/extension.ts"]
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "morphcloud>=0.1",
 ]
 
 [tool.pytest.ini_options]

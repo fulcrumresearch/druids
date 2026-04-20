@@ -17,7 +17,8 @@ import os
 
 import pytest
 
-from ramure.machines.base import SSHCredentials
+from ramure.machines.base import Image, Machine, SSHCredentials
+from ramure.machines.local import LocalMachine
 from ramure.machines.morph import (
     DEFAULT_MORPH_RECIPE,
     DEFAULT_MORPH_RECIPE_VERSION,
@@ -50,6 +51,151 @@ def test_morph_image_recipe_fields() -> None:
     assert img.vcpus == 1
     assert img.memory == 512
     assert img.disk_size == 2048
+
+
+def test_base_machine_fork_and_snapshot_not_implemented() -> None:
+    """``Machine.fork`` / ``Machine.snapshot`` default to NotImplementedError."""
+
+    async def run() -> None:
+        m = LocalMachine()
+        with pytest.raises(NotImplementedError, match="LocalMachine"):
+            await m.fork()
+        with pytest.raises(NotImplementedError, match="LocalMachine"):
+            await m.snapshot()
+
+    asyncio.run(run())
+
+
+class _FakeSpec:
+    def __init__(self, vcpus: int = 3, memory: int = 1024, disk_size: int = 5120) -> None:
+        self.vcpus = vcpus
+        self.memory = memory
+        self.disk_size = disk_size
+
+
+class _FakeSnapshot:
+    def __init__(self, snap_id: str) -> None:
+        self.id = snap_id
+
+
+class _FakeInstance:
+    """Minimal async fake of ``morphcloud.api.Instance`` for offline tests."""
+
+    def __init__(
+        self,
+        *,
+        instance_id: str = "morphvm_test",
+        children: list["_FakeInstance"] | None = None,
+        snapshot_id: str = "snapshot_fake",
+        status: str = "ready",
+    ) -> None:
+        self.id = instance_id
+        self.status = status
+        self.spec = _FakeSpec()
+        self.exec_calls: list[str] = []
+        self._children = children or []
+        self._snapshot_id = snapshot_id
+        self.branched = 0
+        self.snapshotted = 0
+
+    async def aexec(self, command: str, timeout: int | None = None):
+        self.exec_calls.append(command)
+
+        class _R:
+            exit_code = 0
+            stdout = ""
+            stderr = ""
+
+        return _R()
+
+    async def abranch(self, n: int):
+        self.branched += n
+        return self, list(self._children[:n])
+
+    async def asnapshot(self) -> _FakeSnapshot:
+        self.snapshotted += 1
+        return _FakeSnapshot(self._snapshot_id)
+
+    async def aset_metadata(self, metadata: dict) -> None:
+        self.metadata = metadata
+
+    async def aset_ttl(self, **kwargs) -> None:
+        self.ttl = kwargs
+
+    async def await_until_ready(self) -> None:  # pragma: no cover - trivial
+        return None
+
+    async def _refresh_async(self) -> None:  # pragma: no cover - trivial
+        return None
+
+
+def test_morph_machine_snapshot_returns_morph_image() -> None:
+    """``MorphMachine.snapshot()`` must return a respawnable ``MorphImage``."""
+
+    async def run() -> None:
+        inst = _FakeInstance(snapshot_id="snapshot_fromstate")
+        m = MorphMachine(inst, workdir="/work")
+        image = await m.snapshot()
+
+        # Structural guarantees.
+        assert isinstance(image, Image)
+        assert isinstance(image, MorphImage)
+        # Must carry the snapshot id produced by the VM.
+        assert image.snapshot_id == "snapshot_fromstate"
+        # Should inherit workdir by default.
+        assert image.workdir == "/work"
+        # Should carry over the VM's resource spec.
+        assert image.vcpus == inst.spec.vcpus
+        assert image.memory == inst.spec.memory
+        assert image.disk_size == inst.spec.disk_size
+        # sync must run before snapshot so disk state is durable.
+        assert inst.exec_calls[0] == "sync"
+        assert inst.snapshotted == 1
+
+        # workdir override wins over inherited default.
+        other = await m.snapshot(workdir="/override")
+        assert other.workdir == "/override"
+
+    asyncio.run(run())
+
+
+def test_morph_machine_fork_kills_ramure_sessions() -> None:
+    """``fork(clean_agents=True)`` must target only ``ramure-*`` tmux sessions."""
+
+    async def run() -> None:
+        child = _FakeInstance(instance_id="morphvm_child")
+        parent = _FakeInstance(instance_id="morphvm_parent", children=[child])
+        m = MorphMachine(parent, workdir="/work")
+
+        forked = await m.fork()
+        assert isinstance(forked, MorphMachine)
+        assert forked.instance_id == "morphvm_child"
+        assert forked.workdir == "/work"
+
+        # The cleanup must have run on the CHILD, not the parent.
+        assert not any("tmux" in c for c in parent.exec_calls)
+        cleanup = [c for c in child.exec_calls if "tmux" in c]
+        assert len(cleanup) == 1
+        # It must be scoped to ramure-* and must not blow up on empty output.
+        assert "ramure-" in cleanup[0]
+        assert "kill-session" in cleanup[0]
+        assert "|| true" in cleanup[0]
+
+    asyncio.run(run())
+
+
+def test_morph_machine_fork_clean_agents_false_skips_cleanup() -> None:
+    """``clean_agents=False`` must leave the forked VM's processes alone."""
+
+    async def run() -> None:
+        child = _FakeInstance(instance_id="morphvm_child")
+        parent = _FakeInstance(instance_id="morphvm_parent", children=[child])
+        m = MorphMachine(parent)
+
+        await m.fork(clean_agents=False)
+        assert not any("tmux" in c for c in child.exec_calls)
+
+    asyncio.run(run())
 
 
 def test_ssh_credentials_dataclass_frozen() -> None:
