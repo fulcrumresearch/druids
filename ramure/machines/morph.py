@@ -29,16 +29,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-try:
-    from morphcloud.api import ApiError as _ApiError
-except ImportError:
-    # Morph SDK is optional. Unit tests that drive MorphMachine with fake
-    # instances must still work; ``_ApiError`` falls back to a sentinel
-    # that ``isinstance`` checks can never match.
-    class _ApiError(Exception):  # type: ignore[no-redef]
-        status_code: int
-
-
 # ---------------------------------------------------------------------------
 # Default "pi-ready" recipe
 # ---------------------------------------------------------------------------
@@ -118,10 +108,12 @@ def _get_client(api_key: str | None = None) -> "MorphCloudClient":
 
 async def _retry(fn, retries: int = 3, backoff: float = 1.0):
     """Retry a MorphCloud API call on 502/503/timeout."""
+    from morphcloud.api import ApiError
+
     for attempt in range(retries):
         try:
             return await fn()
-        except _ApiError as exc:
+        except ApiError as exc:
             if exc.status_code in (502, 503) and attempt < retries - 1:
                 logger.warning(
                     "MorphCloud %d, retry %d/%d", exc.status_code, attempt + 1, retries
@@ -279,9 +271,11 @@ class MorphMachine(Machine):
 
     async def expose_http_service(self, name: str, port: int) -> str:
         """Expose ``port`` on the VM as a public HTTPS URL; idempotent."""
+        from morphcloud.api import ApiError
+
         try:
             return await self._instance.aexpose_http_service(name, port)
-        except _ApiError as exc:
+        except ApiError as exc:
             if exc.status_code != 409:
                 raise
             await self._instance._refresh_async()

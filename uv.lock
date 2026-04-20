@@ -928,6 +928,7 @@ morph = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "morphcloud" },
     { name = "pytest" },
 ]
 
@@ -940,7 +941,10 @@ requires-dist = [
 provides-extras = ["morph"]
 
 [package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=8.0" }]
+dev = [
+    { name = "morphcloud", specifier = ">=0.1" },
+    { name = "pytest", specifier = ">=8.0" },
+]
 
 [[package]]
 name = "requests"
