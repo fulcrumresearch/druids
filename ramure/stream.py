@@ -9,15 +9,23 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 
 @dataclass(frozen=True)
 class Event:
-    """A single event: a type string and an arbitrary data payload."""
+    """A single event: a type string and an arbitrary data payload.
+
+    ``source`` is optional envelope metadata identifying which
+    process, agent, or other origin emitted the event. It is
+    preserved by :meth:`Stream.emit` and by :func:`ramure.bubble`
+    so events can be traced across layers of supervision without
+    mixing that metadata into the application payload.
+    """
 
     type: str
     data: Any = None
+    source: str | None = None
 
 
 class Stream:
@@ -26,17 +34,78 @@ class Stream:
     def __init__(self) -> None:
         self._items: list[Event] = []
         self._waiters: list[asyncio.Event] = []
+        self._subscribers: list[Callable[[Event], None]] = []
         self._closed = False
 
-    def emit(self, type: str, data: Any = None) -> Event | None:
-        """Emit an event. Returns the event, or None if the stream is closed."""
+    def emit(
+        self, type: str, data: Any = None, *, source: str | None = None
+    ) -> Event | None:
+        """Emit an event.
+
+        ``source`` is optional envelope metadata -- a short tag
+        identifying the origin of the event (typically set by
+        :func:`ramure.bubble` when forwarding across process
+        boundaries). ``data`` is not touched.
+
+        Returns the event, or ``None`` if the stream is closed.
+        """
         if self._closed:
             return None
-        event = Event(type=type, data=data)
+        event = Event(type=type, data=data, source=source)
         self._items.append(event)
         for w in self._waiters:
             w.set()
+        # Subscribers are called synchronously in the emitter's thread.
+        # A subscriber that raises is dropped, not propagated: one bad
+        # listener shouldn't be able to break the stream for everyone
+        # else (same policy as ``Log._deliver``).
+        for cb in list(self._subscribers):
+            try:
+                cb(event)
+            except Exception:
+                try:
+                    self._subscribers.remove(cb)
+                except ValueError:
+                    pass
         return event
+
+    def subscribe(
+        self, cb: Callable[[Event], None], *, replay: bool = True
+    ) -> Callable[[], None]:
+        """Register ``cb`` to be called synchronously for every new event.
+
+        If ``replay`` is true (default), ``cb`` is also called for
+        every event already in the buffer, in order, before returning.
+        This keeps subscribers consistent with ``async for`` iteration
+        -- both see every event.
+
+        Returns an idempotent unsubscribe callable. Calling it after
+        the stream has closed is a no-op.
+
+        A subscriber that raises is dropped silently (see ``emit``).
+        Use this for cheap wiring (e.g. forwarding events to a parent
+        stream); heavy work belongs in an ``async for`` consumer.
+        """
+        if replay:
+            for ev in self._items:
+                try:
+                    cb(ev)
+                except Exception:
+                    # Treat a raise during replay the same as during
+                    # live delivery: never add the subscriber.
+                    def _noop() -> None:
+                        return None
+
+                    return _noop
+        self._subscribers.append(cb)
+
+        def _unsubscribe() -> None:
+            try:
+                self._subscribers.remove(cb)
+            except ValueError:
+                pass
+
+        return _unsubscribe
 
     def close(self) -> None:
         if self._closed:

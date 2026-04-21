@@ -56,6 +56,7 @@ class LogEntry(Event):
         return LogEntry(
             type=d["type"],
             data=d.get("data", {}),
+            source=d.get("source"),      # may be absent on old entries
             seq=d["seq"],
             ts=d["ts"],
             origin=d["origin"],

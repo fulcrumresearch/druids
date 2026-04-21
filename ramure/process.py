@@ -331,6 +331,50 @@ def emit(event_type: str, data: Any = None) -> None:
     scope.events.emit(event_type, data)
 
 
+def bubble(
+    handle: "ProcessHandle", *, source: str | None = None
+) -> Callable[[], None]:
+    """Forward events from ``handle`` onto the current process's stream.
+
+    A supervisor process that spawns children usually wants every
+    child's events to show up on its own event stream, so a single
+    ``async for`` on ``spawn(supervisor).events`` sees the whole
+    picture. ``bubble`` wires that up::
+
+        pool   = spawn(worker_pool, ...)
+        env    = spawn(invariant_maintainer, name='env',   ...)
+        goals  = spawn(invariant_maintainer, name='goals', ...)
+
+        bubble(pool,  source='pool')
+        bubble(env,   source='env')
+        bubble(goals, source='goals')
+
+    Each forwarded event has its :attr:`Event.source` tagged so
+    downstream consumers can tell which child emitted it. The
+    application ``data`` payload is passed through unchanged.
+
+    If the child event already has a ``source`` (for example it was
+    itself bubbled up from a grandchild), we preserve that original
+    source. You see where an event really originated, not where it
+    passed through. Pass ``source=None`` (the default) to forward
+    whatever source the child already had.
+
+    Synchronous under the hood (uses :meth:`Stream.subscribe`); no
+    background task is spawned. Returns an idempotent unsubscribe
+    callable.
+    """
+    scope = _require_scope()
+    dst = scope.events
+
+    def _fwd(ev: Any) -> None:
+        # Preserve the deepest known source: if the child already
+        # tagged it (grandchild -> child -> us), keep the
+        # grandchild's source. Otherwise fall back to ours.
+        dst.emit(ev.type, ev.data, source=ev.source or source)
+
+    return handle.events.subscribe(_fwd)
+
+
 def expose(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
     """Register an async function as an endpoint of this process.
 

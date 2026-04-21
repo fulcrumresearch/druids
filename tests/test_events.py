@@ -96,3 +96,149 @@ def test_multiple_iterators() -> None:
         assert len(collected_b) == 2
 
     asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Stream.subscribe
+# ---------------------------------------------------------------------------
+
+
+def test_subscribe_replays_existing_then_sees_live() -> None:
+    """A subscriber registered after some emits sees the backlog, in
+    order, before returning; and sees every subsequent emit too."""
+    stream = Stream()
+    stream.emit("a")
+    stream.emit("b")
+
+    seen: list[Event] = []
+    stream.subscribe(seen.append)
+    # Replay already happened by the time subscribe returned.
+    assert [e.type for e in seen] == ["a", "b"]
+
+    stream.emit("c")
+    assert [e.type for e in seen] == ["a", "b", "c"]
+
+
+def test_subscribe_no_replay() -> None:
+    """``replay=False`` skips the existing buffer; only new events go."""
+    stream = Stream()
+    stream.emit("old")
+
+    seen: list[Event] = []
+    stream.subscribe(seen.append, replay=False)
+    assert seen == []
+
+    stream.emit("new")
+    assert [e.type for e in seen] == ["new"]
+
+
+def test_subscribe_unsubscribe() -> None:
+    stream = Stream()
+    seen: list[Event] = []
+    off = stream.subscribe(seen.append)
+
+    stream.emit("one")
+    off()
+    stream.emit("two")
+
+    assert [e.type for e in seen] == ["one"]
+    # Calling the returned callable twice is a no-op.
+    off()
+
+
+def test_subscribe_raising_subscriber_is_dropped() -> None:
+    """A subscriber that raises during delivery must be removed so one
+    bad listener can't break the stream for everyone else."""
+    stream = Stream()
+    seen_ok: list[Event] = []
+    call_count = {"bad": 0}
+
+    def bad(ev: Event) -> None:
+        call_count["bad"] += 1
+        raise RuntimeError("boom")
+
+    stream.subscribe(bad)
+    stream.subscribe(seen_ok.append)
+
+    stream.emit("first")
+    stream.emit("second")
+
+    assert call_count["bad"] == 1        # only called once, then dropped
+    assert [e.type for e in seen_ok] == ["first", "second"]
+
+
+def test_subscribe_raising_during_replay_never_subscribes() -> None:
+    """A subscriber that raises on its FIRST replayed item should not
+    end up registered. The follow-up emits must not find it."""
+    stream = Stream()
+    stream.emit("a")
+    call_count = {"n": 0}
+
+    def bad(ev: Event) -> None:
+        call_count["n"] += 1
+        raise RuntimeError("boom")
+
+    off = stream.subscribe(bad)
+    stream.emit("b")
+
+    assert call_count["n"] == 1          # raised during replay, not again
+    off()                                # still safe to call
+
+
+def test_subscribe_preserves_async_iter() -> None:
+    """Subscribers and ``async for`` consumers must both see every event."""
+    async def run() -> None:
+        stream = Stream()
+        seen_sync: list[Event] = []
+        stream.subscribe(seen_sync.append)
+
+        stream.emit("one")
+        stream.emit("two")
+        stream.close()
+
+        seen_async = [e async for e in stream]
+
+        assert [e.type for e in seen_sync] == ["one", "two"]
+        assert [e.type for e in seen_async] == ["one", "two"]
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Event.source: envelope metadata
+# ---------------------------------------------------------------------------
+
+
+def test_emit_default_source_is_none() -> None:
+    stream = Stream()
+    stream.emit("a", {"x": 1})
+    ev = stream.snapshot()[0]
+    assert ev.source is None
+    assert ev.data == {"x": 1}
+
+
+def test_emit_preserves_source_field() -> None:
+    stream = Stream()
+    stream.emit("a", {"x": 1}, source="pool")
+    ev = stream.snapshot()[0]
+    assert ev.type == "a"
+    assert ev.data == {"x": 1}         # data is NOT touched
+    assert ev.source == "pool"
+
+
+def test_event_source_survives_async_iter_and_subscribe() -> None:
+    async def run() -> None:
+        stream = Stream()
+        seen_sync: list[Event] = []
+        stream.subscribe(seen_sync.append)
+
+        stream.emit("a", {"k": 1}, source="pool")
+        stream.emit("b", {"k": 2}, source="env")
+        stream.close()
+
+        seen_async = [e async for e in stream]
+
+        assert [(e.type, e.source) for e in seen_sync]  == [("a", "pool"), ("b", "env")]
+        assert [(e.type, e.source) for e in seen_async] == [("a", "pool"), ("b", "env")]
+
+    asyncio.run(run())
