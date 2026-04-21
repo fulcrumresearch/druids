@@ -75,6 +75,41 @@ def test_log_entry_round_trip() -> None:
     restored = LogEntry.from_dict(d)
     assert restored == entry
     assert json.loads(entry.to_json()) == d
+    # ``source`` defaults to None and survives the round-trip.
+    assert restored.source is None
+
+
+def test_log_entry_round_trip_with_source() -> None:
+    """An entry tagged with a source round-trips through to_dict /
+    from_dict so the factory chain's ``Event.source`` survives
+    persistence and replay from disk."""
+    entry = LogEntry(
+        type="check_ok",
+        data={"ok": True},
+        source="env",
+        seq=1,
+        ts=1713100000.0,
+        origin="server",
+    )
+    d = entry.to_dict()
+    assert d["source"] == "env"
+    restored = LogEntry.from_dict(d)
+    assert restored == entry
+    assert restored.source == "env"
+
+
+def test_log_entry_from_dict_tolerates_missing_source() -> None:
+    """Old jsonl entries written before Event.source existed have no
+    ``source`` key. ``from_dict`` must still parse them."""
+    d = {
+        "type": "tool_call",
+        "data": {"tool": "bash"},
+        "seq": 1,
+        "ts": 1713100000.0,
+        "origin": "agent",
+    }
+    entry = LogEntry.from_dict(d)
+    assert entry.source is None
 
 
 def test_no_persistence_without_path() -> None:
