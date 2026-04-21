@@ -240,7 +240,11 @@ def agent_process(
                 scope.events.emit("cancelled", None)
                 raise
             except Exception as e:
-                scope.events.emit("failed", str(e))
+                # Fall back to the exception class name when the message is
+                # empty — otherwise bare exceptions like asyncio.TimeoutError
+                # (which carries no args) would show up as `("failed", "")`
+                # on the event stream, giving the supervisor no reason.
+                scope.events.emit("failed", str(e) or type(e).__name__)
                 raise
             finally:
                 _current_process.reset(token)

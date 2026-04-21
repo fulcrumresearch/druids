@@ -366,6 +366,33 @@ def test_spawn_failed_event() -> None:
     asyncio.run(run())
 
 
+def test_spawn_failed_event_empty_message_uses_class_name() -> None:
+    """A bare exception with no message must still produce a meaningful
+    `data` on the `failed` event (the class name), not an empty string.
+
+    This is the regression case for asyncio.TimeoutError, which carries
+    no args: ``str(TimeoutError())`` is ``""``.
+    """
+    async def run() -> None:
+        @agent_process(image=LocalImage(), timeout=0.05)
+        async def hangs():
+            # Never completes; the `timeout=` on the decorator trips first.
+            await asyncio.sleep(10)
+
+        @agent_process(image=LocalImage())
+        async def outer():
+            handle = spawn(hangs)
+            async for event in handle.events:
+                if event.type == "failed":
+                    return event.data
+            return None
+
+        data = await outer()
+        assert data == "TimeoutError", data
+
+    asyncio.run(run())
+
+
 # ---------------------------------------------------------------------------
 # emit
 # ---------------------------------------------------------------------------
