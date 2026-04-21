@@ -34,10 +34,47 @@ ID_OPT = typer.Option(None, "--id", "-i", help="Execution id or prefix (default:
 # ---------------------------------------------------------------------------
 
 
-def _live_ids() -> list[str]:
+def _live_ids(*, notify_stale: bool = True) -> list[str]:
+    """List execution ids whose control socket is actually accepting.
+
+    A ``ControlServer.stop()`` on graceful shutdown unlinks the
+    socket path, but a SIGKILL/crash/OOM leaves the socket file
+    behind. Subsequent ``connect()`` calls fail with
+    ``ECONNREFUSED`` because nothing is listening. If we returned
+    every ``*.sock`` we saw, every CLI command (``ls``, ``status``,
+    ``send``) would fail with "Runtime unreachable" until the
+    operator cleaned up by hand.
+
+    We test-connect each socket; if it refuses, the runtime is
+    gone and we unlink the stale file on the spot. When
+    ``notify_stale`` is true (the default for interactive CLI use),
+    a one-line note is printed to stderr per cleaned socket so
+    operators know state was quietly corrected rather than ignored.
+    """
     if not SOCKET_DIR.exists():
         return []
-    return sorted(p.stem for p in SOCKET_DIR.glob("*.sock"))
+    live: list[str] = []
+    cleaned: list[str] = []
+    for p in sorted(SOCKET_DIR.glob("*.sock")):
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(0.5)
+                s.connect(str(p))
+            live.append(p.stem)
+        except (ConnectionRefusedError, FileNotFoundError, OSError):
+            try:
+                p.unlink()
+                cleaned.append(p.stem)
+            except FileNotFoundError:
+                pass
+    if notify_stale and cleaned:
+        label = "socket" if len(cleaned) == 1 else "sockets"
+        ids = ", ".join(c[:8] for c in cleaned)
+        typer.echo(
+            f"note: cleaned {len(cleaned)} stale {label} (no listener): {ids}",
+            err=True,
+        )
+    return live
 
 
 def pick(prefix: str | None) -> str:
