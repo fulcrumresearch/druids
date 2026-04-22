@@ -101,6 +101,92 @@ def test_socket_cleaned_up_on_close(isolated_socket_dir, tmp_path):
     asyncio.run(run_test())
 
 
+def test_ssh_credentials_local_machine_returns_null(isolated_socket_dir, tmp_path, monkeypatch):
+    """LocalMachine has no SSH; the control server must pass the
+    ``None`` through so the CLI can fall back to a local shell.
+    """
+    async def run_test():
+        runtime = Runtime(log_dir=tmp_path / "logs")
+        await runtime.start()
+        scope = ProcessScope(parent=None, runtime=runtime, image=LocalImage(tmp_path))
+        token = _current_process.set(scope)
+        disable_agent_launch(runtime, monkeypatch)
+        try:
+            await agent("worker")
+            reply = await _call(
+                runtime.execution_id,
+                {"cmd": "ssh_credentials", "name": "worker"},
+            )
+            assert reply == {"credentials": None}
+        finally:
+            await scope.cleanup()
+            await runtime.close()
+            _current_process.reset(token)
+
+    asyncio.run(run_test())
+
+
+def test_ssh_credentials_unknown_agent(isolated_socket_dir, tmp_path):
+    async def run_test():
+        runtime = Runtime(log_dir=tmp_path / "logs")
+        await runtime.start()
+        try:
+            reply = await _call(
+                runtime.execution_id,
+                {"cmd": "ssh_credentials", "name": "ghost"},
+            )
+            assert "error" in reply
+        finally:
+            await runtime.close()
+
+    asyncio.run(run_test())
+
+
+def test_ssh_credentials_returns_creds_when_backend_supports(isolated_socket_dir, tmp_path, monkeypatch):
+    """Backends like Morph override ``ssh_credentials()``; the control
+    server must surface the full dict (keyed the same way the CLI expects).
+    """
+    from ramure.machines.base import SSHCredentials
+    from ramure.machines.local import LocalMachine
+
+    async def fake_creds(self):
+        return SSHCredentials(
+            host="ssh.example.com",
+            port=2222,
+            username="inst_123",
+            private_key="-----BEGIN KEY-----\nabc\n",
+            password=None,
+        )
+
+    monkeypatch.setattr(LocalMachine, "ssh_credentials", fake_creds)
+
+    async def run_test():
+        runtime = Runtime(log_dir=tmp_path / "logs")
+        await runtime.start()
+        scope = ProcessScope(parent=None, runtime=runtime, image=LocalImage(tmp_path))
+        token = _current_process.set(scope)
+        disable_agent_launch(runtime, monkeypatch)
+        try:
+            await agent("worker")
+            reply = await _call(
+                runtime.execution_id,
+                {"cmd": "ssh_credentials", "name": "worker"},
+            )
+            assert reply["credentials"] == {
+                "host": "ssh.example.com",
+                "port": 2222,
+                "username": "inst_123",
+                "private_key": "-----BEGIN KEY-----\nabc\n",
+                "password": None,
+            }
+        finally:
+            await scope.cleanup()
+            await runtime.close()
+            _current_process.reset(token)
+
+    asyncio.run(run_test())
+
+
 def test_send_cmd_delivers_message(isolated_socket_dir, tmp_path, monkeypatch):
     async def run_test():
         runtime = Runtime(log_dir=tmp_path / "logs")

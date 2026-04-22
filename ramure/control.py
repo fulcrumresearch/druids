@@ -8,6 +8,7 @@ Commands:
 - ``{"cmd":"status"}`` -> ``{agents, connections, program, pid, started_at}``
 - ``{"cmd":"agent", "name":<str>}`` -> ``{name, machine, tmux_session}``
 - ``{"cmd":"send", "agent":<str>, "text":<str>}`` -> ``{"ok":true}``
+- ``{"cmd":"ssh_credentials", "name":<str>}`` -> ``{"credentials": {host, port, username, private_key, password} | null}``
 
 Errors come back as ``{"error":<msg>}``.
 """
@@ -91,6 +92,8 @@ class ControlServer:
             return self._cmd_agent(msg.get("name", ""))
         if cmd == "send":
             return await self._cmd_send(msg.get("agent", ""), msg.get("text", ""))
+        if cmd == "ssh_credentials":
+            return await self._cmd_ssh_credentials(msg.get("name", ""))
         return {"error": f"unknown cmd '{cmd}'"}
 
     # -- handlers --
@@ -122,6 +125,30 @@ class ControlServer:
             return {"error": "missing text"}
         await ag.send(text)
         return {"ok": True}
+
+    async def _cmd_ssh_credentials(self, name: str) -> dict[str, Any]:
+        """Return SSH credentials for an agent's machine, or ``None``.
+
+        Backends that don't expose SSH (e.g. :class:`LocalMachine`) return
+        ``None`` from ``ssh_credentials()``; we pass that through so the CLI
+        can fall back to a local shell / local tmux attach without a second
+        round-trip.
+        """
+        ag = self.runtime.agents.get(name)
+        if ag is None:
+            return {"error": f"unknown agent '{name}'"}
+        creds = await ag.machine.ssh_credentials()
+        if creds is None:
+            return {"credentials": None}
+        return {
+            "credentials": {
+                "host": creds.host,
+                "port": creds.port,
+                "username": creds.username,
+                "private_key": creds.private_key,
+                "password": creds.password,
+            }
+        }
 
     def _agent_info(self, name: str) -> dict[str, Any]:
         ag = self.runtime.agents[name]
