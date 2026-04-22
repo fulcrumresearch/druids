@@ -5,6 +5,14 @@ const serverUrl = process.env.RAMURE_SERVER_URL;
 const executionId = process.env.RAMURE_EXECUTION_ID;
 const agentId = process.env.RAMURE_AGENT_ID;
 const appendedSystemPrompt = process.env.RAMURE_SYSTEM_PROMPT || "";
+// Cap on pi_tool_result text per event. A full ``cargo build``
+// can be tens of KB; truncate to keep per-agent jsonl files
+// bounded. Callers can raise or lower via the env var; set it to
+// 0 to forward without truncation.
+const toolResultMaxBytes = Math.max(
+  0,
+  parseInt(process.env.RAMURE_TOOL_RESULT_MAX_BYTES || "16384", 10),
+);
 
 type RemoteTool = {
   name: string;
@@ -346,7 +354,65 @@ function setupActivityForwarding(pi: ExtensionAPI): void {
       tool: event.toolName,
       is_error: event.isError || false,
     });
+    sendEvent("pi_tool_result", {
+      tool_call_id: event.toolCallId,
+      tool: event.toolName,
+      is_error: event.isError || false,
+      ...extractToolResultFields(event.result),
+    });
   });
+}
+
+// Pull the human-readable parts out of pi's ToolExecutionEndEvent
+// ``result`` field for forwarding. Pi's own shape is rich:
+//   { content: [{ type: "text", text: "..." }, ...], isError: bool, details?: {...} }
+// We flatten it to a single ``text`` string (concatenating every
+// TextContent entry), truncate at ``toolResultMaxBytes``, and
+// mark truncation explicitly so consumers can tell. Non-text
+// content (images) is summarized but not forwarded -- log
+// consumers almost never want raw image bytes, and they'd blow
+// past the byte cap.
+function extractToolResultFields(result: unknown): Record<string, unknown> {
+  if (result === null || result === undefined) {
+    return { text: "", truncated: false };
+  }
+  if (typeof result !== "object") {
+    const s = String(result);
+    return applyTruncation(s);
+  }
+  const r = result as Record<string, unknown>;
+  const content = Array.isArray(r.content) ? r.content : [];
+  const parts: string[] = [];
+  let nonTextCount = 0;
+  for (const item of content) {
+    if (item && typeof item === "object") {
+      const it = item as Record<string, unknown>;
+      if (it.type === "text" && typeof it.text === "string") {
+        parts.push(it.text);
+      } else if (it.type) {
+        nonTextCount += 1;
+      }
+    }
+  }
+  const text = parts.join("");
+  const out = applyTruncation(text);
+  if (nonTextCount > 0) {
+    out.non_text_content = nonTextCount;
+  }
+  return out;
+}
+
+function applyTruncation(text: string): Record<string, unknown> {
+  if (toolResultMaxBytes === 0 || text.length <= toolResultMaxBytes) {
+    return { text, truncated: false };
+  }
+  // Byte-ish cap by code units; good enough, and avoids measuring
+  // UTF-8 length on every tool call.
+  return {
+    text: text.slice(0, toolResultMaxBytes) + "... [truncated]",
+    truncated: true,
+    original_length: text.length,
+  };
 }
 
 // -- Extension entry point --

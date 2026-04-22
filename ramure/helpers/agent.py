@@ -62,6 +62,11 @@ async def launch_agent(agent: Agent, *, server_url: str, execution_id: str) -> s
         "RAMURE_AGENT_ID": agent.name,
         "RAMURE_SYSTEM_PROMPT": agent.system_prompt or "",
     }
+    # Pass through the truncation cap from the host env if set; the
+    # extension on the VM reads it at startup. Unset = extension's
+    # default (16 KiB).
+    if os.environ.get("RAMURE_TOOL_RESULT_MAX_BYTES"):
+        env["RAMURE_TOOL_RESULT_MAX_BYTES"] = os.environ["RAMURE_TOOL_RESULT_MAX_BYTES"]
     # Forward provider credentials from the host so pi on the remote machine
     # can authenticate. Silently skipped if unset.
     for key in (
