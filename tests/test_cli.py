@@ -7,6 +7,8 @@ Typer app -- easier to unit-test the helpers than shell out.
 from __future__ import annotations
 
 import asyncio
+import os
+import stat
 import tempfile
 from pathlib import Path
 
@@ -102,3 +104,99 @@ def test_live_ids_returns_live_and_removes_stale(isolated_socket_dir):
     assert "bbbbbb" in ids
     assert "aaaaaa" not in ids
     assert not stale.exists()
+
+
+# ---------------------------------------------------------------------------
+# _ssh_argv
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def isolated_home(monkeypatch, tmp_path):
+    """Point ``Path.home()`` at a tempdir so the key file ends up
+    somewhere we can inspect and delete, not in the real ``~/.ramure``.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    return tmp_path
+
+
+CREDS = {
+    "host": "ssh.cloud.morph.so",
+    "port": 22,
+    "username": "inst_abc",
+    "private_key": "-----BEGIN KEY-----\ntest\n-----END KEY-----\n",
+    "password": None,
+}
+
+
+def test_ssh_argv_writes_key_with_0600_and_builds_argv(isolated_home):
+    argv = ramure_cli._ssh_argv(CREDS, tty=True)
+
+    # argv[0] is the program for execvp.
+    assert argv[0] == "ssh"
+    # Target appears as user@host and is the penultimate or final arg.
+    assert f"{CREDS['username']}@{CREDS['host']}" in argv
+    assert "-p" in argv and str(CREDS["port"]) in argv
+    assert "-t" in argv  # tty requested
+    # Hostkey checking is disabled -- these VMs rotate.
+    assert "StrictHostKeyChecking=no" in argv
+    assert "UserKnownHostsFile=/dev/null" in argv
+
+    # -i <path> must point at a real 0600 file containing the key.
+    i_idx = argv.index("-i")
+    key_path = Path(argv[i_idx + 1])
+    assert key_path.exists()
+    mode = stat.S_IMODE(key_path.stat().st_mode)
+    assert mode == 0o600, f"expected 0600, got {oct(mode)}"
+    assert key_path.read_text() == CREDS["private_key"]
+
+    # Key directory itself should be 0700.
+    key_dir = key_path.parent
+    assert key_dir == isolated_home / ".ramure" / "keys"
+    assert stat.S_IMODE(key_dir.stat().st_mode) == 0o700
+
+
+def test_ssh_argv_appends_remote_command(isolated_home):
+    argv = ramure_cli._ssh_argv(
+        CREDS, remote_command="tmux attach-session -t foo", tty=True
+    )
+    # The remote command must be the very last arg so ssh passes it
+    # through verbatim; any earlier and ssh treats it as an option.
+    assert argv[-1] == "tmux attach-session -t foo"
+
+
+def test_ssh_argv_reuses_key_file_across_calls(isolated_home):
+    argv1 = ramure_cli._ssh_argv(CREDS)
+    argv2 = ramure_cli._ssh_argv(CREDS)
+    p1 = Path(argv1[argv1.index("-i") + 1])
+    p2 = Path(argv2[argv2.index("-i") + 1])
+    # Identical creds -> same hash -> same cached file on disk.
+    assert p1 == p2
+    # And only one file in the keys dir.
+    keys_dir = isolated_home / ".ramure" / "keys"
+    assert [p.name for p in sorted(keys_dir.iterdir()) if not p.name.startswith(".tmp-")] == [p1.name]
+
+
+def test_ssh_argv_distinct_keys_for_distinct_credentials(isolated_home):
+    other = dict(CREDS, private_key="-----BEGIN KEY-----\nOTHER\n")
+    argv1 = ramure_cli._ssh_argv(CREDS)
+    argv2 = ramure_cli._ssh_argv(other)
+    p1 = Path(argv1[argv1.index("-i") + 1])
+    p2 = Path(argv2[argv2.index("-i") + 1])
+    assert p1 != p2
+    assert p1.read_text() == CREDS["private_key"]
+    assert p2.read_text() == other["private_key"]
+
+
+def test_ssh_argv_adds_trailing_newline_if_missing(isolated_home):
+    # Some SDKs hand us a key without a trailing newline; ssh is picky.
+    creds = dict(CREDS, private_key="-----BEGIN KEY-----\nnoeol")
+    argv = ramure_cli._ssh_argv(creds)
+    key_path = Path(argv[argv.index("-i") + 1])
+    assert key_path.read_text().endswith("\n")
+
+
+def test_ssh_argv_omits_tty_flag_when_not_requested(isolated_home):
+    argv = ramure_cli._ssh_argv(CREDS)
+    assert "-t" not in argv

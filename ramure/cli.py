@@ -7,10 +7,13 @@ socket; their logs stay in ``~/.ramure/logs/{execution_id}/``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shlex
 import socket
+import stat
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -178,22 +181,115 @@ def cmd_send(
 
 @app.command("connect")
 def cmd_connect(agent: str = typer.Argument(...), id_: str = ID_OPT) -> None:
-    """Attach to an agent's tmux session."""
+    """Attach to an agent's tmux session.
+
+    For local agents the tmux server is on this host, so we ``tmux
+    attach`` directly. For remote agents (e.g. Morph) the tmux session
+    lives on the VM; we SSH in and ``tmux attach`` there.
+    """
     eid = pick(id_)
     info = call(eid, {"cmd": "agent", "name": agent})
     session = info.get("tmux_session") or f"ramure-{eid}-{agent}"
-    os.execvp("tmux", ["tmux", "attach-session", "-t", session])
+
+    creds = call(eid, {"cmd": "ssh_credentials", "name": agent}).get("credentials")
+    if creds is None:
+        os.execvp("tmux", ["tmux", "attach-session", "-t", session])
+        return
+
+    argv = _ssh_argv(
+        creds,
+        remote_command=f"tmux attach-session -t {shlex.quote(session)}",
+        tty=True,
+    )
+    os.execvp(argv[0], argv)
 
 
 @app.command("ssh")
 def cmd_ssh(agent: str = typer.Argument(...), id_: str = ID_OPT) -> None:
-    """Open a shell on an agent's machine."""
-    info = call(pick(id_), {"cmd": "agent", "name": agent})
+    """Open a shell on an agent's machine.
+
+    For local agents this drops into a shell ``cd``'d to the agent's
+    workdir. For remote agents (e.g. Morph) this opens a real SSH
+    session using the credentials the backend advertises.
+    """
+    eid = pick(id_)
+    info = call(eid, {"cmd": "agent", "name": agent})
     m = info["machine"]
-    if m.get("kind") != "LocalMachine":
-        die(f"ssh not supported for machine kind '{m.get('kind')}' yet.")
-    shell = os.environ.get("SHELL", "/bin/bash")
-    os.execvp(shell, [shell, "-c", f"cd {shlex.quote(m.get('workdir', os.getcwd()))} && exec {shell}"])
+
+    creds = call(eid, {"cmd": "ssh_credentials", "name": agent}).get("credentials")
+    if creds is None:
+        if m.get("kind") != "LocalMachine":
+            die(
+                f"ssh not supported for machine kind '{m.get('kind')}': "
+                "backend exposes no credentials."
+            )
+        shell = os.environ.get("SHELL", "/bin/bash")
+        os.execvp(
+            shell,
+            [shell, "-c", f"cd {shlex.quote(m.get('workdir', os.getcwd()))} && exec {shell}"],
+        )
+        return
+
+    argv = _ssh_argv(creds, tty=True)
+    os.execvp(argv[0], argv)
+
+
+def _ssh_argv(
+    creds: dict[str, Any],
+    *,
+    remote_command: str | None = None,
+    tty: bool = False,
+) -> list[str]:
+    """Build an ``ssh`` argv for the given credentials.
+
+    The private key is written to a short-lived 0600 file under
+    ``~/.ramure/keys/``. We keep the file around after ``execvp`` --
+    ssh needs it for the duration of the session and the process image
+    has been replaced, so we can't clean it up from Python. The
+    directory is stable per-user and each key file is named by a hash
+    of its contents, so repeated connects reuse one file.
+    """
+    key_dir = Path.home() / ".ramure" / "keys"
+    key_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        key_dir.chmod(0o700)
+    except OSError:
+        pass
+    private_key = creds["private_key"]
+    if not private_key.endswith("\n"):
+        private_key = private_key + "\n"
+    digest = hashlib.sha256(private_key.encode()).hexdigest()[:16]
+    key_path = key_dir / f"{digest}.key"
+    if not key_path.exists():
+        # Write atomically so a concurrent CLI invocation never sees a
+        # half-written key.
+        fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=str(key_dir))
+        try:
+            with os.fdopen(fd, "w") as fh:
+                fh.write(private_key)
+            os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
+            os.replace(tmp, key_path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            raise
+
+    argv: list[str] = [
+        "ssh",
+        "-i", str(key_path),
+        "-p", str(creds["port"]),
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "LogLevel=ERROR",
+    ]
+    if tty:
+        argv.append("-t")
+    argv.append(f"{creds['username']}@{creds['host']}")
+    if remote_command is not None:
+        argv.append(remote_command)
+    return argv
 
 
 def die(msg: str) -> None:
