@@ -31,6 +31,17 @@ app = typer.Typer(
 
 ID_OPT = typer.Option(None, "--id", "-i", help="Execution id or prefix (default: the only live run).")
 
+#: Remote user ``ssh`` / ``connect`` switch to inside the VM. Agents
+#: are launched via ``MorphMachine.exec`` which wraps every command
+#: in ``sudo -u agent bash -c ...``, so their tmux session lives on
+#: agent's tmux socket (``/tmp/tmux-<agent uid>/default``). Morph's
+#: SSH lands you as the instance id, which maps to root -- a
+#: different (and empty) tmux socket. Hardcoding ``agent`` lines the
+#: two up. If a future backend ever needs a different user we'll
+#: revisit, but threading a CLI flag for every user guess isn't
+#: worth the clutter.
+_AGENT_USER = "agent"
+
 
 # ---------------------------------------------------------------------------
 # Discovery
@@ -180,40 +191,56 @@ def cmd_send(
 
 
 @app.command("connect")
-def cmd_connect(agent: str = typer.Argument(...), id_: str = ID_OPT) -> None:
+def cmd_connect(
+    agent: str = typer.Argument(...),
+    id_: str = ID_OPT,
+    force: bool = typer.Option(
+        False, "--force", "-f", help="Connect even if the agent has ended."
+    ),
+) -> None:
     """Attach to an agent's tmux session.
 
     For local agents the tmux server is on this host, so we ``tmux
     attach`` directly. For remote agents (e.g. Morph) the tmux session
-    lives on the VM; we SSH in and ``tmux attach`` there.
+    lives on the VM and is owned by the ``agent`` user, so we SSH in
+    and ``sudo -u agent`` before running ``tmux attach`` -- otherwise
+    we'd look at root's (empty) tmux socket and the session appears
+    not to exist.
     """
     eid = pick(id_)
     info = call(eid, {"cmd": "agent", "name": agent})
+    _guard_finished(info, agent, force=force, action="connect")
     session = info.get("tmux_session") or f"ramure-{eid}-{agent}"
 
     creds = call(eid, {"cmd": "ssh_credentials", "name": agent}).get("credentials")
     if creds is None:
+        # Local: tmux is on this host; no user switching needed.
         os.execvp("tmux", ["tmux", "attach-session", "-t", session])
         return
 
-    argv = _ssh_argv(
-        creds,
-        remote_command=f"tmux attach-session -t {shlex.quote(session)}",
-        tty=True,
-    )
+    remote = _remote_tmux_attach(session)
+    argv = _ssh_argv(creds, remote_command=remote, tty=True)
     os.execvp(argv[0], argv)
 
 
 @app.command("ssh")
-def cmd_ssh(agent: str = typer.Argument(...), id_: str = ID_OPT) -> None:
+def cmd_ssh(
+    agent: str = typer.Argument(...),
+    id_: str = ID_OPT,
+    force: bool = typer.Option(
+        False, "--force", "-f", help="SSH even if the agent has ended."
+    ),
+) -> None:
     """Open a shell on an agent's machine.
 
     For local agents this drops into a shell ``cd``'d to the agent's
-    workdir. For remote agents (e.g. Morph) this opens a real SSH
-    session using the credentials the backend advertises.
+    workdir. For remote agents (e.g. Morph) this opens an SSH session
+    and ``sudo -iu agent`` so the shell sees the right env, PATH, and
+    ``$HOME`` -- matching where the agent itself was launched.
     """
     eid = pick(id_)
     info = call(eid, {"cmd": "agent", "name": agent})
+    _guard_finished(info, agent, force=force, action="ssh")
     m = info["machine"]
 
     creds = call(eid, {"cmd": "ssh_credentials", "name": agent}).get("credentials")
@@ -230,8 +257,62 @@ def cmd_ssh(agent: str = typer.Argument(...), id_: str = ID_OPT) -> None:
         )
         return
 
-    argv = _ssh_argv(creds, tty=True)
+    remote = _remote_login_shell(creds)
+    argv = _ssh_argv(creds, remote_command=remote, tty=True)
     os.execvp(argv[0], argv)
+
+
+def _remote_tmux_attach(session: str) -> str:
+    """Remote command that attaches to ``session`` as the agent user.
+
+    The agent's tmux socket lives under its own uid; attaching as
+    root (the SSH login user on Morph) hits a different socket and
+    appears empty. ``sudo -u agent`` fixes that.
+    """
+    return (
+        f"sudo -u {_AGENT_USER} -- "
+        f"tmux attach-session -t {shlex.quote(session)}"
+    )
+
+
+def _remote_login_shell(creds: dict[str, Any]) -> str | None:
+    """Remote command for ``ramure ssh``.
+
+    ``None`` = let ssh drop into the login user's shell. We return
+    ``sudo -iu agent`` for a login shell whose env + $HOME match
+    where the agent ran -- unless SSH is already logging in as
+    ``agent``, in which case no switch is needed.
+    """
+    if creds.get("username") == _AGENT_USER:
+        return None
+    return f"sudo -iu {_AGENT_USER}"
+
+
+def _guard_finished(
+    info: dict[str, Any], name: str, *, force: bool, action: str
+) -> None:
+    """Bail out when an agent has already ended.
+
+    Morph keeps VMs around after the agent's tmux session is killed
+    (and fork VMs may resume on SSH), so ``ramure ssh <dead-agent>``
+    happily gets you a shell on a machine whose tmux + agent process
+    are long gone -- with no indication that you're looking at a
+    corpse. Refuse unless ``--force`` is set, so the UX makes this
+    explicit. ``alive`` is populated by newer runtimes; older ones
+    that don't send it are treated as live (no regression).
+    """
+    alive = info.get("alive")
+    if alive is None or alive:
+        return
+    if force:
+        return
+    outcome = info.get("outcome")
+    suffix = f" (outcome: {outcome})" if outcome else ""
+    die(
+        f"Agent '{name}' has ended{suffix}. Its tmux session was "
+        "likely killed during scope cleanup and the machine may be "
+        f"stopped or paused. Pass --force to {action} anyway."
+    )
 
 
 def _ssh_argv(

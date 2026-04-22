@@ -13,6 +13,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
+import typer
 
 from ramure import cli as ramure_cli
 
@@ -200,3 +201,94 @@ def test_ssh_argv_adds_trailing_newline_if_missing(isolated_home):
 def test_ssh_argv_omits_tty_flag_when_not_requested(isolated_home):
     argv = ramure_cli._ssh_argv(CREDS)
     assert "-t" not in argv
+
+
+# ---------------------------------------------------------------------------
+# _remote_tmux_attach / _remote_login_shell / _guard_finished
+# ---------------------------------------------------------------------------
+
+
+def test_remote_tmux_attach_sudos_to_agent_user():
+    """Agent tmux sessions live on the ``agent`` user's tmux socket;
+    attaching as root (the Morph SSH login user) sees an empty socket.
+    The CLI hardcodes ``sudo -u agent -- tmux attach ...`` so the
+    socket resolves under agent's uid.
+    """
+    cmd = ramure_cli._remote_tmux_attach("ramure-x-worker")
+    assert cmd == "sudo -u agent -- tmux attach-session -t ramure-x-worker"
+
+
+def test_remote_tmux_attach_session_name_is_quoted():
+    """Session names come from runtime state; shell-quote so a
+    weird name (spaces, semicolons) can never splice into the
+    remote shell.
+    """
+    cmd = ramure_cli._remote_tmux_attach("x; rm -rf /")
+    assert cmd == "sudo -u agent -- tmux attach-session -t 'x; rm -rf /'"
+
+
+def test_remote_login_shell_returns_none_when_ssh_already_agent():
+    # If the backend's SSH login user is already ``agent``, there's
+    # nothing to switch -- drop straight into the shell.
+    creds = dict(CREDS, username="agent")
+    assert ramure_cli._remote_login_shell(creds) is None
+
+
+def test_remote_login_shell_sudos_to_agent_by_default():
+    # Morph logs in as the instance id (-> root); we want a login
+    # shell as ``agent`` so $HOME / PATH / env match where the
+    # agent itself ran.
+    assert ramure_cli._remote_login_shell(CREDS) == "sudo -iu agent"
+
+
+def test_guard_finished_allows_live_agent(capsys):
+    # ``alive: True`` -> no-op.
+    ramure_cli._guard_finished(
+        {"name": "w", "alive": True}, "w", force=False, action="ssh"
+    )
+    # Missing ``alive`` (older runtimes) also treated as live: we
+    # don't want a runtime upgrade to silently break ssh/connect.
+    ramure_cli._guard_finished(
+        {"name": "w"}, "w", force=False, action="ssh"
+    )
+    assert capsys.readouterr().err == ""
+
+
+def test_guard_finished_blocks_ended_agent_without_force(capsys):
+    with pytest.raises(typer.Exit):
+        ramure_cli._guard_finished(
+            {"name": "w", "alive": False, "outcome": "timeout"},
+            "w",
+            force=False,
+            action="ssh",
+        )
+    err = capsys.readouterr().err
+    assert "has ended" in err
+    assert "timeout" in err
+    assert "--force" in err
+    assert "ssh" in err
+
+
+def test_guard_finished_allows_ended_agent_with_force(capsys):
+    # Force = explicit opt-in to debugging a corpse. Must not die.
+    ramure_cli._guard_finished(
+        {"name": "w", "alive": False, "outcome": "done"},
+        "w",
+        force=True,
+        action="ssh",
+    )
+    assert capsys.readouterr().err == ""
+
+
+def test_guard_finished_omits_outcome_clause_when_unknown(capsys):
+    with pytest.raises(typer.Exit):
+        ramure_cli._guard_finished(
+            {"name": "w", "alive": False},
+            "w",
+            force=False,
+            action="connect",
+        )
+    err = capsys.readouterr().err
+    # No "(outcome: ...)" clause when outcome is missing.
+    assert "outcome" not in err.lower()
+    assert "connect" in err
