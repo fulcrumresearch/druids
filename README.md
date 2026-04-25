@@ -5,26 +5,14 @@ ramure is an opinionated and lightweight Python library for building reliable ag
 Agent software are complex distributed systems. The goal of ramure is to make it easier to build and robustify these systems, in 2 notable ways:
 
 - **Infrastructure primitives**: for agent communication, provisioning, and the software environments in which they run
-- **Fault-tolerant and modular design**: ramure's abstractions encourage modularity and fault-tolerance in the design of agent software, using ideas from distributed systems programming like Erlang
+- **Fault-tolerant and modular design**: ramure's abstractions encourage modularity and fault-tolerance in the design of agent software, using ideas from distributed systems programming like Erlang. See [here] for the motivation behind ramure's design.
 
-See [here] for the motivation behind ramure's design.
-
-
-Here is an example 
-
-insert commented example
-
-
-```
-uv run <program>
-```
-
-Some examples tasks that ramure makes easy with agents:
+Here are some examples of tasks ramure makes easy with agents:
 
 - optimization
 - custom software generation pipelines with user input
 - data pipelines
-
+- worker pools, monitors, and supervisors
 
 ## Install
 
@@ -32,102 +20,84 @@ Some examples tasks that ramure makes easy with agents:
 pip install ramure
 ```
 
+Python 3.11+ is required.
+
 `ramure` depends on `pi` and `tmux` for the machines on which agents run.
 
 ## Quick start
 
+Here is an annotated single worker program:
+
 ```python
 import asyncio
-from ramure import LocalImage, agent, agent_process, done, wait
+from ramure import agent, agent_process, done, fail, wait
 
+# registers the ramure runtime which will manage the agents and their machines, as well as controlling the lifecycle/cleanup
+@agent_process
+async def run_task(spec: str) -> str:
+    # initialize an agent (either locally or on a remote sandbox)
+    worker = await agent(f"worker")
 
-@agent_process(image=LocalImage(), timeout=30)
-async def summarize(text: str) -> str:
-    worker = await agent("worker")
-
+    # register tools the agent can call in-harness
     @worker.on("finish")
     async def on_finish(summary: str) -> str:
-        """Call this with your summary when done."""
+        """Call with your result when the task is done."""
         done(summary)
-        return "Done."
+        return "Recorded."
 
-    await worker.send(f"Summarize this text, then call finish:\n\n{text}")
+    @worker.on("give_up")
+    async def on_give_up(reason: str) -> str:
+        """Call if you cannot complete the task."""
+        fail(f"gave_up: {reason}")
+        return "Recorded."
+
+    await worker.send(
+        f"Task:\n\n{spec}\n\n"
+        "When done, call finish(summary). If impossible, "
+        "call give_up(reason)."
+    )
+    # wait for the done/fail lifecycle triggered by the agent events
     return await wait()
 
 
-asyncio.run(summarize("The quick brown fox jumped over the lazy dog. " * 20))
+if __name__ == "__main__":
+    print(asyncio.run(run_task("Write 10 diverse haikus about git rebase.")))
 ```
 
-Here the agent does the fuzzy work, while Python defines the lifecycle and what counts as completion. Structuring how information moves in your program makes it easier to reliably use agent labor.
+Run it with:
+
+```bash
+uv run your_program.py
+```
+
+Now you can connect to the agent via `ramure connect worker` to see what it's doing.
 
 ## Core concepts
 
 ### Agent processes
 
-We define an **agent process** (AP) as a set of agents working and collaborating on machines with a shared lifecycle.
+The central object of ramure is the `agent_process` (AP), defined by decorating an async function with `@agent_process`. Inside the function, you define agents and machines as well as how they should communicate.
 
-In ramure, the central object is the `agent_process`, defined by the `@agent_process` decorator. Inside the function, you define agents and machines as well as how they should communicate.
+When a root AP gets called, ramure initializes a runtime that is responsible for the lifecycle of the agents and machines it owns. Nested APs inherit the active runtime. To control the lifecycle of an AP, you define events that agents can call back into deterministic Python through `@agent.on(...)`.
 
-```python
-@agent_process
-async def build_and_review(spec: str) -> str:
-    builder = await agent("builder")
-    auditor = await agent("auditor")
-    connect(builder, auditor)
-
-    @builder.on("submit")
-    async def on_submit(code: str):
-        await auditor.send(f"Review:\n{code}")
-        return "Submitted"
-
-    @auditor.on("approve")
-    async def on_approve(code: str):
-        done(code)
-        return "Approved"
-
-    @auditor.on("reject")
-    async def on_reject(feedback: str):
-        await builder.send(f"Fix: {feedback}")
-        return "Sent back"
-
-    await builder.send(f"Implement: {spec}")
-    await auditor.send("Review the builder's work.")
-    return await wait()
-```
-
-A process gives you one place to define:
-
-- which agents and machines belong to the task
-- what success and failure mean
-- which events matter
-- how child work is supervised
-- what gets cleaned up when the task ends
-
-A few lifecycle rules:
-
-- **Root process**: no active runtime yet, so ramure creates one and tears it down on return.
-- **Nested process**: inherits its parent's runtime and runs as a child scope.
-- `done(value)` / `fail(reason)` signal completion from deterministic code or agent tool handlers.
-- `await wait()` blocks until `done()` or `fail()` is called.
-- Agents and machines owned by a process are cleaned up automatically when it returns.
-- `image=` sets the default environment for agents and machines created inside that process.
+Structuring how information moves in your program makes it easier to reliably use agent labor, especially in more complex cases. You can also configure which `image` an AP runs from — your local machine by default, or another image backend such as Docker.
 
 ### Composition
 
-Processes compose by calling each other like normal async functions:
+APs compose. An AP can call another AP the way you'd call any async function:
 
 ```python
-@agent_process(image=LocalImage())
+@agent_process
 async def main():
     code = await write_code("fibonacci function")
     review = await review_code(code)
     return code
 ```
 
-You can also fan out concurrently with `asyncio.gather`:
+Or fan out concurrently with `asyncio.gather`:
 
 ```python
-@agent_process(image=LocalImage())
+@agent_process
 async def main():
     results = await asyncio.gather(
         research("Rust"),
@@ -138,10 +108,10 @@ async def main():
 
 ### Observation, bubbling, and retry
 
-APs compose. An AP can call another AP the way you'd call any async function, or it can `spawn()` and obtain a `ProcessHandle` whose events become observable in real time:
+An AP can also `spawn()` and obtain a handle to the running AP whose events become observable in real time.
 
 ```python
-@agent_process(image=LocalImage())
+@agent_process
 async def main():
     handle = spawn(flaky_task, "write a haiku")
 
@@ -152,7 +122,7 @@ async def main():
             return event.data
 ```
 
-That handle holds on to all the events of the child AP, and lets you observe it as it's running, retry if it fails, and pass events along to higher-level supervisors using `bubble()`.
+This handle holds on to the child AP's event stream, so you can observe it as it runs, retry if it fails, and pass events along to higher-level supervisors using `bubble()`.
 
 Processes can emit custom events with `emit(type, data)`. If a supervisor wants child events to appear on its own event stream, use `bubble()`:
 
@@ -169,9 +139,7 @@ Now a parent observing `spawn(worker_pool, specs).events` can see child events t
 
 ### Endpoints and afforded interfaces
 
-APs can also encode specific ways in which they are interacted with, by exposing an API that can be called in code, or via another agent. This lets you give a component narrow affordances instead of leaking all of its internal state and tools.
-
-For example, a worker-pool process can expose `add_task()` and `tasks()`, while internally spawning one child process per task:
+APs can also encode specific ways in which they are interacted with, by exposing an API that can be called in code, or via another agent. To do this, use the `@expose` decorator:
 
 ```python
 @agent_process
@@ -194,9 +162,7 @@ async def worker_pool() -> None:
     await wait()
 ```
 
-Here `run_task` can be another `@agent_process`, such as a single-worker task runner like the quick-start example.
-
-The parent can either call those endpoints directly or attach them as tools on another agent:
+You can then consume the exposed worker pool in various ways:
 
 ```python
 @agent_process
@@ -207,18 +173,19 @@ async def main():
         if event.type == "ready":
             break
 
-    task_id = await pool.call("add_task", spec="Write a haiku about git rebase.")
+    # call directly
+    await pool.call("add_task", spec="Write a haiku about git rebase.")
 
-    dispatcher = await agent("dispatcher")
-    await pool.attach(dispatcher, prefix="pool_")
-    await dispatcher.send("Use pool_add_task to delegate work.")
-
-    return task_id
+    # or attach an agent to call the exposed functions on the pool,
+    # which get exposed as tools
+    monitor = await agent(
+        "monitor",
+        system_prompt="You run a pool of workers.",
+    )
+    await pool.attach(monitor, prefix="pool_")
 ```
 
-Endpoints run inside the child process's scope, so calls to `emit()`, `done()`, and `fail()` inside an endpoint affect the child, not the caller.
-
-Child-owned agents are also visible through `handle.agents` once the child has created them.
+This lets you give a component narrow affordances instead of ambient access to everything. Endpoints run inside the child process's scope, so calls to `emit()`, `done()`, and `fail()` inside an endpoint affect the child, not the caller. Child-owned agents are also visible through `handle.agents` once the child has created them.
 
 ## API
 
