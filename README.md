@@ -1,11 +1,13 @@
 # ramure
 
+
 ramure is an opinionated and lightweight Python library for building reliable agent software. It makes it easy to define programs where agents communicate across environments to accomplish a task.
+
 
 Agent software are complex distributed systems. The goal of ramure is to make it easier to build and robustify these systems, in 2 notable ways:
 
 - **Infrastructure primitives**: for agent communication, provisioning, and the software environments in which they run
-- **Fault-tolerant and modular design**: ramure's abstractions encourage modularity and fault-tolerance in the design of agent software, using ideas from distributed systems programming like Erlang. See [here] for the motivation behind ramure's design.
+- **Fault-tolerant and modular design**: ramure's abstractions encourage modularity and fault-tolerance in the design of agent software, using ideas from distributed systems programming like Erlang. See [multi-agent systems as distributed software](https://fulcrum.inc/2026/04/30/multi-agent-as-distributed.html) for the motivation behind ramure's design.
 
 Here are some examples of tasks ramure makes easy with agents:
 
@@ -13,6 +15,9 @@ Here are some examples of tasks ramure makes easy with agents:
 - custom software generation pipelines with user input
 - data pipelines
 - worker pools, monitors, and supervisors
+
+
+Note: ramure is the successor to our earlier agent runtime druids. The old code is preserved at [fulcrumresearch/druids-archive](https://github.com/fulcrumresearch/druids-archive).
 
 ## Install
 
