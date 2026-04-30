@@ -85,7 +85,7 @@ The central object of ramure is the `agent_process` (AP), defined by decorating 
 
 When a root AP gets called, ramure initializes a runtime that is responsible for the lifecycle of the agents and machines it owns. Nested APs inherit the active runtime. To control the lifecycle of an AP, you define events that agents can call back into deterministic Python through `@agent.on(...)`.
 
-Structuring how information moves in your program makes it easier to reliably use agent labor, especially in more complex cases. You can also configure which `image` an AP runs from — your local machine by default, or another image backend such as Docker.
+Structuring how information moves in your program makes it easier to reliably use agent labor, especially in more complex cases. You can also configure which `image` an AP runs from — your local machine by default, or any other backend (see [Images and machines](#images-and-machines)).
 
 ### Composition
 
@@ -141,6 +141,64 @@ async def worker_pool(specs: list[str]) -> None:
 ```
 
 Now a parent observing `spawn(worker_pool, specs).events` can see child events too, tagged with `source=tid`.
+
+### Images and machines
+
+Where does an agent actually run? In ramure that's the **machine** — a running environment. An **image** is the template that spawns one.
+
+```
+Image.spawn() -> Machine
+```
+
+A `Machine` is anything that satisfies four async methods:
+
+```python
+class Machine(ABC):
+    async def exec(self, command, *, user="agent", timeout=None) -> ExecResult: ...
+    async def write_file(self, path, content) -> None: ...
+    async def read_file(self, path) -> bytes: ...
+    async def stop(self) -> None: ...
+```
+
+That's the whole contract. ramure uses `exec` to launch the `pi` harness in a tmux session on the machine, `write_file` to drop the agent extension there, and `stop` for cleanup. Two optional methods, `fork()` and `snapshot()`, let backends expose cheap state duplication if they have it (MorphCloud does; LocalMachine doesn't).
+
+Bundled backends:
+
+- `LocalImage(workdir=, env=)` — your host. Default. Each spawned `LocalMachine` is just a working directory.
+- `MorphImage(...)` — [MorphCloud](https://morphcloud.com) VMs. Snapshot/fork friendly. `pip install ramure[morph]`.
+
+### Adding your own backend
+
+A new backend is a pair: an `Image` that knows how to bring up a machine, and a `Machine` that wraps the running thing. For example, a Docker container backend would look roughly like:
+
+```python
+from ramure.machines.base import Image, Machine
+from ramure.types import ExecResult
+
+class DockerMachine(Machine):
+    def __init__(self, container_id: str):
+        self.container_id = container_id
+
+    async def exec(self, command, *, user="agent", timeout=None):
+        # docker exec ... and wrap in ExecResult
+        ...
+
+    async def write_file(self, path, content): ...
+    async def read_file(self, path): ...
+    async def stop(self): ...  # docker rm -f
+
+class DockerImage(Image):
+    def __init__(self, image: str):
+        self.image = image
+
+    async def spawn(self) -> DockerMachine:
+        # docker run -d ... and return DockerMachine(container_id)
+        ...
+```
+
+Pass an instance anywhere ramure takes one: `@agent_process(image=DockerImage("my/image"))`, `await agent("name", image=...)`, or `await machine(image=...)`. The runtime takes care of registering the agent over WebSocket from inside the machine, and tears everything down via `Machine.stop()` when the AP exits.
+
+Look at [`ramure/machines/local.py`](./ramure/machines/local.py) (~110 lines) for the simplest reference implementation, and [`ramure/machines/morph.py`](./ramure/machines/morph.py) for one with SSH, snapshots, and forking.
 
 ### Endpoints and afforded interfaces
 
