@@ -1,0 +1,3 @@
+[submodule "examples/rubric"]
+	path = examples/rubric
+	url = https://github.com/fulcrumresearch/rubric.git
