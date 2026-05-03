@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 # Default "pi-ready" recipe
 # ---------------------------------------------------------------------------
 
-#: Shell recipe used by ``MorphImage()`` when no ``recipe`` / ``snapshot_id``
+#: Shell recipe used by ``MorphImage()`` when no ``recipe`` / ``id``
 #: is provided. Installs node, tmux, pi + pi-coding-agent, uv, gh, and a
 #: non-root ``agent`` user that can sudo -- everything druids needs on the
 #: VM to launch an agent. Adapted from the ``_DRUIDS_BASE_RECIPE`` in
@@ -297,7 +297,7 @@ class MorphMachine(Machine):
         snap = await _retry(lambda: self._instance.asnapshot())
         spec = getattr(self._instance, "spec", None)
         image_kwargs: dict[str, Any] = {
-            "snapshot_id": snap.id,
+            "id": snap.id,
             "workdir": kwargs.pop("workdir", self.workdir),
         }
         if spec is not None:
@@ -398,10 +398,16 @@ class MorphMachine(Machine):
 class MorphImage(Image):
     """Image that spawns a MorphCloud VM.
 
-    Construct with a ``snapshot_id`` to boot a specific snapshot, or with a
-    ``recipe`` (shell script) to build + cache a snapshot keyed on
-    ``base_image`` + ``version`` + a hash of the recipe. With no arguments
-    the default pi-ready recipe is used so ``MorphImage()`` "just works".
+    Construct with an ``id`` (the snapshot id) to boot a specific snapshot,
+    or with a ``recipe`` (shell script) to build + cache a snapshot keyed
+    on ``base_image`` + ``version`` + a hash of the recipe. With no
+    arguments the default pi-ready recipe is used so ``MorphImage()``
+    "just works".
+
+    The :attr:`id` attribute is the Morph snapshot id and is the reload
+    key: ``MorphImage(id=image.id)`` boots the same snapshot. For images
+    constructed from a recipe, ``id`` is ``None`` until the recipe has
+    been resolved (lazily, on first :meth:`spawn`).
     """
 
     #: Default base image used when building snapshots by recipe.
@@ -410,7 +416,7 @@ class MorphImage(Image):
     def __init__(
         self,
         *,
-        snapshot_id: str | None = None,
+        id: str | None = None,
         recipe: str | None = None,
         version: str = "druids-v1",
         base_image: str = DEFAULT_BASE_IMAGE,
@@ -423,13 +429,17 @@ class MorphImage(Image):
         metadata: Mapping[str, str] | None = None,
         workdir: str | None = None,
     ) -> None:
-        if snapshot_id is None and recipe is None:
+        if id is None and recipe is None:
             # Fall back to the druids default agent recipe so `MorphImage()`
             # with no args boots a pi-ready VM.
             recipe = DEFAULT_MORPH_RECIPE
             if version == "druids-v1":
                 version = DEFAULT_MORPH_RECIPE_VERSION
-        self.snapshot_id = snapshot_id
+        # True iff the user handed us a snapshot id directly. Determines
+        # whether `spawn()` calls `aboot` (with our resource spec) or
+        # `astart` (using the snapshot's baked-in spec).
+        self._id_supplied = id is not None
+        self.id: str | None = id
         self.recipe = recipe
         self.version = version
         self.base_image = base_image
@@ -442,9 +452,15 @@ class MorphImage(Image):
         self.metadata = dict(metadata or {})
         self.workdir = workdir
 
-    async def _resolve_snapshot_id(self) -> str:
-        if self.snapshot_id:
-            return self.snapshot_id
+    async def _resolve_id(self) -> str:
+        """Return the snapshot id, building from the recipe if needed.
+
+        Memoizes on ``self.id`` so subsequent calls are free, and so the
+        recipe-built snapshot id becomes visible to callers reading
+        ``image.id`` after a spawn.
+        """
+        if self.id:
+            return self.id
         assert self.recipe is not None
         client = _get_client(self.api_key)
         digest = (
@@ -459,10 +475,11 @@ class MorphImage(Image):
             digest=digest,
         )
         snapshot = await base.abuild([self.recipe])
+        self.id = snapshot.id
         return snapshot.id
 
     async def spawn(self) -> MorphMachine:
-        snapshot_id = await self._resolve_snapshot_id()
+        snapshot_id = await self._resolve_id()
         client = _get_client(self.api_key)
 
         kwargs: dict[str, Any] = {"metadata": self.metadata or None}
@@ -472,7 +489,7 @@ class MorphImage(Image):
 
         # If we just built the snapshot with our own resource spec, start;
         # otherwise boot with our spec so snapshot defaults don't override.
-        if self.snapshot_id is None:
+        if not self._id_supplied:
             instance = await _retry(lambda: client.instances.astart(snapshot_id, **kwargs))
         else:
             instance = await _retry(

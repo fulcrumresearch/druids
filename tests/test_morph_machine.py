@@ -29,7 +29,7 @@ from ramure.machines.morph import (
 
 def test_morph_image_default_uses_pi_recipe() -> None:
     img = MorphImage()
-    assert img.snapshot_id is None
+    assert img.id is None
     assert img.recipe == DEFAULT_MORPH_RECIPE
     assert img.version == DEFAULT_MORPH_RECIPE_VERSION
     # The default recipe must install the pieces druids needs on the VM.
@@ -37,9 +37,9 @@ def test_morph_image_default_uses_pi_recipe() -> None:
         assert token in DEFAULT_MORPH_RECIPE
 
 
-def test_morph_image_with_snapshot_id() -> None:
-    img = MorphImage(snapshot_id="snap_abc")
-    assert img.snapshot_id == "snap_abc"
+def test_morph_image_with_id() -> None:
+    img = MorphImage(id="snap_abc")
+    assert img.id == "snap_abc"
     assert img.base_image == MorphImage.DEFAULT_BASE_IMAGE
     assert img.recipe is None
 
@@ -141,7 +141,7 @@ def test_morph_machine_snapshot_returns_morph_image() -> None:
         assert isinstance(image, Image)
         assert isinstance(image, MorphImage)
         # Must carry the snapshot id produced by the VM.
-        assert image.snapshot_id == "snapshot_fromstate"
+        assert image.id == "snapshot_fromstate"
         # Should inherit workdir by default.
         assert image.workdir == "/work"
         # Should carry over the VM's resource spec.
