@@ -413,6 +413,11 @@ class MorphImage(Image):
     #: Default base image used when building snapshots by recipe.
     DEFAULT_BASE_IMAGE = "morphvm-minimal"
 
+    #: Resource defaults applied **only** when building a snapshot from a
+    #: recipe. ``acreate`` needs concrete ints; an existing snapshot has its
+    #: own baked-in spec we don't want to override silently.
+    _RECIPE_BUILD_DEFAULTS = {"vcpus": 2, "memory": 4096, "disk_size": 10240}
+
     def __init__(
         self,
         *,
@@ -420,9 +425,9 @@ class MorphImage(Image):
         recipe: str | None = None,
         version: str = "druids-v1",
         base_image: str = DEFAULT_BASE_IMAGE,
-        vcpus: int = 2,
-        memory: int = 4096,
-        disk_size: int = 10240,
+        vcpus: int | None = None,
+        memory: int | None = None,
+        disk_size: int | None = None,
         api_key: str | None = None,
         ttl_seconds: int | None = None,
         ttl_action: str = "pause",
@@ -435,9 +440,14 @@ class MorphImage(Image):
             recipe = DEFAULT_MORPH_RECIPE
             if version == "druids-v1":
                 version = DEFAULT_MORPH_RECIPE_VERSION
-        # True iff the user handed us a snapshot id directly. Determines
-        # whether `spawn()` calls `aboot` (with our resource spec) or
-        # `astart` (using the snapshot's baked-in spec).
+        # ``vcpus`` / ``memory`` / ``disk_size`` default to ``None`` so the
+        # ``id=`` (existing snapshot) path inherits the snapshot's own
+        # baked-in spec instead of silently overriding it with hardcoded
+        # numbers. They were previously ``2 / 4096 / 10240`` -- which meant
+        # ``MorphImage(id="snap_xyz")`` quietly booted a 2-vCPU / 4GB VM
+        # regardless of what ``snap_xyz`` was built for. Recipe-built
+        # snapshots fall back to ``_RECIPE_BUILD_DEFAULTS`` in
+        # :meth:`_resolve_id` because ``acreate`` needs concrete ints.
         self._id_supplied = id is not None
         self.id: str | None = id
         self.recipe = recipe
@@ -458,6 +468,11 @@ class MorphImage(Image):
         Memoizes on ``self.id`` so subsequent calls are free, and so the
         recipe-built snapshot id becomes visible to callers reading
         ``image.id`` after a spawn.
+
+        Resource args fall back to :attr:`_RECIPE_BUILD_DEFAULTS` here
+        because ``acreate`` needs concrete ints. The ``id=`` path
+        doesn't go through this method; it inherits the snapshot's
+        own spec via :meth:`spawn` passing ``None`` to ``aboot``.
         """
         if self.id:
             return self.id
@@ -467,11 +482,14 @@ class MorphImage(Image):
             f"{self.version}-"
             f"{hashlib.sha256(self.recipe.encode()).hexdigest()[:12]}"
         )
+        defaults = self._RECIPE_BUILD_DEFAULTS
         base = await client.snapshots.acreate(
             image_id=self.base_image,
-            vcpus=self.vcpus,
-            memory=self.memory,
-            disk_size=self.disk_size,
+            vcpus=self.vcpus if self.vcpus is not None else defaults["vcpus"],
+            memory=self.memory if self.memory is not None else defaults["memory"],
+            disk_size=(
+                self.disk_size if self.disk_size is not None else defaults["disk_size"]
+            ),
             digest=digest,
         )
         snapshot = await base.abuild([self.recipe])
@@ -487,8 +505,13 @@ class MorphImage(Image):
             kwargs["ttl_seconds"] = self.ttl_seconds
             kwargs["ttl_action"] = self.ttl_action
 
-        # If we just built the snapshot with our own resource spec, start;
-        # otherwise boot with our spec so snapshot defaults don't override.
+        # Recipe path: we just called ``acreate`` with the resolved spec,
+        # so the snapshot already encodes our resources -- ``astart`` is
+        # enough. ``id=`` path: the user gave us an existing snapshot, so
+        # we boot via ``aboot`` and forward only the resource args the
+        # user actually set. ``None`` lets the snapshot's baked-in spec
+        # win, which is the behavior we want when the user doesn't
+        # override.
         if not self._id_supplied:
             instance = await _retry(lambda: client.instances.astart(snapshot_id, **kwargs))
         else:
