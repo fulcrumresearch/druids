@@ -209,66 +209,46 @@ class ControlServer:
             return {"error": "kwargs must be an object"}
 
         rt_log = self.runtime.log
-        if rt_log is not None:
-            rt_log.emit(
-                "endpoint_called",
-                {
-                    "endpoint": endpoint,
-                    "kwargs": to_jsonable(kwargs),
-                    "caller": caller,
-                },
-            )
+
+        def log_call(payload: dict[str, Any]) -> None:
+            if rt_log is not None:
+                rt_log.emit("endpoint_called", payload)
+
+        def log_return(*, ok: bool, started: float, error: str | None = None) -> None:
+            if rt_log is None:
+                return
+            payload: dict[str, Any] = {
+                "endpoint": endpoint,
+                "caller": caller,
+                "ok": ok,
+                "duration_ms": int((time.monotonic() - started) * 1000),
+            }
+            if error is not None:
+                payload["error"] = error
+            rt_log.emit("endpoint_returned", payload)
+
+        log_call(
+            {"endpoint": endpoint, "kwargs": to_jsonable(kwargs), "caller": caller}
+        )
 
         started = time.monotonic()
         try:
             result = await _invoke_in_scope(scope, handler, kwargs)
-        except Exception as exc:  # noqa: BLE001 -- surface anything to the caller
-            duration_ms = int((time.monotonic() - started) * 1000)
-            if rt_log is not None:
-                rt_log.emit(
-                    "endpoint_returned",
-                    {
-                        "endpoint": endpoint,
-                        "caller": caller,
-                        "ok": False,
-                        "error": str(exc) or type(exc).__name__,
-                        "duration_ms": duration_ms,
-                    },
-                )
-            return {"error": str(exc) or type(exc).__name__}
+        except Exception as exc:  # noqa: BLE001 -- handler errors must reach the caller
+            err = str(exc) or type(exc).__name__
+            log_return(ok=False, started=started, error=err)
+            return {"error": err}
 
         try:
             jsonable = to_jsonable(result)
-            # Round-trip to make sure it's actually serializable
-            # before we hand it off.
+            # Round-trip to confirm serializability before we hand it off.
             json.dumps(jsonable)
         except (TypeError, ValueError) as exc:
-            duration_ms = int((time.monotonic() - started) * 1000)
             err = f"endpoint result is not JSON-serializable: {exc}"
-            if rt_log is not None:
-                rt_log.emit(
-                    "endpoint_returned",
-                    {
-                        "endpoint": endpoint,
-                        "caller": caller,
-                        "ok": False,
-                        "error": err,
-                        "duration_ms": duration_ms,
-                    },
-                )
+            log_return(ok=False, started=started, error=err)
             return {"error": err}
 
-        duration_ms = int((time.monotonic() - started) * 1000)
-        if rt_log is not None:
-            rt_log.emit(
-                "endpoint_returned",
-                {
-                    "endpoint": endpoint,
-                    "caller": caller,
-                    "ok": True,
-                    "duration_ms": duration_ms,
-                },
-            )
+        log_return(ok=True, started=started)
         return {"ok": True, "result": jsonable}
 
     def _agent_info(self, name: str) -> dict[str, Any]:

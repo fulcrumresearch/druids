@@ -97,16 +97,13 @@ class StatusWriter:
             return
         self._stopped = True
         if self._unsubscribe is not None:
-            try:
-                self._unsubscribe()
-            except Exception:
-                pass
+            self._unsubscribe()
             self._unsubscribe = None
         if self._task is not None:
             self._task.cancel()
             try:
                 await self._task
-            except (asyncio.CancelledError, Exception):
+            except asyncio.CancelledError:
                 pass
             self._task = None
         # Final render outside the loop -- captures any state that
@@ -127,26 +124,23 @@ class StatusWriter:
 
     async def _run(self) -> None:
         """Coalesce wake events into at most one render per debounce window."""
-        try:
-            while True:
-                await self._wake.wait()
-                self._wake.clear()
-                # Structural events flush immediately; everything else
-                # waits out the debounce so a burst (e.g. tool messages
-                # during a chatty turn) collapses into a single write.
-                if not self._urgent:
-                    await asyncio.sleep(_DEBOUNCE_S)
-                self._urgent = False
-                try:
-                    self._render_to_disk(status="live")
-                except Exception:
-                    # Never let a render error tear down the writer.
-                    # Worst case the file goes briefly stale; the
-                    # next event re-tries. The runtime log itself
-                    # is unaffected.
-                    pass
-        except asyncio.CancelledError:
-            raise
+        while True:
+            await self._wake.wait()
+            self._wake.clear()
+            # Structural events flush immediately; everything else
+            # waits out the debounce so a burst (e.g. tool messages
+            # during a chatty turn) collapses into a single write.
+            if not self._urgent:
+                await asyncio.sleep(_DEBOUNCE_S)
+            self._urgent = False
+            try:
+                self._render_to_disk(status="live")
+            except OSError:
+                # Disk hiccup (no space, permission gone). The next
+                # event re-tries; the runtime log itself is unaffected.
+                # Render bugs (KeyError, etc.) intentionally surface --
+                # silent staleness in dev hides real problems.
+                pass
 
     # -----------------------------------------------------------------
     # Rendering
@@ -156,17 +150,16 @@ class StatusWriter:
         body = self._render(status=status)
         # Write-then-rename so a reader never sees a half-written
         # file. Same-directory tempfile guarantees os.replace is
-        # atomic on the same filesystem.
+        # atomic on the same filesystem. If the write or rename
+        # fails, drop the temp file so we don't leak ``.STATUS.*``
+        # turds into the log directory.
         fd, tmp = tempfile.mkstemp(prefix=".STATUS.", suffix=".md", dir=str(self.path.parent))
         try:
             with os.fdopen(fd, "w") as fh:
                 fh.write(body)
             os.replace(tmp, self.path)
-        except Exception:
-            try:
-                os.unlink(tmp)
-            except FileNotFoundError:
-                pass
+        except OSError:
+            Path(tmp).unlink(missing_ok=True)
             raise
 
     def _render(self, *, status: str) -> str:
