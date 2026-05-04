@@ -9,6 +9,8 @@ Commands:
 - ``{"cmd":"agent", "name":<str>}`` -> ``{name, machine, tmux_session}``
 - ``{"cmd":"send", "agent":<str>, "text":<str>}`` -> ``{"ok":true}``
 - ``{"cmd":"ssh_credentials", "name":<str>}`` -> ``{"credentials": {host, port, username, private_key, password} | null}``
+- ``{"cmd":"endpoints"}`` -> ``{"endpoints": [{name, description, parameters}, ...]}``
+- ``{"cmd":"call", "endpoint":<str>, "kwargs":<dict>, "caller":<str>}`` -> ``{"ok":true, "result":<jsonable>}``
 
 Errors come back as ``{"error":<msg>}``.
 """
@@ -19,10 +21,13 @@ import asyncio
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ramure.helpers import agent_session_name
+from ramure.helpers.schema import build_tool_definition
+from ramure.types import to_jsonable
 
 if TYPE_CHECKING:
     from ramure.runtime import Runtime
@@ -94,6 +99,14 @@ class ControlServer:
             return await self._cmd_send(msg.get("agent", ""), msg.get("text", ""))
         if cmd == "ssh_credentials":
             return await self._cmd_ssh_credentials(msg.get("name", ""))
+        if cmd == "endpoints":
+            return self._cmd_endpoints()
+        if cmd == "call":
+            return await self._cmd_call(
+                msg.get("endpoint", ""),
+                msg.get("kwargs") or {},
+                msg.get("caller") or "external",
+            )
         return {"error": f"unknown cmd '{cmd}'"}
 
     # -- handlers --
@@ -149,6 +162,114 @@ class ControlServer:
                 "password": creds.password,
             }
         }
+
+    def _cmd_endpoints(self) -> dict[str, Any]:
+        """List endpoints exposed by the root @agent_process.
+
+        Reuses :func:`build_tool_definition` so the schema matches
+        what agents see for their own tools -- the CLI can render
+        endpoints without a parallel code path.
+        """
+        scope = self.runtime.root_scope
+        if scope is None:
+            return {"endpoints": []}
+        return {
+            "endpoints": [
+                build_tool_definition(name, fn)
+                for name, fn in scope.endpoints.items()
+            ]
+        }
+
+    async def _cmd_call(
+        self, endpoint: str, kwargs: dict[str, Any], caller: str
+    ) -> dict[str, Any]:
+        """Invoke an exposed endpoint on the root scope.
+
+        Goes through the same ``_invoke_in_scope`` path that
+        ``handle.call`` uses, so the endpoint runs inside the root
+        scope and ``emit()``/``done()``/``fail()`` inside the
+        handler land where the program author expects.
+
+        Logs a pair of ``endpoint_called`` / ``endpoint_returned``
+        entries on the runtime log so the call is visible to any
+        downstream observer (CLI tail, status file, etc.). The
+        ``caller`` field distinguishes external invocations from
+        in-runtime ones (which currently don't go through this
+        path, but the convention lines up for when they do).
+        """
+        from ramure.process import _invoke_in_scope
+
+        scope = self.runtime.root_scope
+        if scope is None:
+            return {"error": "root scope not available"}
+        handler = scope.endpoints.get(endpoint)
+        if handler is None:
+            return {"error": f"unknown endpoint '{endpoint}'"}
+        if not isinstance(kwargs, dict):
+            return {"error": "kwargs must be an object"}
+
+        rt_log = self.runtime.log
+        if rt_log is not None:
+            rt_log.emit(
+                "endpoint_called",
+                {
+                    "endpoint": endpoint,
+                    "kwargs": to_jsonable(kwargs),
+                    "caller": caller,
+                },
+            )
+
+        started = time.monotonic()
+        try:
+            result = await _invoke_in_scope(scope, handler, kwargs)
+        except Exception as exc:  # noqa: BLE001 -- surface anything to the caller
+            duration_ms = int((time.monotonic() - started) * 1000)
+            if rt_log is not None:
+                rt_log.emit(
+                    "endpoint_returned",
+                    {
+                        "endpoint": endpoint,
+                        "caller": caller,
+                        "ok": False,
+                        "error": str(exc) or type(exc).__name__,
+                        "duration_ms": duration_ms,
+                    },
+                )
+            return {"error": str(exc) or type(exc).__name__}
+
+        try:
+            jsonable = to_jsonable(result)
+            # Round-trip to make sure it's actually serializable
+            # before we hand it off.
+            json.dumps(jsonable)
+        except (TypeError, ValueError) as exc:
+            duration_ms = int((time.monotonic() - started) * 1000)
+            err = f"endpoint result is not JSON-serializable: {exc}"
+            if rt_log is not None:
+                rt_log.emit(
+                    "endpoint_returned",
+                    {
+                        "endpoint": endpoint,
+                        "caller": caller,
+                        "ok": False,
+                        "error": err,
+                        "duration_ms": duration_ms,
+                    },
+                )
+            return {"error": err}
+
+        duration_ms = int((time.monotonic() - started) * 1000)
+        if rt_log is not None:
+            rt_log.emit(
+                "endpoint_returned",
+                {
+                    "endpoint": endpoint,
+                    "caller": caller,
+                    "ok": True,
+                    "duration_ms": duration_ms,
+                },
+            )
+        return {"ok": True, "result": jsonable}
 
     def _agent_info(self, name: str) -> dict[str, Any]:
         ag = self.runtime.agents[name]

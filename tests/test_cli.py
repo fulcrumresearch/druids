@@ -280,6 +280,78 @@ def test_guard_finished_allows_ended_agent_with_force(capsys):
     assert capsys.readouterr().err == ""
 
 
+# ---------------------------------------------------------------------------
+# _parse_kv_args / _format_endpoint_signature  (used by `ramure call` /
+# `ramure status`)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_kv_args_handles_typed_values():
+    """JSON-first parsing means ``count=3`` is an int, ``flag=true`` is
+    a bool, ``tags=["a","b"]`` is a list -- without a `--type` flag
+    per arg. Anything that isn't valid JSON is left as a raw string.
+    """
+    parsed = ramure_cli._parse_kv_args([
+        "count=3",
+        "flag=true",
+        'tags=["a","b"]',
+        "spec=hello world",     # invalid JSON -> string fallback
+        'msg="quoted"',         # quoted JSON string -> unquoted str
+        "obj={\"k\": 1}",
+    ])
+    assert parsed == {
+        "count": 3,
+        "flag": True,
+        "tags": ["a", "b"],
+        "spec": "hello world",
+        "msg": "quoted",
+        "obj": {"k": 1},
+    }
+
+
+def test_parse_kv_args_rejects_missing_eq(capsys):
+    """A typo like ``ramure call add 3`` should die with a clear
+    error, not silently treat ``3`` as a flag-shaped no-op.
+    """
+    with pytest.raises(typer.Exit):
+        ramure_cli._parse_kv_args(["justakey"])
+    assert "key=value" in capsys.readouterr().err
+
+
+def test_parse_kv_args_rejects_empty_key(capsys):
+    with pytest.raises(typer.Exit):
+        ramure_cli._parse_kv_args(["=oops"])
+    assert "empty key" in capsys.readouterr().err
+
+
+def test_format_endpoint_signature_renders_required_and_default():
+    """The signature line in `ramure status` should read like Python:
+    required positional first, optional with their defaults. Reused
+    here to make sure we don't regress the affordance display when
+    we touch the schema.
+    """
+    sig = ramure_cli._format_endpoint_signature(
+        {
+            "name": "add_task",
+            "parameters": {
+                "properties": {
+                    "spec": {"type": "string"},
+                    "priority": {"type": "integer", "default": 0},
+                },
+                "required": ["spec"],
+            },
+        }
+    )
+    assert sig == "add_task(spec: string, priority: integer = 0)"
+
+
+def test_format_endpoint_signature_handles_no_params():
+    sig = ramure_cli._format_endpoint_signature(
+        {"name": "tasks", "parameters": {"properties": {}, "required": []}}
+    )
+    assert sig == "tasks()"
+
+
 def test_guard_finished_omits_outcome_clause_when_unknown(capsys):
     with pytest.raises(typer.Exit):
         ramure_cli._guard_finished(

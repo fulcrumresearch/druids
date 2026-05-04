@@ -14,7 +14,7 @@ import os
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ramure.agent import Agent
 from ramure.context import _current_process
@@ -24,7 +24,11 @@ from ramure.helpers import launch_agent as _launch_agent_impl
 from ramure.log import Log
 from ramure.machines.base import Image, Machine
 from ramure.server import Server
+from ramure.status import StatusWriter
 from ramure.types import ToolCallError
+
+if TYPE_CHECKING:
+    from ramure.process import ProcessScope
 
 
 DEFAULT_LOG_DIR = Path.home() / ".ramure" / "logs"
@@ -44,6 +48,7 @@ class Runtime:
         host: str = "127.0.0.1",
         port: int = 0,
         base_url: str | None = None,
+        summary: str | None = None,
     ):
         """Create a Runtime.
 
@@ -58,11 +63,19 @@ class Runtime:
                 actual bound port -- fine for local-only runs. Set this
                 when a proxy in front of the runtime has a different
                 public hostname, e.g. ``wss://me.example.com``.
+            summary: Short author-supplied description rendered in
+                ``STATUS.md`` so a reader (agent or human) immediately
+                knows what this program does. Optional.
         """
         self.execution_id: str | None = None
         self.server_url: str | None = None
         self.agents: dict[str, Agent] = {}
         self.edges: set[tuple[str, str]] = set()
+        # The root @agent_process's scope. Set by the decorator on the
+        # root branch; remains None for runtimes that haven't yet
+        # entered their root AP. The control socket dispatches
+        # external endpoint calls here.
+        self.root_scope: "ProcessScope | None" = None
         self.log_dir_root = Path(log_dir) if log_dir else DEFAULT_LOG_DIR
         self.server_instance: Server | None = None
         self.log: Log | None = None  # runtime-scope log; set in start()
@@ -71,6 +84,8 @@ class Runtime:
         self.host = host
         self.port = port
         self.base_url = base_url
+        self.summary = summary
+        self.status: StatusWriter | None = None
 
     async def start(self) -> None:
         self.execution_id = str(uuid.uuid4())
@@ -88,6 +103,15 @@ class Runtime:
 
         self.control = ControlServer(self)
         await self.control.start()
+
+        # STATUS.md sits next to the runtime log so the directory
+        # is a self-describing artifact: log + digest + (later)
+        # post-mortem snapshot. The writer subscribes to the
+        # runtime log; emit the start event below *after* it's up
+        # so the very first log entry shows up in the file.
+        status_path = self.log_dir_root / self.execution_id / "STATUS.md"
+        self.status = StatusWriter(self, status_path, summary=self.summary)
+        await self.status.start()
 
         self.log.emit(
             "execution_started",
@@ -107,6 +131,14 @@ class Runtime:
             self.log.emit("execution_ended", {"execution_id": self.execution_id})
             self.log.close()
             self.log = None
+        if self.status is not None:
+            # Final snapshot stamps the file with terminal status.
+            # We don't currently know if the run failed or succeeded
+            # at this layer; "done" is fine because @agent_process
+            # also emits its own done/failed event onto the parent
+            # stream, which is reflected in the runtime log.
+            await self.status.stop(status="done")
+            self.status = None
         if self.server_instance is not None:
             await self.server_instance.stop()
             self.server_instance = None

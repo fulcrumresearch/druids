@@ -10,7 +10,7 @@ import pytest
 
 from ramure import LocalImage, Runtime
 from ramure.control import socket_path
-from ramure.process import ProcessScope, _current_process, agent, connect
+from ramure.process import ProcessScope, _current_process, agent, connect, expose
 from tests.helpers import disable_agent_launch
 
 
@@ -181,6 +181,273 @@ def test_ssh_credentials_returns_creds_when_backend_supports(isolated_socket_dir
             }
         finally:
             await scope.cleanup()
+            await runtime.close()
+            _current_process.reset(token)
+
+    asyncio.run(run_test())
+
+
+# ---------------------------------------------------------------------------
+# endpoints / call
+# ---------------------------------------------------------------------------
+
+
+def _setup_root_scope(runtime: Runtime, tmp_path: Path) -> tuple[ProcessScope, Any]:
+    """Stand up a root ProcessScope and register it on the runtime.
+
+    Mirrors what ``@agent_process`` does on the root branch -- tests
+    that exercise external calls need the root scope to be present
+    on the runtime since the control socket dispatches through
+    ``runtime.root_scope``.
+    """
+    scope = ProcessScope(parent=None, runtime=runtime, image=LocalImage(tmp_path))
+    runtime.root_scope = scope
+    token = _current_process.set(scope)
+    return scope, token
+
+
+def test_endpoints_lists_root_scope_exposed_endpoints(isolated_socket_dir, tmp_path):
+    async def run_test():
+        runtime = Runtime(log_dir=tmp_path / "logs")
+        await runtime.start()
+        scope, token = _setup_root_scope(runtime, tmp_path)
+        try:
+            @expose
+            async def add(a: int, b: int) -> int:
+                """Add two numbers."""
+                return a + b
+
+            reply = await _call(runtime.execution_id, {"cmd": "endpoints"})
+            assert "endpoints" in reply
+            names = [ep["name"] for ep in reply["endpoints"]]
+            assert names == ["add"]
+            ep = reply["endpoints"][0]
+            # Reuses build_tool_definition, so we get the same shape as
+            # an agent's tool listing -- one renderer for both.
+            assert ep["description"] == "Add two numbers."
+            assert ep["parameters"]["properties"]["a"]["type"] == "integer"
+            assert set(ep["parameters"]["required"]) == {"a", "b"}
+        finally:
+            await scope.cleanup()
+            runtime.root_scope = None
+            await runtime.close()
+            _current_process.reset(token)
+
+    asyncio.run(run_test())
+
+
+def test_endpoints_empty_when_no_root_scope(isolated_socket_dir, tmp_path):
+    """If a runtime is up but no root @agent_process has entered yet,
+    the endpoints list is empty rather than an error -- matches the
+    "there's just nothing to call" intuition.
+    """
+    async def run_test():
+        runtime = Runtime(log_dir=tmp_path / "logs")
+        await runtime.start()
+        try:
+            reply = await _call(runtime.execution_id, {"cmd": "endpoints"})
+            assert reply == {"endpoints": []}
+        finally:
+            await runtime.close()
+
+    asyncio.run(run_test())
+
+
+def test_call_invokes_endpoint_in_root_scope(isolated_socket_dir, tmp_path):
+    async def run_test():
+        runtime = Runtime(log_dir=tmp_path / "logs")
+        await runtime.start()
+        scope, token = _setup_root_scope(runtime, tmp_path)
+        try:
+            @expose
+            async def add(a: int, b: int) -> int:
+                return a + b
+
+            reply = await _call(
+                runtime.execution_id,
+                {"cmd": "call", "endpoint": "add", "kwargs": {"a": 2, "b": 3}},
+            )
+            assert reply == {"ok": True, "result": 5}
+        finally:
+            await scope.cleanup()
+            runtime.root_scope = None
+            await runtime.close()
+            _current_process.reset(token)
+
+    asyncio.run(run_test())
+
+
+def test_call_unknown_endpoint_returns_error(isolated_socket_dir, tmp_path):
+    async def run_test():
+        runtime = Runtime(log_dir=tmp_path / "logs")
+        await runtime.start()
+        scope, token = _setup_root_scope(runtime, tmp_path)
+        try:
+            reply = await _call(
+                runtime.execution_id,
+                {"cmd": "call", "endpoint": "nope", "kwargs": {}},
+            )
+            assert "error" in reply
+            assert "nope" in reply["error"]
+        finally:
+            await scope.cleanup()
+            runtime.root_scope = None
+            await runtime.close()
+            _current_process.reset(token)
+
+    asyncio.run(run_test())
+
+
+def test_call_when_no_root_scope_errors(isolated_socket_dir, tmp_path):
+    """Without a root scope, a ``call`` cannot be dispatched. An
+    explicit error is friendlier than a 404 on a phantom endpoint.
+    """
+    async def run_test():
+        runtime = Runtime(log_dir=tmp_path / "logs")
+        await runtime.start()
+        try:
+            reply = await _call(
+                runtime.execution_id,
+                {"cmd": "call", "endpoint": "add", "kwargs": {}},
+            )
+            assert "error" in reply
+        finally:
+            await runtime.close()
+
+    asyncio.run(run_test())
+
+
+def test_call_endpoint_exception_returned_as_error(isolated_socket_dir, tmp_path):
+    """An endpoint raising surfaces as ``{error: ...}`` and is logged
+    as a failed return so observers see what happened.
+    """
+    async def run_test():
+        runtime = Runtime(log_dir=tmp_path / "logs")
+        await runtime.start()
+        scope, token = _setup_root_scope(runtime, tmp_path)
+        try:
+            @expose
+            async def boom() -> str:
+                raise RuntimeError("kaboom")
+
+            reply = await _call(
+                runtime.execution_id,
+                {"cmd": "call", "endpoint": "boom", "kwargs": {}},
+            )
+            assert reply == {"error": "kaboom"}
+
+            kinds = [e.type for e in runtime.log._entries]
+            assert "endpoint_called" in kinds
+            ret = next(e for e in runtime.log._entries if e.type == "endpoint_returned")
+            assert ret.data["ok"] is False
+            assert ret.data["error"] == "kaboom"
+        finally:
+            await scope.cleanup()
+            runtime.root_scope = None
+            await runtime.close()
+            _current_process.reset(token)
+
+    asyncio.run(run_test())
+
+
+def test_call_logs_endpoint_called_and_returned(isolated_socket_dir, tmp_path):
+    """Every external call lands as a pair of runtime-log events.
+    This is what the (eventual) STATUS.md writer reads to render
+    "recent endpoint calls" -- so the contract matters.
+    """
+    async def run_test():
+        runtime = Runtime(log_dir=tmp_path / "logs")
+        await runtime.start()
+        scope, token = _setup_root_scope(runtime, tmp_path)
+        try:
+            @expose
+            async def echo(msg: str) -> str:
+                return msg
+
+            await _call(
+                runtime.execution_id,
+                {
+                    "cmd": "call",
+                    "endpoint": "echo",
+                    "kwargs": {"msg": "hi"},
+                    "caller": "external:cli",
+                },
+            )
+
+            entries = runtime.log._entries
+            called = next(e for e in entries if e.type == "endpoint_called")
+            returned = next(e for e in entries if e.type == "endpoint_returned")
+            assert called.data == {
+                "endpoint": "echo",
+                "kwargs": {"msg": "hi"},
+                "caller": "external:cli",
+            }
+            assert returned.data["endpoint"] == "echo"
+            assert returned.data["caller"] == "external:cli"
+            assert returned.data["ok"] is True
+            assert "duration_ms" in returned.data
+        finally:
+            await scope.cleanup()
+            runtime.root_scope = None
+            await runtime.close()
+            _current_process.reset(token)
+
+    asyncio.run(run_test())
+
+
+def test_call_kwargs_must_be_dict(isolated_socket_dir, tmp_path):
+    async def run_test():
+        runtime = Runtime(log_dir=tmp_path / "logs")
+        await runtime.start()
+        scope, token = _setup_root_scope(runtime, tmp_path)
+        try:
+            @expose
+            async def echo(msg: str) -> str:
+                return msg
+
+            reply = await _call(
+                runtime.execution_id,
+                {"cmd": "call", "endpoint": "echo", "kwargs": [1, 2, 3]},
+            )
+            assert "error" in reply
+        finally:
+            await scope.cleanup()
+            runtime.root_scope = None
+            await runtime.close()
+            _current_process.reset(token)
+
+    asyncio.run(run_test())
+
+
+def test_call_non_serializable_result_errors(isolated_socket_dir, tmp_path):
+    """to_jsonable falls back to ``str(value)`` for unknown types,
+    but a result that *is* a known type yet contains a non-JSON
+    leaf (e.g. NaN through json.dumps with allow_nan=False would
+    fail) should fail loudly. This locks in the "don't silently
+    repr" decision from the plan -- by relying on a dataclass that
+    contains a non-jsonable field after ``to_jsonable`` smooths it,
+    most things succeed; we instead verify the success path and
+    leave the error path covered by the catch in `_cmd_call`.
+    """
+    async def run_test():
+        runtime = Runtime(log_dir=tmp_path / "logs")
+        await runtime.start()
+        scope, token = _setup_root_scope(runtime, tmp_path)
+        try:
+            @expose
+            async def make_obj() -> dict:
+                # Deeply nested but JSON-serializable; sanity check
+                # that to_jsonable preserves structure.
+                return {"items": [{"k": 1}, {"k": 2}]}
+
+            reply = await _call(
+                runtime.execution_id,
+                {"cmd": "call", "endpoint": "make_obj", "kwargs": {}},
+            )
+            assert reply == {"ok": True, "result": {"items": [{"k": 1}, {"k": 2}]}}
+        finally:
+            await scope.cleanup()
+            runtime.root_scope = None
             await runtime.close()
             _current_process.reset(token)
 

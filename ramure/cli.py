@@ -155,8 +155,11 @@ def cmd_ls() -> None:
 
 @app.command("status")
 def cmd_status(id_: str = ID_OPT) -> None:
-    """Show structure of a live run: agents, machines, connections."""
-    s = call(pick(id_), {"cmd": "status"})
+    """Show structure of a live run: agents, machines, connections,
+    plus endpoints exposed by the root program.
+    """
+    eid = pick(id_)
+    s = call(eid, {"cmd": "status"})
 
     typer.echo(f"Execution: {s['execution_id']}")
     typer.echo(f"Program:   {s.get('program', '?')}")
@@ -177,6 +180,102 @@ def cmd_status(id_: str = ID_OPT) -> None:
         typer.echo("\nConnections:")
         for c in s["connections"]:
             typer.echo(f"  {c['a']} -> {c['b']}")
+
+    # Affordances: endpoints @expose'd by the root @agent_process,
+    # callable via `ramure call`. A separate round-trip keeps
+    # `cmd: status` and `cmd: endpoints` independent (one is
+    # topology, the other is the public API).
+    endpoints = call(eid, {"cmd": "endpoints"}).get("endpoints") or []
+    if endpoints:
+        typer.echo("\nAffordances:")
+        for ep in endpoints:
+            typer.echo(f"  {_format_endpoint_signature(ep)}")
+            doc = (ep.get("description") or "").strip().splitlines()
+            if doc:
+                typer.echo(f"    {doc[0]}")
+
+
+def _format_endpoint_signature(ep: dict[str, Any]) -> str:
+    """Render an endpoint's name and parameter list, e.g. ``add_task(spec)``.
+
+    The schema we get back has a flat ``parameters.properties`` map
+    plus a ``required`` list; we turn it back into something that
+    reads like a Python signature -- enough for an operator to
+    know what to type without staring at JSON.
+    """
+    name = ep.get("name", "?")
+    params = ep.get("parameters") or {}
+    props = params.get("properties") or {}
+    required = set(params.get("required") or [])
+    bits: list[str] = []
+    for pname, pschema in props.items():
+        ptype = pschema.get("type", "any")
+        if pname in required:
+            bits.append(f"{pname}: {ptype}")
+        else:
+            default = pschema.get("default")
+            bits.append(f"{pname}: {ptype} = {default!r}")
+    return f"{name}({', '.join(bits)})"
+
+
+@app.command("call")
+def cmd_call(
+    endpoint: str = typer.Argument(..., help="Endpoint name."),
+    args: list[str] = typer.Argument(
+        None, help="Arguments as key=value (JSON value, falls back to string)."
+    ),
+    id_: str = ID_OPT,
+    json_out: bool = typer.Option(
+        False, "--json", help="Print result as JSON instead of a Python repr."
+    ),
+    as_: str = typer.Option(
+        "cli", "--as", help="Caller tag recorded in the runtime log."
+    ),
+) -> None:
+    """Call an endpoint exposed by the root @agent_process.
+
+    Each ``key=value`` argument is parsed as JSON first, falling
+    back to the raw string if that fails. So ``count=3``,
+    ``enabled=true``, ``tags='["a","b"]'``, and ``spec=hello`` all
+    work.
+    """
+    kwargs = _parse_kv_args(args or [])
+    reply = call(
+        pick(id_),
+        {
+            "cmd": "call",
+            "endpoint": endpoint,
+            "kwargs": kwargs,
+            "caller": f"external:{as_}",
+        },
+    )
+    result = reply.get("result")
+    if json_out:
+        typer.echo(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        typer.echo(repr(result))
+
+
+def _parse_kv_args(items: list[str]) -> dict[str, Any]:
+    """Turn ``["k=v", "n=3"]`` into ``{"k": "v", "n": 3}``.
+
+    JSON-first because that's what makes typed values (numbers,
+    booleans, lists, objects) work without a separate flag for
+    each. Falls back to the raw string when JSON can't parse it,
+    so ``spec=hello world`` doesn't require quoting.
+    """
+    out: dict[str, Any] = {}
+    for raw in items:
+        if "=" not in raw:
+            die(f"argument '{raw}' is not in key=value form")
+        key, _, value = raw.partition("=")
+        if not key:
+            die(f"argument '{raw}' has empty key")
+        try:
+            out[key] = json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            out[key] = value
+    return out
 
 
 @app.command("send")

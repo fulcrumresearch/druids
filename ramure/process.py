@@ -191,6 +191,7 @@ def agent_process(
     host: str = "127.0.0.1",
     port: int = 0,
     base_url: str | None = None,
+    summary: str | None = None,
 ) -> (
     Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[Any]]]
     | Callable[P, Awaitable[Any]]
@@ -210,6 +211,7 @@ def agent_process(
                     host=host,
                     port=port,
                     base_url=base_url,
+                    summary=summary,
                 )
                 await runtime.start()
             else:
@@ -225,6 +227,11 @@ def agent_process(
             if handle is not None:
                 scope.events = handle.events
                 handle._bind_scope(scope)
+
+            if is_root:
+                # External callers (the control socket / `ramure call`)
+                # dispatch into the root scope's exposed endpoints.
+                runtime.root_scope = scope
 
             token = _current_process.set(scope)
             try:
@@ -250,6 +257,7 @@ def agent_process(
                 _current_process.reset(token)
                 await scope.cleanup()
                 if is_root:
+                    runtime.root_scope = None
                     await runtime.close()
 
         return wrapped
