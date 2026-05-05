@@ -25,6 +25,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ramure.context import _invoke_in_scope
 from ramure.helpers import agent_session_name
 from ramure.helpers.schema import build_tool_definition
 from ramure.types import to_jsonable
@@ -197,8 +198,6 @@ class ControlServer:
         in-runtime ones (which currently don't go through this
         path, but the convention lines up for when they do).
         """
-        from ramure.process import _invoke_in_scope
-
         scope = self.runtime.root_scope
         if scope is None:
             return {"error": "root scope not available"}

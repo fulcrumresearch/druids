@@ -1,29 +1,11 @@
-"""STATUS.md writer for a live ramure execution.
-
-Each runtime owns one :class:`StatusWriter`. It subscribes to the
-runtime log, watches for state changes, and rewrites
-``{log_dir_root}/{execution_id}/STATUS.md`` as the program evolves.
-
-The file is a *view*, not a source of truth. Authoritative reads
-still go through the control socket. The point of STATUS.md is
-**orientation**: an LLM (or a human) dropped into a directory with
-this file should understand what's running and how to interact
-with it without prior knowledge of ramure.
-
-Update strategy: a single coalescing task. Structural events
-trigger an immediate flush; everything else is debounced to at
-most one rewrite per :data:`_DEBOUNCE_S` seconds.
-
-Atomic write-then-rename keeps concurrent readers (an agent
-reading the file as we update it) from ever seeing half a file.
-"""
+"""STATUS.md writer for a live ramure execution."""
 
 from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import tempfile
-import time
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -373,8 +355,6 @@ def _short_repr(value: Any, limit: int = 60) -> str:
 
 
 def _program_name() -> str:
-    import sys
-
     argv0 = sys.argv[0] if sys.argv else ""
     if argv0 and Path(argv0).exists():
         return str(Path(argv0).resolve())
