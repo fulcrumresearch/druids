@@ -280,6 +280,131 @@ def test_guard_finished_allows_ended_agent_with_force(capsys):
     assert capsys.readouterr().err == ""
 
 
+# ---------------------------------------------------------------------------
+# _parse_kv_args / _format_endpoint_signature  (used by `ramure call` /
+# `ramure status`)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_kv_args_handles_typed_values():
+    """JSON-first parsing means ``count=3`` is an int, ``flag=true`` is
+    a bool, ``tags=["a","b"]`` is a list -- without a `--type` flag
+    per arg. Anything that isn't valid JSON is left as a raw string.
+    """
+    parsed = ramure_cli._parse_kv_args([
+        "count=3",
+        "flag=true",
+        'tags=["a","b"]',
+        "spec=hello world",     # invalid JSON -> string fallback
+        'msg="quoted"',         # quoted JSON string -> unquoted str
+        "obj={\"k\": 1}",
+    ])
+    assert parsed == {
+        "count": 3,
+        "flag": True,
+        "tags": ["a", "b"],
+        "spec": "hello world",
+        "msg": "quoted",
+        "obj": {"k": 1},
+    }
+
+
+def test_parse_kv_args_rejects_missing_eq(capsys):
+    """A typo like ``ramure call add 3`` should die with a clear
+    error, not silently treat ``3`` as a flag-shaped no-op.
+    """
+    with pytest.raises(typer.Exit):
+        ramure_cli._parse_kv_args(["justakey"])
+    assert "key=value" in capsys.readouterr().err
+
+
+def test_parse_kv_args_rejects_empty_key(capsys):
+    with pytest.raises(typer.Exit):
+        ramure_cli._parse_kv_args(["=oops"])
+    assert "empty key" in capsys.readouterr().err
+
+
+def test_format_endpoint_signature_renders_required_and_default():
+    """The signature line in `ramure status` should read like Python:
+    required positional first, optional with their defaults. Reused
+    here to make sure we don't regress the affordance display when
+    we touch the schema.
+    """
+    sig = ramure_cli._format_endpoint_signature(
+        {
+            "name": "add_task",
+            "parameters": {
+                "properties": {
+                    "spec": {"type": "string"},
+                    "priority": {"type": "integer", "default": 0},
+                },
+                "required": ["spec"],
+            },
+        }
+    )
+    assert sig == "add_task(spec: string, priority: integer = 0)"
+
+
+def test_format_endpoint_signature_handles_no_params():
+    sig = ramure_cli._format_endpoint_signature(
+        {"name": "tasks", "parameters": {"properties": {}, "required": []}}
+    )
+    assert sig == "tasks()"
+
+
+# ---------------------------------------------------------------------------
+# _format_recent (Recent: section in `ramure status`)
+# ---------------------------------------------------------------------------
+
+
+def test_format_recent_pairs_calls_and_keeps_other_events():
+    """Each ``endpoint_called`` collapses with its matching
+    ``endpoint_returned`` into one line so the operator sees the
+    outcome at a glance. Other lifecycle events (agent_created,
+    etc.) pass through untouched. Order is most-recent-first.
+    """
+    entries = [
+        {"type": "execution_started", "data": {"execution_id": "abc"}, "ts": 1.0, "seq": 1},
+        {"type": "agent_created", "data": {"agent": "alpha"}, "ts": 2.0, "seq": 2},
+        {"type": "endpoint_called", "data": {"endpoint": "f", "kwargs": {"a": 1}, "caller": "external:cli"}, "ts": 3.0, "seq": 3},
+        {"type": "endpoint_returned", "data": {"endpoint": "f", "caller": "external:cli", "ok": True}, "ts": 4.0, "seq": 4},
+        {"type": "endpoint_called", "data": {"endpoint": "g", "kwargs": {}, "caller": "external:cli"}, "ts": 5.0, "seq": 5},
+        {"type": "endpoint_returned", "data": {"endpoint": "g", "caller": "external:cli", "ok": False, "error": "boom"}, "ts": 6.0, "seq": 6},
+    ]
+    out = ramure_cli._format_recent(entries)
+
+    # Most recent first; endpoint_returned lines never appear (they
+    # render as part of their call).
+    assert all("endpoint_returned" not in line for line in out)
+    assert "g() by external:cli -> error: boom" in out[0]
+    assert "f(a=1) by external:cli -> ok" in out[1]
+    assert "agent_created alpha" in out[2]
+    assert "execution_started abc" in out[3]
+
+
+def test_format_recent_handles_call_without_return():
+    """A call still in flight should render as ``...`` rather than
+    being dropped or mispaired with an unrelated return.
+    """
+    entries = [
+        {"type": "endpoint_called", "data": {"endpoint": "slow", "kwargs": {}, "caller": "external:cli"}, "ts": 1.0, "seq": 1},
+    ]
+    out = ramure_cli._format_recent(entries)
+    assert out == [out[0]]  # single line
+    assert "slow() by external:cli -> ..." in out[0]
+
+
+def test_format_recent_respects_limit():
+    entries = [
+        {"type": "agent_created", "data": {"agent": f"a{i}"}, "ts": float(i), "seq": i}
+        for i in range(20)
+    ]
+    out = ramure_cli._format_recent(entries, limit=5)
+    assert len(out) == 5
+    # Most-recent first.
+    assert "a19" in out[0]
+
+
 def test_guard_finished_omits_outcome_clause_when_unknown(capsys):
     with pytest.raises(typer.Exit):
         ramure_cli._guard_finished(

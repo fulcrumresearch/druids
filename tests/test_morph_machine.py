@@ -29,19 +29,23 @@ from ramure.machines.morph import (
 
 def test_morph_image_default_uses_pi_recipe() -> None:
     img = MorphImage()
-    assert img.snapshot_id is None
+    assert img.id is None
     assert img.recipe == DEFAULT_MORPH_RECIPE
     assert img.version == DEFAULT_MORPH_RECIPE_VERSION
-    # The default recipe must install the pieces druids needs on the VM.
+    # The default recipe must install the pieces ramure needs on the VM.
     for token in ("npm install -g", "pi-coding-agent", "tmux", "useradd -m"):
         assert token in DEFAULT_MORPH_RECIPE
 
 
-def test_morph_image_with_snapshot_id() -> None:
-    img = MorphImage(snapshot_id="snap_abc")
-    assert img.snapshot_id == "snap_abc"
+def test_morph_image_with_id() -> None:
+    img = MorphImage(id="snap_abc")
+    assert img.id == "snap_abc"
     assert img.base_image == MorphImage.DEFAULT_BASE_IMAGE
     assert img.recipe is None
+    # Resource args default to None so the snapshot's baked-in spec
+    # wins (regression: they used to default to 2 / 4096 / 10240,
+    # silently downsizing snapshots built for more).
+    assert (img.vcpus, img.memory, img.disk_size) == (None, None, None)
 
 
 def test_morph_image_recipe_fields() -> None:
@@ -129,6 +133,51 @@ class _FakeInstance:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Spawn forwards resource args (or None) to aboot.
+# ---------------------------------------------------------------------------
+
+
+def test_morph_image_spawn_forwards_resource_args(monkeypatch) -> None:
+    """Regression for the silent-downsize footgun: when the user
+    doesn't pass resource args, ``aboot`` must receive ``None`` so
+    morphcloud falls back to the snapshot's baked-in spec rather
+    than overriding it with hardcoded numbers. When the user does
+    pass them, they flow through.
+    """
+    from ramure.machines import morph as morph_mod
+
+    calls: list[dict[str, Any]] = []
+
+    class _Instances:
+        async def aboot(self, snapshot_id: str, **kwargs):
+            calls.append({"snapshot_id": snapshot_id, **kwargs})
+            return _FakeInstance()
+
+    class _Client:
+        instances = _Instances()
+
+    async def _passthrough(fn, *_a, **_k):
+        return await fn()
+
+    monkeypatch.setattr(morph_mod, "_get_client", lambda *_a, **_k: _Client())
+    monkeypatch.setattr(morph_mod, "_retry", _passthrough)
+
+    async def run() -> None:
+        await MorphImage(id="snap_xyz").spawn()
+        await MorphImage(id="snap_xyz", vcpus=8, memory=16384).spawn()
+
+    asyncio.run(run())
+
+    assert calls[0]["vcpus"] is None
+    assert calls[0]["memory"] is None
+    assert calls[0]["disk_size"] is None
+
+    assert calls[1]["vcpus"] == 8
+    assert calls[1]["memory"] == 16384
+    assert calls[1]["disk_size"] is None
+
+
 def test_morph_machine_snapshot_returns_morph_image() -> None:
     """``MorphMachine.snapshot()`` must return a respawnable ``MorphImage``."""
 
@@ -141,7 +190,7 @@ def test_morph_machine_snapshot_returns_morph_image() -> None:
         assert isinstance(image, Image)
         assert isinstance(image, MorphImage)
         # Must carry the snapshot id produced by the VM.
-        assert image.snapshot_id == "snapshot_fromstate"
+        assert image.id == "snapshot_fromstate"
         # Should inherit workdir by default.
         assert image.workdir == "/work"
         # Should carry over the VM's resource spec.

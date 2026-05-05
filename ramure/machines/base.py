@@ -82,7 +82,22 @@ class Machine(ABC):
 
 
 class Image(ABC):
-    """A snapshot that can spawn into a running machine."""
+    """A snapshot that can spawn into a running machine.
+
+    Every image exposes an :attr:`id` -- the backend-specific handle that
+    identifies this image, in whatever shape the backend uses to reload
+    it. For :class:`~ramure.machines.morph.MorphImage` it is the snapshot
+    id; for :class:`~ramure.machines.local.LocalImage` it is the workdir
+    path. ``BackendImage(id=image.id)`` reconstructs the image, given the
+    same backend.
+
+    ``id`` may be ``None`` for images whose backing snapshot has not yet
+    been materialized (for example a :class:`MorphImage` built from a
+    ``recipe`` that has not been spawned yet). Once the snapshot is
+    realized, ``id`` is set and stays stable.
+    """
+
+    id: str | None
 
     @abstractmethod
     async def spawn(self) -> Machine:

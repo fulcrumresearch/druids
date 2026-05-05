@@ -9,6 +9,9 @@ Commands:
 - ``{"cmd":"agent", "name":<str>}`` -> ``{name, machine, tmux_session}``
 - ``{"cmd":"send", "agent":<str>, "text":<str>}`` -> ``{"ok":true}``
 - ``{"cmd":"ssh_credentials", "name":<str>}`` -> ``{"credentials": {host, port, username, private_key, password} | null}``
+- ``{"cmd":"endpoints"}`` -> ``{"endpoints": [{name, description, parameters}, ...]}``
+- ``{"cmd":"call", "endpoint":<str>, "kwargs":<dict>, "caller":<str>}`` -> ``{"ok":true, "result":<jsonable>}``
+- ``{"cmd":"tail", "n":<int>}`` -> ``{"entries": [{type, data, ts, seq}, ...]}``
 
 Errors come back as ``{"error":<msg>}``.
 """
@@ -19,10 +22,14 @@ import asyncio
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ramure.context import _invoke_in_scope
 from ramure.helpers import agent_session_name
+from ramure.helpers.schema import build_tool_definition
+from ramure.types import to_jsonable
 
 if TYPE_CHECKING:
     from ramure.runtime import Runtime
@@ -94,6 +101,16 @@ class ControlServer:
             return await self._cmd_send(msg.get("agent", ""), msg.get("text", ""))
         if cmd == "ssh_credentials":
             return await self._cmd_ssh_credentials(msg.get("name", ""))
+        if cmd == "endpoints":
+            return self._cmd_endpoints()
+        if cmd == "call":
+            return await self._cmd_call(
+                msg.get("endpoint", ""),
+                msg.get("kwargs") or {},
+                msg.get("caller") or "external",
+            )
+        if cmd == "tail":
+            return self._cmd_tail(int(msg.get("n") or 50))
         return {"error": f"unknown cmd '{cmd}'"}
 
     # -- handlers --
@@ -110,6 +127,22 @@ class ControlServer:
             "connections": [
                 {"a": a, "b": b} for (a, b) in sorted(rt.edges)
             ],
+        }
+
+    def _cmd_tail(self, n: int) -> dict[str, Any]:
+        """Return the last ``n`` runtime-log entries.
+
+        Used by ``ramure status`` to surface recent activity.
+        """
+        log = self.runtime.log
+        if log is None:
+            return {"entries": []}
+        n = max(1, min(n, 1000))
+        return {
+            "entries": [
+                {"type": e.type, "data": e.data, "ts": e.ts, "seq": e.seq}
+                for e in log._entries[-n:]
+            ]
         }
 
     def _cmd_agent(self, name: str) -> dict[str, Any]:
@@ -149,6 +182,78 @@ class ControlServer:
                 "password": creds.password,
             }
         }
+
+    def _cmd_endpoints(self) -> dict[str, Any]:
+        """List endpoints exposed by the root @agent_process.
+
+        Reuses :func:`build_tool_definition` so the schema matches
+        what agents see for their own tools -- the CLI can render
+        endpoints without a parallel code path.
+        """
+        scope = self.runtime.root_scope
+        if scope is None:
+            return {"endpoints": []}
+        return {
+            "endpoints": [
+                build_tool_definition(name, fn)
+                for name, fn in scope.endpoints.items()
+            ]
+        }
+
+    async def _cmd_call(
+        self, endpoint: str, kwargs: dict[str, Any], caller: str
+    ) -> dict[str, Any]:
+        """Invoke an exposed endpoint on the root scope.
+
+        Goes through the same ``_invoke_in_scope`` path that
+        ``handle.call`` uses, so the endpoint runs inside the root
+        scope and ``emit()``/``done()``/``fail()`` inside the
+        handler land where the program author expects.
+
+        Logs a pair of ``endpoint_called`` / ``endpoint_returned``
+        entries on the runtime log so the call is visible to any
+        downstream observer (CLI tail, status file, etc.). The
+        ``caller`` field distinguishes external invocations from
+        in-runtime ones (which currently don't go through this
+        path, but the convention lines up for when they do).
+        """
+        scope = self.runtime.root_scope
+        if scope is None:
+            return {"error": "root scope not available"}
+        handler = scope.endpoints.get(endpoint)
+        if handler is None:
+            return {"error": f"unknown endpoint '{endpoint}'"}
+        if not isinstance(kwargs, dict):
+            return {"error": "kwargs must be an object"}
+
+        log = self.runtime.log
+        if log is not None:
+            log.emit(
+                "endpoint_called",
+                {"endpoint": endpoint, "kwargs": to_jsonable(kwargs), "caller": caller},
+            )
+
+        started = time.monotonic()
+        try:
+            result = await _invoke_in_scope(scope, handler, kwargs)
+            ok, error = True, None
+        except Exception as exc:  # noqa: BLE001 -- handler errors must reach the caller
+            result, ok, error = None, False, str(exc) or type(exc).__name__
+
+        if log is not None:
+            log.emit(
+                "endpoint_returned",
+                {
+                    "endpoint": endpoint,
+                    "caller": caller,
+                    "ok": ok,
+                    "duration_ms": int((time.monotonic() - started) * 1000),
+                    **({"error": error} if error else {}),
+                },
+            )
+        if not ok:
+            return {"error": error}
+        return {"ok": True, "result": to_jsonable(result)}
 
     def _agent_info(self, name: str) -> dict[str, Any]:
         ag = self.runtime.agents[name]

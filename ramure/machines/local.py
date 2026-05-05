@@ -96,15 +96,29 @@ class LocalMachine(Machine):
 
 
 class LocalImage(Image):
-    """Image that spawns a local working directory machine."""
+    """Image that spawns a local working directory machine.
+
+    The image's :attr:`id` is ``"local:<workdir>"`` -- the ``local:``
+    prefix tags it as belonging to this backend so different
+    backends' ids never collide. ``LocalImage(id=image.id)``
+    reconstructs an equivalent image.
+    """
 
     def __init__(
         self,
         workdir: str | Path | None = None,
         env: Mapping[str, str] | None = None,
+        *,
+        id: str | None = None,
     ):
-        self.workdir = Path(workdir or os.getcwd())
+        if id is not None and id.startswith("local:"):
+            id = id[len("local:"):]
+        self.workdir = Path(id or workdir or os.getcwd())
         self.env = dict(env or {})
+
+    @property
+    def id(self) -> str:
+        return f"local:{self.workdir}"
 
     async def spawn(self) -> LocalMachine:
         return LocalMachine(self.workdir, self.env)

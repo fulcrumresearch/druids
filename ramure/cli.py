@@ -155,8 +155,12 @@ def cmd_ls() -> None:
 
 @app.command("status")
 def cmd_status(id_: str = ID_OPT) -> None:
-    """Show structure of a live run: agents, machines, connections."""
-    s = call(pick(id_), {"cmd": "status"})
+    """Show structure of a live run: agents, machines, connections,
+    plus endpoints exposed by the root program.
+    """
+    eid = pick(id_)
+    s = call(eid, {"cmd": "status"})
+    endpoints = call(eid, {"cmd": "endpoints"}).get("endpoints") or []
 
     typer.echo(f"Execution: {s['execution_id']}")
     typer.echo(f"Program:   {s.get('program', '?')}")
@@ -177,6 +181,175 @@ def cmd_status(id_: str = ID_OPT) -> None:
         typer.echo("\nConnections:")
         for c in s["connections"]:
             typer.echo(f"  {c['a']} -> {c['b']}")
+
+    if endpoints:
+        typer.echo("\nAffordances:")
+        for ep in endpoints:
+            typer.echo(f"  {_format_endpoint_signature(ep)}")
+            doc = (ep.get("description") or "").strip().splitlines()
+            if doc:
+                typer.echo(f"    {doc[0]}")
+
+    entries = call(eid, {"cmd": "tail", "n": 200}).get("entries") or []
+    recent = _format_recent(entries, limit=10)
+    if recent:
+        typer.echo("\nRecent:")
+        for line in recent:
+            typer.echo(f"  {line}")
+
+    # Footer: how an outside caller (operator or agent) drives this
+    # run. Cheap to print and the difference between "some ramure
+    # output" and "someone unfamiliar with ramure can act on it."
+    eid8 = s.get("execution_id", "")[:8]
+    typer.echo("\nInteract:")
+    typer.echo(f"  ramure send <agent> \"<msg>\" -i {eid8}")
+    if endpoints:
+        typer.echo(f"  ramure call <endpoint> k=v ... -i {eid8}")
+    if s.get("agents"):
+        typer.echo(f"  ramure connect <agent> -i {eid8}   # tmux attach")
+        typer.echo(f"  ramure ssh <agent> -i {eid8}       # shell on the machine")
+
+
+def _format_recent(entries: list[dict[str, Any]], *, limit: int = 10) -> list[str]:
+    """Format a chronological tail of runtime events for ``ramure status``.
+
+    Pairs ``endpoint_called`` with the matching ``endpoint_returned``
+    (matched by ``seq``) so each call renders on one line with its
+    outcome. ``endpoint_returned`` entries are dropped because the
+    pair already covers them. Most recent first.
+    """
+    from datetime import datetime
+
+    returns_by_seq: dict[int, dict[str, Any]] = {}
+    for e in entries:
+        if e.get("type") == "endpoint_returned":
+            ep = (e.get("data") or {}).get("endpoint")
+            if ep is not None:
+                # Index by call seq so we pair with the right call:
+                # the call's seq is one less than the return's. Walk
+                # backwards looking for the most recent matching
+                # call instead of indexing both directions.
+                returns_by_seq[e.get("seq", 0)] = e
+
+    out: list[str] = []
+    for e in reversed(entries):
+        kind = e.get("type", "?")
+        ts = datetime.fromtimestamp(e.get("ts", 0)).strftime("%H:%M:%S")
+        d = e.get("data") if isinstance(e.get("data"), dict) else {}
+        if kind == "endpoint_returned":
+            continue  # rendered with its call
+        if kind == "endpoint_called":
+            ep = d.get("endpoint", "?")
+            kwargs = d.get("kwargs") or {}
+            caller = d.get("caller", "?")
+            ret = next(
+                (r for s, r in returns_by_seq.items() if s > e.get("seq", 0)
+                 and (r.get("data") or {}).get("endpoint") == ep),
+                None,
+            )
+            if ret is None:
+                outcome = "..."
+            else:
+                rd = ret.get("data") or {}
+                outcome = "ok" if rd.get("ok") else f"error: {rd.get('error', '?')}"
+            args = ", ".join(f"{k}={_short_repr(v)}" for k, v in kwargs.items())
+            out.append(f"{ts}  {ep}({args}) by {caller} -> {outcome}")
+        else:
+            tag = (d or {}).get("agent") or (d or {}).get("execution_id") or ""
+            out.append(f"{ts}  {kind}{(' ' + tag) if tag else ''}")
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _short_repr(value: Any, limit: int = 60) -> str:
+    r = repr(value)
+    if len(r) > limit:
+        return r[: limit - 1] + "\u2026"
+    return r
+
+
+def _format_endpoint_signature(ep: dict[str, Any]) -> str:
+    """Render an endpoint's name and parameter list, e.g. ``add_task(spec)``.
+
+    The schema we get back has a flat ``parameters.properties`` map
+    plus a ``required`` list; we turn it back into something that
+    reads like a Python signature -- enough for an operator to
+    know what to type without staring at JSON.
+    """
+    name = ep.get("name", "?")
+    params = ep.get("parameters") or {}
+    props = params.get("properties") or {}
+    required = set(params.get("required") or [])
+    bits: list[str] = []
+    for pname, pschema in props.items():
+        ptype = pschema.get("type", "any")
+        if pname in required:
+            bits.append(f"{pname}: {ptype}")
+        else:
+            default = pschema.get("default")
+            bits.append(f"{pname}: {ptype} = {default!r}")
+    return f"{name}({', '.join(bits)})"
+
+
+@app.command("call")
+def cmd_call(
+    endpoint: str = typer.Argument(..., help="Endpoint name."),
+    args: list[str] = typer.Argument(
+        None, help="Arguments as key=value (JSON value, falls back to string)."
+    ),
+    id_: str = ID_OPT,
+    json_out: bool = typer.Option(
+        False, "--json", help="Print result as JSON instead of a Python repr."
+    ),
+    as_: str = typer.Option(
+        "cli", "--as", help="Caller tag recorded in the runtime log."
+    ),
+) -> None:
+    """Call an endpoint exposed by the root @agent_process.
+
+    Each ``key=value`` argument is parsed as JSON first, falling
+    back to the raw string if that fails. So ``count=3``,
+    ``enabled=true``, ``tags='["a","b"]'``, and ``spec=hello`` all
+    work.
+    """
+    kwargs = _parse_kv_args(args or [])
+    reply = call(
+        pick(id_),
+        {
+            "cmd": "call",
+            "endpoint": endpoint,
+            "kwargs": kwargs,
+            "caller": f"external:{as_}",
+        },
+    )
+    result = reply.get("result")
+    if json_out:
+        typer.echo(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        typer.echo(repr(result))
+
+
+def _parse_kv_args(items: list[str]) -> dict[str, Any]:
+    """Turn ``["k=v", "n=3"]`` into ``{"k": "v", "n": 3}``.
+
+    JSON-first because that's what makes typed values (numbers,
+    booleans, lists, objects) work without a separate flag for
+    each. Falls back to the raw string when JSON can't parse it,
+    so ``spec=hello world`` doesn't require quoting.
+    """
+    out: dict[str, Any] = {}
+    for raw in items:
+        if "=" not in raw:
+            die(f"argument '{raw}' is not in key=value form")
+        key, _, value = raw.partition("=")
+        if not key:
+            die(f"argument '{raw}' has empty key")
+        try:
+            out[key] = json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            out[key] = value
+    return out
 
 
 @app.command("send")

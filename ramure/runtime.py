@@ -14,7 +14,7 @@ import os
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ramure.agent import Agent
 from ramure.context import _current_process
@@ -25,6 +25,9 @@ from ramure.log import Log
 from ramure.machines.base import Image, Machine
 from ramure.server import Server
 from ramure.types import ToolCallError
+
+if TYPE_CHECKING:
+    from ramure.process import ProcessScope
 
 
 DEFAULT_LOG_DIR = Path.home() / ".ramure" / "logs"
@@ -63,6 +66,11 @@ class Runtime:
         self.server_url: str | None = None
         self.agents: dict[str, Agent] = {}
         self.edges: set[tuple[str, str]] = set()
+        # The root @agent_process's scope. Set by the decorator on the
+        # root branch; remains None for runtimes that haven't yet
+        # entered their root AP. The control socket dispatches
+        # external endpoint calls here.
+        self.root_scope: "ProcessScope | None" = None
         self.log_dir_root = Path(log_dir) if log_dir else DEFAULT_LOG_DIR
         self.server_instance: Server | None = None
         self.log: Log | None = None  # runtime-scope log; set in start()

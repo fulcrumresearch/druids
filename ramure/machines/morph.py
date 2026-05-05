@@ -33,11 +33,10 @@ logger = logging.getLogger(__name__)
 # Default "pi-ready" recipe
 # ---------------------------------------------------------------------------
 
-#: Shell recipe used by ``MorphImage()`` when no ``recipe`` / ``snapshot_id``
+#: Shell recipe used by ``MorphImage()`` when no ``recipe`` / ``id``
 #: is provided. Installs node, tmux, pi + pi-coding-agent, uv, gh, and a
-#: non-root ``agent`` user that can sudo -- everything druids needs on the
-#: VM to launch an agent. Adapted from the ``_DRUIDS_BASE_RECIPE`` in
-#: fulcrumresearch/druids.
+#: non-root ``agent`` user that can sudo -- everything ramure needs on
+#: the VM to launch an agent.
 DEFAULT_MORPH_RECIPE = """\
 set -e
 apt-get update && apt-get install -y git curl ca-certificates sudo vim tmux python3-pip
@@ -53,10 +52,10 @@ chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
 echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
 apt-get update && apt-get install -y gh
 
-# pi coding agent (ships the `pi` CLI druids uses to launch agents) + claude-code
+# pi coding agent (ships the `pi` CLI ramure uses to launch agents) + claude-code
 npm install -g @anthropic-ai/claude-code@latest @mariozechner/pi-coding-agent@latest
 
-# Non-root user with passwordless sudo (druids launches agents as `agent`)
+# Non-root user with passwordless sudo (ramure launches agents as `agent`)
 useradd -m -s /bin/bash agent
 echo 'agent ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/agent
 chmod 440 /etc/sudoers.d/agent
@@ -67,7 +66,7 @@ sync
 
 #: Version tag bumped whenever ``DEFAULT_MORPH_RECIPE`` changes in a way that
 #: requires rebuilding the snapshot.
-DEFAULT_MORPH_RECIPE_VERSION = "druids-codex-agent-v1"
+DEFAULT_MORPH_RECIPE_VERSION = "ramure-v1"
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +223,7 @@ class MorphMachine(Machine):
 
     async def read_file(self, path: str) -> bytes:
         resolved = self._resolve_path(path)
-        fd, local_path = tempfile.mkstemp(prefix="druids-morph-")
+        fd, local_path = tempfile.mkstemp(prefix="ramure-morph-")
         os.close(fd)
         try:
             await self._instance.adownload(resolved, local_path)
@@ -242,7 +241,7 @@ class MorphMachine(Machine):
         parent = resolved.rsplit("/", 1)[0] if "/" in resolved else "/"
         await self._instance.aexec(f"mkdir -p {parent}")
 
-        fd, local_path = tempfile.mkstemp(prefix="druids-morph-")
+        fd, local_path = tempfile.mkstemp(prefix="ramure-morph-")
         try:
             with os.fdopen(fd, "wb") as fh:
                 fh.write(data)
@@ -297,7 +296,7 @@ class MorphMachine(Machine):
         snap = await _retry(lambda: self._instance.asnapshot())
         spec = getattr(self._instance, "spec", None)
         image_kwargs: dict[str, Any] = {
-            "snapshot_id": snap.id,
+            "id": snap.id,
             "workdir": kwargs.pop("workdir", self.workdir),
         }
         if spec is not None:
@@ -398,10 +397,16 @@ class MorphMachine(Machine):
 class MorphImage(Image):
     """Image that spawns a MorphCloud VM.
 
-    Construct with a ``snapshot_id`` to boot a specific snapshot, or with a
-    ``recipe`` (shell script) to build + cache a snapshot keyed on
-    ``base_image`` + ``version`` + a hash of the recipe. With no arguments
-    the default pi-ready recipe is used so ``MorphImage()`` "just works".
+    Construct with an ``id`` (the snapshot id) to boot a specific snapshot,
+    or with a ``recipe`` (shell script) to build + cache a snapshot keyed
+    on ``base_image`` + ``version`` + a hash of the recipe. With no
+    arguments the default pi-ready recipe is used so ``MorphImage()``
+    "just works".
+
+    The :attr:`id` attribute is the Morph snapshot id and is the reload
+    key: ``MorphImage(id=image.id)`` boots the same snapshot. For images
+    constructed from a recipe, ``id`` is ``None`` until the recipe has
+    been resolved (lazily, on first :meth:`spawn`).
     """
 
     #: Default base image used when building snapshots by recipe.
@@ -410,26 +415,25 @@ class MorphImage(Image):
     def __init__(
         self,
         *,
-        snapshot_id: str | None = None,
+        id: str | None = None,
         recipe: str | None = None,
-        version: str = "druids-v1",
+        version: str = DEFAULT_MORPH_RECIPE_VERSION,
         base_image: str = DEFAULT_BASE_IMAGE,
-        vcpus: int = 2,
-        memory: int = 4096,
-        disk_size: int = 10240,
+        vcpus: int | None = None,
+        memory: int | None = None,
+        disk_size: int | None = None,
         api_key: str | None = None,
         ttl_seconds: int | None = None,
         ttl_action: str = "pause",
         metadata: Mapping[str, str] | None = None,
         workdir: str | None = None,
     ) -> None:
-        if snapshot_id is None and recipe is None:
-            # Fall back to the druids default agent recipe so `MorphImage()`
-            # with no args boots a pi-ready VM.
+        if id is None and recipe is None:
             recipe = DEFAULT_MORPH_RECIPE
-            if version == "druids-v1":
-                version = DEFAULT_MORPH_RECIPE_VERSION
-        self.snapshot_id = snapshot_id
+        # vcpus / memory / disk_size are None by default so morphcloud
+        # picks its own spec on the recipe path and the snapshot's
+        # baked-in spec wins on the id= path.
+        self.id: str | None = id
         self.recipe = recipe
         self.version = version
         self.base_image = base_image
@@ -442,9 +446,17 @@ class MorphImage(Image):
         self.metadata = dict(metadata or {})
         self.workdir = workdir
 
-    async def _resolve_snapshot_id(self) -> str:
-        if self.snapshot_id:
-            return self.snapshot_id
+    async def _resolve_id(self) -> str:
+        """Return the snapshot id, building from the recipe if needed.
+
+        Memoizes on ``self.id`` so subsequent calls are free, and so the
+        recipe-built snapshot id becomes visible to callers reading
+        ``image.id`` after a spawn. Unset resource args pass ``None``
+        through to ``acreate``, which makes morphcloud pick its own
+        server-side defaults rather than committing us to a number.
+        """
+        if self.id:
+            return self.id
         assert self.recipe is not None
         client = _get_client(self.api_key)
         digest = (
@@ -459,31 +471,23 @@ class MorphImage(Image):
             digest=digest,
         )
         snapshot = await base.abuild([self.recipe])
+        self.id = snapshot.id
         return snapshot.id
 
     async def spawn(self) -> MorphMachine:
-        snapshot_id = await self._resolve_snapshot_id()
+        snapshot_id = await self._resolve_id()
         client = _get_client(self.api_key)
-
-        kwargs: dict[str, Any] = {"metadata": self.metadata or None}
-        if self.ttl_seconds is not None and self.ttl_seconds > 0:
-            kwargs["ttl_seconds"] = self.ttl_seconds
-            kwargs["ttl_action"] = self.ttl_action
-
-        # If we just built the snapshot with our own resource spec, start;
-        # otherwise boot with our spec so snapshot defaults don't override.
-        if self.snapshot_id is None:
-            instance = await _retry(lambda: client.instances.astart(snapshot_id, **kwargs))
-        else:
-            instance = await _retry(
-                lambda: client.instances.aboot(
-                    snapshot_id,
-                    vcpus=self.vcpus,
-                    memory=self.memory,
-                    disk_size=self.disk_size,
-                    **kwargs,
-                )
+        instance = await _retry(
+            lambda: client.instances.aboot(
+                snapshot_id,
+                vcpus=self.vcpus,
+                memory=self.memory,
+                disk_size=self.disk_size,
+                metadata=self.metadata or None,
+                ttl_seconds=self.ttl_seconds,
+                ttl_action=self.ttl_action if self.ttl_seconds else None,
             )
+        )
         await instance.await_until_ready()
         logger.info("MorphImage.spawn instance=%s snapshot=%s", instance.id, snapshot_id)
         return MorphMachine(instance, workdir=self.workdir)

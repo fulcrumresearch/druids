@@ -292,13 +292,32 @@ Running a root `@agent_process` opens a Unix socket at
 under `~/.ramure/logs/{execution_id}/`. The `ramure` CLI uses these:
 
 ```text
-ramure ls                         # live runs
-ramure status [--id <prefix>]     # agents, machines, connections
+ramure ls                                       # live runs
+ramure status [--id <prefix>]                   # agents, machines, connections, affordances
 ramure send <agent> <msg> [--id <prefix>]
-ramure connect <agent> [--id <prefix>]  # tmux attach
-ramure ssh <agent> [--id <prefix>]      # shell on the agent's machine
+ramure call <endpoint> [k=v ...] [--id <prefix>] [--json]   # invoke an @expose'd endpoint
+ramure connect <agent> [--id <prefix>]          # tmux attach
+ramure ssh <agent> [--id <prefix>]              # shell on the agent's machine
 ```
 
 `--id` takes an execution-id prefix. Omit it when there's only one live run.
 All commands require the run to be live (socket present). Finished-run logs
 remain under `~/.ramure/logs/{execution_id}/`.
+
+### `ramure call` and external affordances
+
+Whatever the root `@agent_process` `@expose`s is reachable from outside
+the program via `ramure call`. Arguments are parsed as JSON first, with
+string fallback, so typed values work without flags:
+
+```text
+ramure call add_task spec="write tests"
+ramure call add_task count=3 enabled=true tags='["a","b"]'
+ramure call list_tasks --json
+```
+
+Nested AP `@expose`s remain internal — reach them via `handle.call` /
+`handle.attach` from owning code. Only the root program's surface is
+externally addressable.
+
+

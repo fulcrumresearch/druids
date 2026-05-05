@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, ParamSpec, TypeVar
 
 from ramure.agent import Agent
-from ramure.context import _current_process
+from ramure.context import _current_process, _invoke_in_scope
 from ramure.helpers import kill_agent
 from ramure.machines.base import Image, Machine
 from ramure.machines.local import LocalImage
@@ -154,18 +154,6 @@ class ProcessHandle:
             self.task.cancel()
 
 
-async def _invoke_in_scope(
-    scope: ProcessScope,
-    handler: Callable[..., Awaitable[Any]],
-    kwargs: dict[str, Any],
-) -> Any:
-    token = _current_process.set(scope)
-    try:
-        return await handler(**kwargs)
-    finally:
-        _current_process.reset(token)
-
-
 def _make_endpoint_tool(
     scope: ProcessScope,
     handler: Callable[..., Awaitable[Any]],
@@ -226,6 +214,11 @@ def agent_process(
                 scope.events = handle.events
                 handle._bind_scope(scope)
 
+            if is_root:
+                # External callers (the control socket / `ramure call`)
+                # dispatch into the root scope's exposed endpoints.
+                runtime.root_scope = scope
+
             token = _current_process.set(scope)
             try:
                 if timeout is not None:
@@ -250,6 +243,7 @@ def agent_process(
                 _current_process.reset(token)
                 await scope.cleanup()
                 if is_root:
+                    runtime.root_scope = None
                     await runtime.close()
 
         return wrapped
