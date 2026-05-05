@@ -129,6 +129,7 @@ class Runtime:
         name: str,
         *,
         system_prompt: str | None = None,
+        model: str | None = None,
         image: Image | None = None,
         machine: Machine | None = None,
     ) -> tuple[Agent, Machine | None]:
@@ -158,6 +159,7 @@ class Runtime:
             machine=resolved_machine,
             log=Log(path=log_path),
             system_prompt=system_prompt,
+            model=model,
         )
 
         self.agents[name] = ag
@@ -169,6 +171,7 @@ class Runtime:
                     "agent": name,
                     "machine": resolved_machine.describe(),
                     "system_prompt": bool(system_prompt),
+                    "model": model,
                 },
             )
 

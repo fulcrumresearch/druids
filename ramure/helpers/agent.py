@@ -28,12 +28,15 @@ def build_agent_launch_command(
     extension_path: str,
     env: dict[str, str],
     session_name: str,
+    model: str | None = None,
 ) -> str:
     env_prefix = " ".join(
         f"{key}={shlex.quote(value)}" for key, value in env.items()
     )
+    model_arg = f" --model {shlex.quote(model)}" if model else ""
     pi_invocation = (
-        f"env {env_prefix} {shlex.quote(pi_command)} --extension {shlex.quote(extension_path)}"
+        f"env {env_prefix} {shlex.quote(pi_command)}{model_arg} "
+        f"--extension {shlex.quote(extension_path)}"
     )
     return (
         f"{shlex.quote(tmux_command)} has-session -t {shlex.quote(session_name)} 2>/dev/null && "
@@ -85,6 +88,7 @@ async def launch_agent(agent: Agent, *, server_url: str, execution_id: str) -> s
         extension_path=extension_path,
         env=env,
         session_name=session_name,
+        model=agent.model,
     )
     result = await agent.machine.exec(command)
     if not result.ok:

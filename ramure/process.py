@@ -273,6 +273,7 @@ async def agent(
     name: str,
     *,
     system_prompt: str | None = None,
+    model: str | None = None,
     image: Image | None = None,
     machine: Machine | None = None,
 ) -> Agent:
@@ -281,6 +282,7 @@ async def agent(
     ag, spawned_machine = await scope.runtime.create_agent(
         name,
         system_prompt=system_prompt,
+        model=model,
         image=resolved_image,
         machine=machine,
     )

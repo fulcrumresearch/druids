@@ -32,6 +32,7 @@ class Agent:
     machine: Machine
     log: Log
     system_prompt: str | None = None
+    model: str | None = None
     handlers: dict[str, Handler] = field(default_factory=dict)
     registered: asyncio.Event = field(default_factory=asyncio.Event)
     scope: "ProcessScope | None" = field(default=None, repr=False)

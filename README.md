@@ -258,7 +258,7 @@ This lets you give a component narrow affordances instead of ambient access to e
 
 ### Ambient functions
 
-- `await agent(name, system_prompt=, image=, machine=)` — create an agent
+- `await agent(name, system_prompt=, model=, image=, machine=)` — create an agent (`model` is passed to pi's `--model`)
 - `await machine(image=)` — spawn a standalone machine
 - `connect(a, b, direction=)` — allow agents to message/send files
 - `done(result)` — signal process success

@@ -230,6 +230,18 @@ def test_scope_tracks_agents(tmp_path: Path, monkeypatch) -> None:
     asyncio.run(run())
 
 
+def test_agent_accepts_model_arg(tmp_path: Path, monkeypatch) -> None:
+    async def run() -> None:
+        runtime, scope, token = await _setup_runtime(tmp_path, monkeypatch)
+        try:
+            worker = await agent("worker", model="openai/gpt-4o")
+            assert worker.model == "openai/gpt-4o"
+        finally:
+            await _teardown_runtime(runtime, scope, token)
+
+    asyncio.run(run())
+
+
 def test_scope_tracks_machines(tmp_path: Path, monkeypatch) -> None:
     async def run() -> None:
         runtime, scope, token = await _setup_runtime(tmp_path, monkeypatch)

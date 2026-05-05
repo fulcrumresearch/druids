@@ -76,3 +76,42 @@ def test_tool_result_max_bytes_absent_when_host_env_unset(monkeypatch):
         session_name="ramure-eid-t",
     )
     assert "RAMURE_TOOL_RESULT_MAX_BYTES" not in cmd
+
+
+def test_model_arg_is_passed_to_pi_launch_command():
+    env = {
+        "RAMURE_SERVER_URL": "ws://example/test",
+        "RAMURE_EXECUTION_ID": "eid",
+        "RAMURE_AGENT_ID": "t",
+        "RAMURE_SYSTEM_PROMPT": "",
+    }
+
+    cmd = build_agent_launch_command(
+        pi_command="/usr/bin/pi",
+        tmux_command="/usr/bin/tmux",
+        extension_path="/tmp/ext.ts",
+        env=env,
+        session_name="ramure-eid-t",
+        model="openai/gpt-4o",
+    )
+
+    assert "--model openai/gpt-4o" in cmd
+
+
+def test_model_arg_absent_by_default():
+    env = {
+        "RAMURE_SERVER_URL": "ws://example/test",
+        "RAMURE_EXECUTION_ID": "eid",
+        "RAMURE_AGENT_ID": "t",
+        "RAMURE_SYSTEM_PROMPT": "",
+    }
+
+    cmd = build_agent_launch_command(
+        pi_command="/usr/bin/pi",
+        tmux_command="/usr/bin/tmux",
+        extension_path="/tmp/ext.ts",
+        env=env,
+        session_name="ramure-eid-t",
+    )
+
+    assert "--model" not in cmd
