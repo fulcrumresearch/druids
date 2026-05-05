@@ -104,8 +104,6 @@ class LocalImage(Image):
     reconstructs an equivalent image.
     """
 
-    _ID_PREFIX = "local:"
-
     def __init__(
         self,
         workdir: str | Path | None = None,
@@ -113,14 +111,14 @@ class LocalImage(Image):
         *,
         id: str | None = None,
     ):
-        if id is not None and id.startswith(self._ID_PREFIX):
-            id = id[len(self._ID_PREFIX):]
+        if id is not None and id.startswith("local:"):
+            id = id[len("local:"):]
         self.workdir = Path(id or workdir or os.getcwd())
         self.env = dict(env or {})
 
     @property
     def id(self) -> str:
-        return f"{self._ID_PREFIX}{self.workdir}"
+        return f"local:{self.workdir}"
 
     async def spawn(self) -> LocalMachine:
         return LocalMachine(self.workdir, self.env)
