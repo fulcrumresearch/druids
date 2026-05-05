@@ -199,11 +199,12 @@ def _patch_morph_spawn(monkeypatch: pytest.MonkeyPatch) -> _FakeMorphClient:
     return fake_client
 
 
-def test_morph_image_spawn_id_path_passes_none_resource_args(monkeypatch) -> None:
+def test_morph_image_spawn_id_path_uses_astart_with_no_overrides(monkeypatch) -> None:
     """Regression for the silent-downsize footgun: with ``id=`` and no
-    explicit resource args, ``aboot`` must receive ``None`` for
-    ``vcpus`` / ``memory`` / ``disk_size`` so morphcloud falls back to
-    the snapshot's baked-in spec.
+    explicit resource args we use ``astart``, which boots the
+    snapshot exactly as it was built. (``aboot`` is the only API
+    that takes resource overrides; if we don't have any, ``astart``
+    is the simpler/cleaner path.)
     """
 
     async def run() -> None:
@@ -212,22 +213,20 @@ def test_morph_image_spawn_id_path_passes_none_resource_args(monkeypatch) -> Non
         machine = await img.spawn()
         assert isinstance(machine, MorphMachine)
 
-        assert client.instances.astart_calls == []
-        assert len(client.instances.aboot_calls) == 1
-        call = client.instances.aboot_calls[0]
+        assert client.instances.aboot_calls == []
+        assert len(client.instances.astart_calls) == 1
+        call = client.instances.astart_calls[0]
         assert call["snapshot_id"] == "snap_xyz"
-        # The whole point of this fix: don't override the snapshot.
-        assert call["vcpus"] is None
-        assert call["memory"] is None
-        assert call["disk_size"] is None
 
     asyncio.run(run())
 
 
-def test_morph_image_spawn_id_path_forwards_explicit_resource_args(monkeypatch) -> None:
-    """When the user *does* set resource args, those still go through to
-    ``aboot`` and override the snapshot's spec -- this is the explicit
-    upgrade/downgrade path that should keep working.
+def test_morph_image_spawn_id_path_uses_aboot_with_explicit_overrides(monkeypatch) -> None:
+    """When the user sets resource args, ``aboot`` is the only API
+    that takes them. We forward only the ones the user actually
+    set, so an unspecified ``disk_size`` still inherits the
+    snapshot's spec rather than getting pinned to a hardcoded
+    default.
     """
 
     async def run() -> None:
@@ -235,12 +234,13 @@ def test_morph_image_spawn_id_path_forwards_explicit_resource_args(monkeypatch) 
         img = MorphImage(id="snap_xyz", vcpus=8, memory=16384)
         await img.spawn()
 
+        assert client.instances.astart_calls == []
         call = client.instances.aboot_calls[0]
         assert call["vcpus"] == 8
         assert call["memory"] == 16384
-        # The unset arg still passes through as None so we don't pin a
-        # disk_size the user never asked for.
-        assert call["disk_size"] is None
+        # Not set by the user -> not forwarded -> snapshot's own
+        # disk_size wins.
+        assert "disk_size" not in call
 
     asyncio.run(run())
 

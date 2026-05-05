@@ -448,7 +448,6 @@ class MorphImage(Image):
         # regardless of what ``snap_xyz`` was built for. Recipe-built
         # snapshots fall back to ``_RECIPE_BUILD_DEFAULTS`` in
         # :meth:`_resolve_id` because ``acreate`` needs concrete ints.
-        self._id_supplied = id is not None
         self.id: str | None = id
         self.recipe = recipe
         self.version = version
@@ -505,24 +504,28 @@ class MorphImage(Image):
             kwargs["ttl_seconds"] = self.ttl_seconds
             kwargs["ttl_action"] = self.ttl_action
 
-        # Recipe path: we just called ``acreate`` with the resolved spec,
-        # so the snapshot already encodes our resources -- ``astart`` is
-        # enough. ``id=`` path: the user gave us an existing snapshot, so
-        # we boot via ``aboot`` and forward only the resource args the
-        # user actually set. ``None`` lets the snapshot's baked-in spec
-        # win, which is the behavior we want when the user doesn't
-        # override.
-        if not self._id_supplied:
-            instance = await _retry(lambda: client.instances.astart(snapshot_id, **kwargs))
+        # Pick the API call by what we have to say, not by how we got
+        # here. ``aboot`` is the only one that accepts resource
+        # overrides; ``astart`` boots the snapshot as-is. With nothing
+        # to override, ``astart`` is the simpler path -- and the only
+        # one a recipe-built snapshot needs, since ``acreate`` already
+        # baked the spec in.
+        overrides = {
+            k: v
+            for k, v in (
+                ("vcpus", self.vcpus),
+                ("memory", self.memory),
+                ("disk_size", self.disk_size),
+            )
+            if v is not None
+        }
+        if overrides:
+            instance = await _retry(
+                lambda: client.instances.aboot(snapshot_id, **overrides, **kwargs)
+            )
         else:
             instance = await _retry(
-                lambda: client.instances.aboot(
-                    snapshot_id,
-                    vcpus=self.vcpus,
-                    memory=self.memory,
-                    disk_size=self.disk_size,
-                    **kwargs,
-                )
+                lambda: client.instances.astart(snapshot_id, **kwargs)
             )
         await instance.await_until_ready()
         logger.info("MorphImage.spawn instance=%s snapshot=%s", instance.id, snapshot_id)
