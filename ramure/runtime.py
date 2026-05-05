@@ -47,7 +47,6 @@ class Runtime:
         host: str = "127.0.0.1",
         port: int = 0,
         base_url: str | None = None,
-        summary: str | None = None,
     ):
         """Create a Runtime.
 
@@ -62,9 +61,6 @@ class Runtime:
                 actual bound port -- fine for local-only runs. Set this
                 when a proxy in front of the runtime has a different
                 public hostname, e.g. ``wss://me.example.com``.
-            summary: Short author-supplied description rendered in
-                ``STATUS.md`` so a reader (agent or human) immediately
-                knows what this program does. Optional.
         """
         self.execution_id: str | None = None
         self.server_url: str | None = None
@@ -83,7 +79,6 @@ class Runtime:
         self.host = host
         self.port = port
         self.base_url = base_url
-        self.summary = summary
 
     async def start(self) -> None:
         self.execution_id = str(uuid.uuid4())

@@ -5,13 +5,12 @@ The CLI connects, sends one line of JSON, reads one line back, closes.
 
 Commands:
 
-- ``{"cmd":"status"}`` -> ``{agents, connections, program, pid, started_at, summary}``
+- ``{"cmd":"status"}`` -> ``{agents, connections, program, pid, started_at}``
 - ``{"cmd":"agent", "name":<str>}`` -> ``{name, machine, tmux_session}``
 - ``{"cmd":"send", "agent":<str>, "text":<str>}`` -> ``{"ok":true}``
 - ``{"cmd":"ssh_credentials", "name":<str>}`` -> ``{"credentials": {host, port, username, private_key, password} | null}``
 - ``{"cmd":"endpoints"}`` -> ``{"endpoints": [{name, description, parameters}, ...]}``
 - ``{"cmd":"call", "endpoint":<str>, "kwargs":<dict>, "caller":<str>}`` -> ``{"ok":true, "result":<jsonable>}``
-- ``{"cmd":"tail", "n":<int>}`` -> ``{"entries": [{type, data, ts, seq}, ...]}``
 
 Errors come back as ``{"error":<msg>}``.
 """
@@ -109,8 +108,6 @@ class ControlServer:
                 msg.get("kwargs") or {},
                 msg.get("caller") or "external",
             )
-        if cmd == "tail":
-            return self._cmd_tail(int(msg.get("n") or 50))
         return {"error": f"unknown cmd '{cmd}'"}
 
     # -- handlers --
@@ -123,30 +120,10 @@ class ControlServer:
             "program": _program_name(),
             "started_at": rt.started_at,
             "server_url": rt.server_url,
-            "summary": rt.summary,
             "agents": [self._agent_info(ag.name) for ag in rt.agents.values()],
             "connections": [
                 {"a": a, "b": b} for (a, b) in sorted(rt.edges)
             ],
-        }
-
-    def _cmd_tail(self, n: int) -> dict[str, Any]:
-        """Return the last ``n`` runtime-log entries.
-
-        Used by ``ramure status --md`` to render "recent endpoint
-        calls" and "recent events" without persisting a file. The
-        entries are tuples shaped like the JSONL we'd write anyway,
-        so the CLI doesn't have to know about :class:`LogEntry`.
-        """
-        log = self.runtime.log
-        if log is None:
-            return {"entries": []}
-        n = max(1, min(n, 1000))
-        return {
-            "entries": [
-                {"type": e.type, "data": e.data, "ts": e.ts, "seq": e.seq}
-                for e in log._entries[-n:]
-            ]
         }
 
     def _cmd_agent(self, name: str) -> dict[str, Any]:

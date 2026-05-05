@@ -179,7 +179,6 @@ def agent_process(
     host: str = "127.0.0.1",
     port: int = 0,
     base_url: str | None = None,
-    summary: str | None = None,
 ) -> (
     Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[Any]]]
     | Callable[P, Awaitable[Any]]
@@ -199,7 +198,6 @@ def agent_process(
                     host=host,
                     port=port,
                     base_url=base_url,
-                    summary=summary,
                 )
                 await runtime.start()
             else:
