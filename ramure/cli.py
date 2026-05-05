@@ -190,6 +190,84 @@ def cmd_status(id_: str = ID_OPT) -> None:
             if doc:
                 typer.echo(f"    {doc[0]}")
 
+    entries = call(eid, {"cmd": "tail", "n": 200}).get("entries") or []
+    recent = _format_recent(entries, limit=10)
+    if recent:
+        typer.echo("\nRecent:")
+        for line in recent:
+            typer.echo(f"  {line}")
+
+    # Footer: how an outside caller (operator or agent) drives this
+    # run. Cheap to print and the difference between "some ramure
+    # output" and "someone unfamiliar with ramure can act on it."
+    eid8 = s.get("execution_id", "")[:8]
+    typer.echo("\nInteract:")
+    typer.echo(f"  ramure send <agent> \"<msg>\" -i {eid8}")
+    if endpoints:
+        typer.echo(f"  ramure call <endpoint> k=v ... -i {eid8}")
+    if s.get("agents"):
+        typer.echo(f"  ramure connect <agent> -i {eid8}   # tmux attach")
+        typer.echo(f"  ramure ssh <agent> -i {eid8}       # shell on the machine")
+
+
+def _format_recent(entries: list[dict[str, Any]], *, limit: int = 10) -> list[str]:
+    """Format a chronological tail of runtime events for ``ramure status``.
+
+    Pairs ``endpoint_called`` with the matching ``endpoint_returned``
+    (matched by ``seq``) so each call renders on one line with its
+    outcome. ``endpoint_returned`` entries are dropped because the
+    pair already covers them. Most recent first.
+    """
+    from datetime import datetime
+
+    returns_by_seq: dict[int, dict[str, Any]] = {}
+    for e in entries:
+        if e.get("type") == "endpoint_returned":
+            ep = (e.get("data") or {}).get("endpoint")
+            if ep is not None:
+                # Index by call seq so we pair with the right call:
+                # the call's seq is one less than the return's. Walk
+                # backwards looking for the most recent matching
+                # call instead of indexing both directions.
+                returns_by_seq[e.get("seq", 0)] = e
+
+    out: list[str] = []
+    for e in reversed(entries):
+        kind = e.get("type", "?")
+        ts = datetime.fromtimestamp(e.get("ts", 0)).strftime("%H:%M:%S")
+        d = e.get("data") if isinstance(e.get("data"), dict) else {}
+        if kind == "endpoint_returned":
+            continue  # rendered with its call
+        if kind == "endpoint_called":
+            ep = d.get("endpoint", "?")
+            kwargs = d.get("kwargs") or {}
+            caller = d.get("caller", "?")
+            ret = next(
+                (r for s, r in returns_by_seq.items() if s > e.get("seq", 0)
+                 and (r.get("data") or {}).get("endpoint") == ep),
+                None,
+            )
+            if ret is None:
+                outcome = "..."
+            else:
+                rd = ret.get("data") or {}
+                outcome = "ok" if rd.get("ok") else f"error: {rd.get('error', '?')}"
+            args = ", ".join(f"{k}={_short_repr(v)}" for k, v in kwargs.items())
+            out.append(f"{ts}  {ep}({args}) by {caller} -> {outcome}")
+        else:
+            tag = (d or {}).get("agent") or (d or {}).get("execution_id") or ""
+            out.append(f"{ts}  {kind}{(' ' + tag) if tag else ''}")
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _short_repr(value: Any, limit: int = 60) -> str:
+    r = repr(value)
+    if len(r) > limit:
+        return r[: limit - 1] + "\u2026"
+    return r
+
 
 def _format_endpoint_signature(ep: dict[str, Any]) -> str:
     """Render an endpoint's name and parameter list, e.g. ``add_task(spec)``.
