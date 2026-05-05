@@ -32,7 +32,7 @@ def test_morph_image_default_uses_pi_recipe() -> None:
     assert img.id is None
     assert img.recipe == DEFAULT_MORPH_RECIPE
     assert img.version == DEFAULT_MORPH_RECIPE_VERSION
-    # The default recipe must install the pieces druids needs on the VM.
+    # The default recipe must install the pieces ramure needs on the VM.
     for token in ("npm install -g", "pi-coding-agent", "tmux", "useradd -m"):
         assert token in DEFAULT_MORPH_RECIPE
 
@@ -42,19 +42,10 @@ def test_morph_image_with_id() -> None:
     assert img.id == "snap_abc"
     assert img.base_image == MorphImage.DEFAULT_BASE_IMAGE
     assert img.recipe is None
-
-
-def test_morph_image_with_id_does_not_set_resource_defaults() -> None:
-    """Regression: ``MorphImage(id=...)`` used to default vcpus / memory /
-    disk_size to hardcoded ints (2 / 4096 / 10240), which were then
-    *forced* onto ``aboot`` -- silently downsizing a snapshot that was
-    built for more. Resource args must default to ``None`` so the
-    snapshot's baked-in spec wins unless the caller overrides.
-    """
-    img = MorphImage(id="snap_abc")
-    assert img.vcpus is None
-    assert img.memory is None
-    assert img.disk_size is None
+    # Resource args default to None so the snapshot's baked-in spec
+    # wins (regression: they used to default to 2 / 4096 / 10240,
+    # silently downsizing snapshots built for more).
+    assert (img.vcpus, img.memory, img.disk_size) == (None, None, None)
 
 
 def test_morph_image_recipe_fields() -> None:
@@ -64,19 +55,6 @@ def test_morph_image_recipe_fields() -> None:
     assert img.vcpus == 1
     assert img.memory == 512
     assert img.disk_size == 2048
-
-
-def test_morph_image_recipe_no_resource_args_keeps_none_until_resolve() -> None:
-    """Recipe path also defaults to ``None`` on the instance; concrete
-    fallbacks live in ``_resolve_id`` so the snapshot build has the
-    ints ``acreate`` requires. We don't bake the defaults onto the
-    image so a future change to the build defaults can't silently
-    contaminate stored ``MorphImage`` instances.
-    """
-    img = MorphImage(recipe="echo hi")
-    assert img.vcpus is None
-    assert img.memory is None
-    assert img.disk_size is None
 
 
 def test_base_machine_fork_and_snapshot_not_implemented() -> None:
@@ -156,93 +134,48 @@ class _FakeInstance:
 
 
 # ---------------------------------------------------------------------------
-# Spawn dispatch: id= path inherits snapshot spec; recipe path uses our spec.
+# Spawn forwards resource args (or None) to aboot.
 # ---------------------------------------------------------------------------
 
 
-class _FakeInstancesAPI:
-    """Captures the kwargs handed to ``aboot``/``astart`` so tests can
-    assert on dispatch behavior without real Morph traffic.
-    """
-
-    def __init__(self) -> None:
-        self.aboot_calls: list[dict[str, Any]] = []  # type: ignore[name-defined]
-        self.astart_calls: list[dict[str, Any]] = []  # type: ignore[name-defined]
-
-    async def aboot(self, snapshot_id: str, **kwargs):
-        self.aboot_calls.append({"snapshot_id": snapshot_id, **kwargs})
-        return _FakeInstance(instance_id="morphvm_boot")
-
-    async def astart(self, snapshot_id: str, **kwargs):
-        self.astart_calls.append({"snapshot_id": snapshot_id, **kwargs})
-        return _FakeInstance(instance_id="morphvm_start")
-
-
-class _FakeMorphClient:
-    def __init__(self) -> None:
-        self.instances = _FakeInstancesAPI()
-
-
-def _patch_morph_spawn(monkeypatch: pytest.MonkeyPatch) -> _FakeMorphClient:
-    """Wire up the bare minimum of fakes to drive ``MorphImage.spawn``
-    through ``aboot`` / ``astart`` without touching the network.
+def test_morph_image_spawn_forwards_resource_args(monkeypatch) -> None:
+    """Regression for the silent-downsize footgun: when the user
+    doesn't pass resource args, ``aboot`` must receive ``None`` so
+    morphcloud falls back to the snapshot's baked-in spec rather
+    than overriding it with hardcoded numbers. When the user does
+    pass them, they flow through.
     """
     from ramure.machines import morph as morph_mod
 
-    fake_client = _FakeMorphClient()
-    monkeypatch.setattr(morph_mod, "_get_client", lambda *a, **k: fake_client)
+    calls: list[dict[str, Any]] = []
 
-    async def _retry_passthrough(fn, retries: int = 3, backoff: float = 1.0):
+    class _Instances:
+        async def aboot(self, snapshot_id: str, **kwargs):
+            calls.append({"snapshot_id": snapshot_id, **kwargs})
+            return _FakeInstance()
+
+    class _Client:
+        instances = _Instances()
+
+    async def _passthrough(fn, *_a, **_k):
         return await fn()
 
-    monkeypatch.setattr(morph_mod, "_retry", _retry_passthrough)
-    return fake_client
-
-
-def test_morph_image_spawn_id_path_uses_astart_with_no_overrides(monkeypatch) -> None:
-    """Regression for the silent-downsize footgun: with ``id=`` and no
-    explicit resource args we use ``astart``, which boots the
-    snapshot exactly as it was built. (``aboot`` is the only API
-    that takes resource overrides; if we don't have any, ``astart``
-    is the simpler/cleaner path.)
-    """
+    monkeypatch.setattr(morph_mod, "_get_client", lambda *_a, **_k: _Client())
+    monkeypatch.setattr(morph_mod, "_retry", _passthrough)
 
     async def run() -> None:
-        client = _patch_morph_spawn(monkeypatch)
-        img = MorphImage(id="snap_xyz")
-        machine = await img.spawn()
-        assert isinstance(machine, MorphMachine)
-
-        assert client.instances.aboot_calls == []
-        assert len(client.instances.astart_calls) == 1
-        call = client.instances.astart_calls[0]
-        assert call["snapshot_id"] == "snap_xyz"
+        await MorphImage(id="snap_xyz").spawn()
+        await MorphImage(id="snap_xyz", vcpus=8, memory=16384).spawn()
 
     asyncio.run(run())
 
+    assert calls[0]["vcpus"] is None
+    assert calls[0]["memory"] is None
+    assert calls[0]["disk_size"] is None
 
-def test_morph_image_spawn_id_path_uses_aboot_with_explicit_overrides(monkeypatch) -> None:
-    """When the user sets resource args, ``aboot`` is the only API
-    that takes them. We forward only the ones the user actually
-    set, so an unspecified ``disk_size`` still inherits the
-    snapshot's spec rather than getting pinned to a hardcoded
-    default.
-    """
-
-    async def run() -> None:
-        client = _patch_morph_spawn(monkeypatch)
-        img = MorphImage(id="snap_xyz", vcpus=8, memory=16384)
-        await img.spawn()
-
-        assert client.instances.astart_calls == []
-        call = client.instances.aboot_calls[0]
-        assert call["vcpus"] == 8
-        assert call["memory"] == 16384
-        # Not set by the user -> not forwarded -> snapshot's own
-        # disk_size wins.
-        assert "disk_size" not in call
-
-    asyncio.run(run())
+    assert calls[1]["vcpus"] == 8
+    assert calls[1]["memory"] == 16384
+    assert calls[1]["disk_size"] is None
 
 
 def test_morph_machine_snapshot_returns_morph_image() -> None:
