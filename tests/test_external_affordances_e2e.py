@@ -244,21 +244,26 @@ def test_ramure_call_unknown_endpoint_exits_nonzero(isolated_runtime_dirs):
         stop()
 
 
-def test_status_file_reflects_real_endpoint_call(isolated_runtime_dirs):
-    """After a real ``ramure call``, STATUS.md's recent-calls section
-    should reflect the call. Exercises the full chain:
+def test_ramure_status_md_reflects_real_endpoint_call(isolated_runtime_dirs):
+    """After a real ``ramure call``, ``ramure status --md`` must
+    surface the call in its "Recent endpoint calls" section. This
+    exercises the full chain:
 
-        CLI -> socket -> _cmd_call -> runtime.log.emit
-            -> StatusWriter subscriber -> render -> file
+        CLI(call) -> socket -> _cmd_call -> runtime.log.emit
+           ...
+        CLI(status --md) -> socket(status, endpoints, tail)
+           -> markdown digest on stdout.
 
-    This is the end-to-end story the PR actually promises. Each of
-    its links has unit coverage; this verifies they line up.
+    The previous version of this test asserted on a written file;
+    we no longer maintain a file, so the equivalent check is that
+    a fresh ``status --md`` request reflects the call.
     """
     _, log_dir = isolated_runtime_dirs
 
     def register(scope):
         @expose
         async def echo(msg: str) -> str:
+            """Echo back the message."""
             return msg
 
     stop, runtime_box = _run_runtime_in_thread(log_dir, register)
@@ -267,24 +272,18 @@ def test_status_file_reflects_real_endpoint_call(isolated_runtime_dirs):
         _wait_for_socket(rt.execution_id)
 
         runner = CliRunner()
+        eid8 = rt.execution_id[:8]
         result = runner.invoke(
-            ramure_cli.app,
-            ["call", "echo", "msg=hello", "-i", rt.execution_id[:8]],
+            ramure_cli.app, ["call", "echo", "msg=hello", "-i", eid8]
         )
         assert result.exit_code == 0
 
-        status_path = log_dir / rt.execution_id / "STATUS.md"
-        # The writer is on the runtime's loop (background thread).
-        # endpoint_called/returned are structural events so it should
-        # flush within a couple hundred ms; poll briefly.
-        deadline = time.time() + 3.0
-        text = ""
-        while time.time() < deadline:
-            text = status_path.read_text() if status_path.exists() else ""
-            if "Recent endpoint calls" in text and "echo(msg='hello')" in text:
-                break
-            time.sleep(0.05)
-
+        md_result = runner.invoke(ramure_cli.app, ["status", "--md", "-i", eid8])
+        assert md_result.exit_code == 0
+        text = md_result.stdout
+        # The four invariants the agent-facing digest is supposed to
+        # carry: section headers, the affordance, the call, and the
+        # caller tag so an operator can tell who did what.
         assert "## Affordances" in text
         assert "echo(msg: string)" in text
         assert "Recent endpoint calls" in text

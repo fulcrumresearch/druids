@@ -154,12 +154,29 @@ def cmd_ls() -> None:
 
 
 @app.command("status")
-def cmd_status(id_: str = ID_OPT) -> None:
-    """Show structure of a live run: agents, machines, connections,
-    plus endpoints exposed by the root program.
+def cmd_status(
+    id_: str = ID_OPT,
+    md: bool = typer.Option(
+        False, "--md", help="Render as a markdown digest suitable for an LLM/agent."
+    ),
+) -> None:
+    """Show structure of a live run.
+
+    Default output is a compact human view: agents, machines,
+    connections, and any endpoints exposed by the root program.
+    ``--md`` renders a longer markdown digest including the program
+    summary, recent endpoint calls, and recent events -- the same
+    information an agent needs to operate the run without prior
+    knowledge of ramure.
     """
     eid = pick(id_)
     s = call(eid, {"cmd": "status"})
+    endpoints = call(eid, {"cmd": "endpoints"}).get("endpoints") or []
+
+    if md:
+        entries = call(eid, {"cmd": "tail", "n": 200}).get("entries") or []
+        typer.echo(_render_status_md(s, endpoints, entries))
+        return
 
     typer.echo(f"Execution: {s['execution_id']}")
     typer.echo(f"Program:   {s.get('program', '?')}")
@@ -181,11 +198,6 @@ def cmd_status(id_: str = ID_OPT) -> None:
         for c in s["connections"]:
             typer.echo(f"  {c['a']} -> {c['b']}")
 
-    # Affordances: endpoints @expose'd by the root @agent_process,
-    # callable via `ramure call`. A separate round-trip keeps
-    # `cmd: status` and `cmd: endpoints` independent (one is
-    # topology, the other is the public API).
-    endpoints = call(eid, {"cmd": "endpoints"}).get("endpoints") or []
     if endpoints:
         typer.echo("\nAffordances:")
         for ep in endpoints:
@@ -193,6 +205,178 @@ def cmd_status(id_: str = ID_OPT) -> None:
             doc = (ep.get("description") or "").strip().splitlines()
             if doc:
                 typer.echo(f"    {doc[0]}")
+
+
+def _render_status_md(
+    status: dict[str, Any],
+    endpoints: list[dict[str, Any]],
+    entries: list[dict[str, Any]],
+) -> str:
+    """Markdown digest of a live run, suitable for piping at an LLM.
+
+    This used to be a file (``STATUS.md``) maintained by a background
+    writer. The information it surfaces is the same; the upgrade is
+    that it's always current (rendered on demand from the
+    authoritative socket) and there's no second surface to keep in
+    sync. ``ramure status --md > STATUS.md`` recovers the old
+    behavior in one line if anything ever wants the file.
+    """
+    from datetime import datetime
+
+    eid = status.get("execution_id") or "<unset>"
+    eid8 = eid[:8]
+    started_at = status.get("started_at")
+    started = (
+        datetime.fromtimestamp(started_at).isoformat(timespec="seconds")
+        if started_at
+        else "?"
+    )
+
+    lines: list[str] = []
+    lines.append(f"# ramure execution {eid}")
+    lines.append("")
+    lines.append(f"- Program: {status.get('program', '?')}")
+    lines.append(f"- Started: {started}")
+    lines.append(f"- PID: {status.get('pid', '?')}")
+    if status.get("summary"):
+        lines.append("")
+        lines.append("## Summary")
+        lines.append("")
+        lines.append(str(status["summary"]).strip())
+
+    lines.append("")
+    lines.append("## Affordances")
+    lines.append("")
+    if endpoints:
+        lines.append(
+            "Call from outside with `ramure call <name> k=v ...`. "
+            "Arguments are parsed as JSON, falling back to strings."
+        )
+        lines.append("")
+        for ep in endpoints:
+            lines.append(f"- `{_format_endpoint_signature(ep)}`")
+            doc = (ep.get("description") or "").strip().splitlines()
+            if doc:
+                lines.append(f"  - {doc[0]}")
+    else:
+        lines.append("_(no endpoints exposed)_")
+
+    lines.append("")
+    lines.append("## Agents")
+    lines.append("")
+    agents = status.get("agents") or []
+    if agents:
+        for ag in agents:
+            m = ag.get("machine") or {}
+            bits = [m.get("kind", "?")]
+            if "workdir" in m:
+                bits.append(f"workdir={m['workdir']}")
+            tmux = ag.get("tmux_session") or f"ramure-{eid8}-{ag.get('name', '?')}"
+            lines.append(f"- `{ag.get('name', '?')}` [{' '.join(bits)}] tmux=`{tmux}`")
+    else:
+        lines.append("_(none yet)_")
+
+    connections = status.get("connections") or []
+    if connections:
+        lines.append("")
+        lines.append("## Connections")
+        lines.append("")
+        for c in connections:
+            lines.append(f"- {c['a']} -> {c['b']}")
+
+    calls = _format_recent_calls(entries)
+    if calls:
+        lines.append("")
+        lines.append(f"## Recent endpoint calls (last {len(calls)})")
+        lines.append("")
+        for line in calls:
+            lines.append(f"- {line}")
+
+    events = _format_recent_events(entries)
+    if events:
+        lines.append("")
+        lines.append(f"## Recent events (last {len(events)})")
+        lines.append("")
+        for line in events:
+            lines.append(f"- {line}")
+
+    lines.append("")
+    lines.append("## How to interact")
+    lines.append("")
+    lines.append(f"- `ramure status -i {eid8}` \u2014 full snapshot")
+    lines.append(f"- `ramure send <agent> \"<msg>\" -i {eid8}` \u2014 message an agent")
+    lines.append(
+        f"- `ramure call <endpoint> k=v ... -i {eid8}` \u2014 call an exposed endpoint"
+    )
+    lines.append(f"- `ramure connect <agent> -i {eid8}` \u2014 attach to an agent's tmux")
+
+    return "\n".join(lines)
+
+
+def _format_recent_calls(entries: list[dict[str, Any]], limit: int = 10) -> list[str]:
+    """Pair ``endpoint_called`` with its matching ``endpoint_returned``.
+
+    Walks the tail most-recent-first; for each call, picks the
+    earliest return whose ``seq`` is greater than the call's. A
+    call without a return reads as ``...`` (still in flight).
+    """
+    from datetime import datetime
+
+    returns_by_endpoint: dict[str, list[dict[str, Any]]] = {}
+    for e in entries:
+        if e.get("type") == "endpoint_returned":
+            ep = (e.get("data") or {}).get("endpoint", "?")
+            returns_by_endpoint.setdefault(ep, []).append(e)
+
+    out: list[str] = []
+    for e in reversed(entries):
+        if e.get("type") != "endpoint_called":
+            continue
+        d = e.get("data") or {}
+        ep = d.get("endpoint", "?")
+        kwargs = d.get("kwargs") or {}
+        caller = d.get("caller", "?")
+        ret = next(
+            (r for r in returns_by_endpoint.get(ep, []) if r.get("seq", 0) > e.get("seq", 0)),
+            None,
+        )
+        if ret is None:
+            outcome = "..."
+        else:
+            rd = ret.get("data") or {}
+            outcome = "ok" if rd.get("ok") else f"error: {rd.get('error', '?')}"
+        args_str = ", ".join(f"{k}={_short_repr(v)}" for k, v in kwargs.items())
+        ts = datetime.fromtimestamp(e.get("ts", 0)).strftime("%H:%M:%S")
+        out.append(f"{ts}  {ep}({args_str}) by {caller} -> {outcome}")
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _format_recent_events(entries: list[dict[str, Any]], limit: int = 20) -> list[str]:
+    """Recent non-endpoint events (calls render in their own section)."""
+    from datetime import datetime
+
+    skip = {"endpoint_called", "endpoint_returned"}
+    out: list[str] = []
+    for e in reversed(entries):
+        if e.get("type") in skip:
+            continue
+        d = e.get("data") if isinstance(e.get("data"), dict) else {}
+        tag = (d or {}).get("agent") or (d or {}).get("execution_id") or ""
+        extra = f" {tag}" if tag else ""
+        ts = datetime.fromtimestamp(e.get("ts", 0)).strftime("%H:%M:%S")
+        out.append(f"{ts}  {e.get('type', '?')}{extra}")
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _short_repr(value: Any, limit: int = 60) -> str:
+    r = repr(value)
+    if len(r) > limit:
+        return r[: limit - 1] + "\u2026"
+    return r
 
 
 def _format_endpoint_signature(ep: dict[str, Any]) -> str:

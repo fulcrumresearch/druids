@@ -320,15 +320,17 @@ Nested AP `@expose`s remain internal — reach them via `handle.call` /
 `handle.attach` from owning code. Only the root program's surface is
 externally addressable.
 
-### STATUS.md
+### `ramure status --md` (agent-facing digest)
 
-Every run writes a continuously-updated digest at
-`~/.ramure/logs/{execution_id}/STATUS.md`. The file orients an LLM or
-human reader: what the program is, which agents are alive, which
-endpoints are callable, and how to interact via the CLI. It updates as
-topology and activity change, and gets a final snapshot on shutdown.
-Point an outside agent at this file to give it context without bespoke
-prompting.
+`ramure status --md` renders a markdown digest of the live run —
+program metadata, summary, exposed affordances, agents, connections,
+recent endpoint calls, and a "how to interact" footer. Pipe it at
+an LLM (or read it yourself) to orient on a run without prior
+knowledge of ramure. Always fresh because it's rendered on demand
+from the authoritative socket; no background writer.
 
 A short author-supplied description can be added with
 `@agent_process(summary="...")`.
+
+If anything ever wants the file behavior back, `ramure status --md > STATUS.md`
+recovers it in one line.

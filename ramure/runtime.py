@@ -24,7 +24,6 @@ from ramure.helpers import launch_agent as _launch_agent_impl
 from ramure.log import Log
 from ramure.machines.base import Image, Machine
 from ramure.server import Server
-from ramure.status import StatusWriter
 from ramure.types import ToolCallError
 
 if TYPE_CHECKING:
@@ -85,7 +84,6 @@ class Runtime:
         self.port = port
         self.base_url = base_url
         self.summary = summary
-        self.status: StatusWriter | None = None
 
     async def start(self) -> None:
         self.execution_id = str(uuid.uuid4())
@@ -103,15 +101,6 @@ class Runtime:
 
         self.control = ControlServer(self)
         await self.control.start()
-
-        # STATUS.md sits next to the runtime log so the directory
-        # is a self-describing artifact: log + digest + (later)
-        # post-mortem snapshot. The writer subscribes to the
-        # runtime log; emit the start event below *after* it's up
-        # so the very first log entry shows up in the file.
-        status_path = self.log_dir_root / self.execution_id / "STATUS.md"
-        self.status = StatusWriter(self, status_path, summary=self.summary)
-        await self.status.start()
 
         self.log.emit(
             "execution_started",
@@ -131,14 +120,6 @@ class Runtime:
             self.log.emit("execution_ended", {"execution_id": self.execution_id})
             self.log.close()
             self.log = None
-        if self.status is not None:
-            # Final snapshot stamps the file with terminal status.
-            # We don't currently know if the run failed or succeeded
-            # at this layer; "done" is fine because @agent_process
-            # also emits its own done/failed event onto the parent
-            # stream, which is reflected in the runtime log.
-            await self.status.stop(status="done")
-            self.status = None
         if self.server_instance is not None:
             await self.server_instance.stop()
             self.server_instance = None
