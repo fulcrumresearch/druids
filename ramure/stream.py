@@ -128,7 +128,7 @@ class Stream:
         *,
         timeout: float | None = None,
         where: Callable[[Event], bool] | None = None,
-        replay: bool = True,
+        replay: bool = False,
     ) -> Event | None:
         """Wait for the first matching event.
 
@@ -137,9 +137,8 @@ class Stream:
         event, or ``None`` if ``timeout`` expires or the stream closes
         before a match.
 
-        By default this mirrors normal stream iteration and checks
-        buffered events first. Pass ``replay=False`` to listen only for
-        events emitted after this call starts.
+        By default this listens only for events emitted after this call
+        starts. Pass ``replay=True`` to check buffered events first.
         """
         def matches(event: Event) -> bool:
             if type is not None and event.type != type:
