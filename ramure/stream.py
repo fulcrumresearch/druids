@@ -122,6 +122,44 @@ class Stream:
         """Return a copy of items emitted so far, oldest first."""
         return list(self._items)
 
+    async def listen_for(
+        self,
+        type: str | None = None,
+        *,
+        timeout: float | None = None,
+        where: Callable[[Event], bool] | None = None,
+        replay: bool = True,
+    ) -> Event | None:
+        """Wait for the first matching event.
+
+        ``type`` matches :attr:`Event.type`; ``where`` can add an
+        arbitrary predicate over the full event. Returns the matching
+        event, or ``None`` if ``timeout`` expires or the stream closes
+        before a match.
+
+        By default this mirrors normal stream iteration and checks
+        buffered events first. Pass ``replay=False`` to listen only for
+        events emitted after this call starts.
+        """
+        def matches(event: Event) -> bool:
+            if type is not None and event.type != type:
+                return False
+            return where(event) if where is not None else True
+
+        async def find() -> Event | None:
+            start = 0 if replay else len(self._items)
+            async for event in _StreamIter(self, start=start):
+                if matches(event):
+                    return event
+            return None
+
+        if timeout is None:
+            return await find()
+        try:
+            return await asyncio.wait_for(find(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+
     def __len__(self) -> int:
         return len(self._items)
 
@@ -130,9 +168,12 @@ class Stream:
 
 
 class _StreamIter:
-    def __init__(self, stream: Stream) -> None:
+    def __init__(self, stream: Stream, *, start: int = 0) -> None:
         self._stream = stream
-        self._index = 0
+        self._index = start
+
+    def __aiter__(self) -> _StreamIter:
+        return self
 
     async def __anext__(self) -> Event:
         while True:

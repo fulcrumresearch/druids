@@ -205,6 +205,74 @@ def test_subscribe_preserves_async_iter() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Stream.listen_for
+# ---------------------------------------------------------------------------
+
+
+def test_listen_for_replays_existing_match() -> None:
+    async def run() -> None:
+        stream = Stream()
+        stream.emit("tool_call", {"tool": "report"})
+
+        event = await stream.listen_for(
+            "tool_call",
+            timeout=0.1,
+            where=lambda e: e.data.get("tool") == "report",
+        )
+
+        assert event == Event(type="tool_call", data={"tool": "report"})
+
+    asyncio.run(run())
+
+
+def test_listen_for_waits_for_live_match() -> None:
+    async def run() -> None:
+        stream = Stream()
+
+        task = asyncio.create_task(
+            stream.listen_for(
+                "tool_call",
+                timeout=0.5,
+                where=lambda e: e.data.get("tool") == "report",
+                replay=False,
+            )
+        )
+        await asyncio.sleep(0)
+
+        stream.emit("tool_call", {"tool": "other"})
+        stream.emit("tool_call", {"tool": "report"})
+
+        event = await task
+        assert event == Event(type="tool_call", data={"tool": "report"})
+
+    asyncio.run(run())
+
+
+def test_listen_for_returns_none_on_timeout() -> None:
+    async def run() -> None:
+        stream = Stream()
+
+        event = await stream.listen_for("done", timeout=0.01)
+
+        assert event is None
+
+    asyncio.run(run())
+
+
+def test_listen_for_returns_none_when_stream_closes() -> None:
+    async def run() -> None:
+        stream = Stream()
+        task = asyncio.create_task(stream.listen_for("done"))
+        await asyncio.sleep(0)
+
+        stream.close()
+
+        assert await task is None
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
 # Event.source: envelope metadata
 # ---------------------------------------------------------------------------
 
