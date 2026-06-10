@@ -374,11 +374,12 @@ def cmd_connect(
     """Attach to an agent's tmux session.
 
     For local agents the tmux server is on this host, so we ``tmux
-    attach`` directly. For remote agents (e.g. Morph) the tmux session
-    lives on the VM and is owned by the ``agent`` user, so we SSH in
-    and ``sudo -u agent`` before running ``tmux attach`` -- otherwise
-    we'd look at root's (empty) tmux socket and the session appears
-    not to exist.
+    attach`` directly. For Docker agents we ``docker exec -it`` into
+    the container as ``agent`` and attach there. For remote agents
+    (e.g. Morph) the tmux session lives on the VM and is owned by the
+    ``agent`` user, so we SSH in and ``sudo -u agent`` before running
+    ``tmux attach`` -- otherwise we'd look at root's (empty) tmux
+    socket and the session appears not to exist.
     """
     eid = pick(id_)
     info = call(eid, {"cmd": "agent", "name": agent})
@@ -387,6 +388,11 @@ def cmd_connect(
 
     creds = call(eid, {"cmd": "ssh_credentials", "name": agent}).get("credentials")
     if creds is None:
+        m = info.get("machine") or {}
+        if m.get("kind") == "DockerMachine":
+            argv = _docker_tmux_attach_argv(m, session)
+            os.execvp(argv[0], argv)
+            return
         # Local: tmux is on this host; no user switching needed.
         os.execvp("tmux", ["tmux", "attach-session", "-t", session])
         return
@@ -407,7 +413,8 @@ def cmd_ssh(
     """Open a shell on an agent's machine.
 
     For local agents this drops into a shell ``cd``'d to the agent's
-    workdir. For remote agents (e.g. Morph) this opens an SSH session
+    workdir. For Docker agents this opens ``docker exec -it`` as
+    ``agent``. For remote agents (e.g. Morph) this opens an SSH session
     and ``sudo -iu agent`` so the shell sees the right env, PATH, and
     ``$HOME`` -- matching where the agent itself was launched.
     """
@@ -418,6 +425,10 @@ def cmd_ssh(
 
     creds = call(eid, {"cmd": "ssh_credentials", "name": agent}).get("credentials")
     if creds is None:
+        if m.get("kind") == "DockerMachine":
+            argv = _docker_login_shell_argv(m)
+            os.execvp(argv[0], argv)
+            return
         if m.get("kind") != "LocalMachine":
             die(
                 f"ssh not supported for machine kind '{m.get('kind')}': "
@@ -433,6 +444,38 @@ def cmd_ssh(
     remote = _remote_login_shell(creds)
     argv = _ssh_argv(creds, remote_command=remote, tty=True)
     os.execvp(argv[0], argv)
+
+
+def _docker_tmux_attach_argv(machine: dict[str, Any], session: str) -> list[str]:
+    """Docker argv for attaching to an agent tmux session in-container."""
+    container_id = machine.get("container_id")
+    if not container_id:
+        die("DockerMachine is missing container_id; cannot connect")
+    return [
+        "docker",
+        "exec",
+        "-it",
+        "--user",
+        _AGENT_USER,
+        str(container_id),
+        "tmux",
+        "attach-session",
+        "-t",
+        session,
+    ]
+
+
+def _docker_login_shell_argv(machine: dict[str, Any]) -> list[str]:
+    """Docker argv for opening a shell matching the agent user/container."""
+    container_id = machine.get("container_id")
+    if not container_id:
+        die("DockerMachine is missing container_id; cannot open shell")
+    argv = ["docker", "exec", "-it", "--user", _AGENT_USER]
+    workdir = machine.get("workdir")
+    if workdir:
+        argv.extend(["--workdir", str(workdir)])
+    argv.extend([str(container_id), "/bin/bash", "-l"])
+    return argv
 
 
 def _remote_tmux_attach(session: str) -> str:

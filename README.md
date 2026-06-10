@@ -165,40 +165,22 @@ That's the whole contract. ramure uses `exec` to launch the `pi` harness in a tm
 Bundled backends:
 
 - `LocalImage(workdir=, env=)` — your host. Default. Each spawned `LocalMachine` is just a working directory.
+- `DockerImage("image:tag", workdir=, env=, volumes=)` — a local Docker container. The image must include `bash`, `tmux`, `pi`, and an `agent` user. Uses `--network host` by default so the agent can reach the local runtime. `ramure connect` / `ramure ssh` use `docker exec -it` for Docker agents.
 - `MorphImage(...)` — [MorphCloud](https://morphcloud.com) VMs. Snapshot/fork friendly. `pip install ramure[morph]`.
+
+```python
+from ramure import DockerImage, agent_process
+
+@agent_process(image=DockerImage("my-pi-ready-image:latest", workdir="/home/agent"))
+async def run():
+    ...
+```
 
 ### Adding your own backend
 
-A new backend is a pair: an `Image` that knows how to bring up a machine, and a `Machine` that wraps the running thing. For example, a Docker container backend would look roughly like:
+A new backend is a pair: an `Image` that knows how to bring up a machine, and a `Machine` that wraps the running thing. Pass an instance anywhere ramure takes one: `@agent_process(image=MyImage(...))`, `await agent("name", image=...)`, or `await machine(image=...)`. The runtime takes care of registering the agent over WebSocket from inside the machine, and tears everything down via `Machine.stop()` when the AP exits.
 
-```python
-from ramure.machines.base import Image, Machine
-from ramure.types import ExecResult
-
-class DockerMachine(Machine):
-    def __init__(self, container_id: str):
-        self.container_id = container_id
-
-    async def exec(self, command, *, user="agent", timeout=None):
-        # docker exec ... and wrap in ExecResult
-        ...
-
-    async def write_file(self, path, content): ...
-    async def read_file(self, path): ...
-    async def stop(self): ...  # docker rm -f
-
-class DockerImage(Image):
-    def __init__(self, image: str):
-        self.image = image
-
-    async def spawn(self) -> DockerMachine:
-        # docker run -d ... and return DockerMachine(container_id)
-        ...
-```
-
-Pass an instance anywhere ramure takes one: `@agent_process(image=DockerImage("my/image"))`, `await agent("name", image=...)`, or `await machine(image=...)`. The runtime takes care of registering the agent over WebSocket from inside the machine, and tears everything down via `Machine.stop()` when the AP exits.
-
-Look at [`ramure/machines/local.py`](./ramure/machines/local.py) (~110 lines) for the simplest reference implementation, and [`ramure/machines/morph.py`](./ramure/machines/morph.py) for one with SSH, snapshots, and forking.
+Look at [`ramure/machines/local.py`](./ramure/machines/local.py) (~110 lines) for the simplest reference implementation, [`ramure/machines/docker.py`](./ramure/machines/docker.py) for a CLI-backed container implementation, and [`ramure/machines/morph.py`](./ramure/machines/morph.py) for one with SSH, snapshots, and forking.
 
 ### Endpoints and afforded interfaces
 
@@ -303,6 +285,10 @@ ramure ssh <agent> [--id <prefix>]              # shell on the agent's machine
 `--id` takes an execution-id prefix. Omit it when there's only one live run.
 All commands require the run to be live (socket present). Finished-run logs
 remain under `~/.ramure/logs/{execution_id}/`.
+
+Agent logs include raw activity events from `pi`. Assistant responses also emit
+`usage` entries with token counts and estimated cost; those entries are mirrored
+into `_runtime.jsonl` with an `agent` field for run-level accounting.
 
 ### `ramure call` and external affordances
 

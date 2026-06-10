@@ -7,14 +7,18 @@ at startup, which is covered by integration / factory-2 runs.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from ramure.agent import Agent
 from ramure.helpers.agent import build_agent_launch_command, launch_agent
 from ramure.log import Log
+from ramure.machines.base import Machine
 from ramure.machines.local import LocalMachine
+from ramure.types import ExecResult
 
 
 def _fake_agent() -> Agent:
@@ -115,3 +119,43 @@ def test_model_arg_absent_by_default():
     )
 
     assert "--model" not in cmd
+
+
+def test_launch_agent_prefers_machine_pi_and_tmux_paths():
+    class FakeMachine(Machine):
+        def __init__(self) -> None:
+            self.launch_command = ""
+
+        async def exec(
+            self,
+            command: str,
+            *,
+            user: str = "agent",
+            timeout: int | None = None,
+        ) -> ExecResult:
+            if command == "command -v pi":
+                return ExecResult(0, "/opt/bin/pi\n", "", command=command)
+            if command == "command -v tmux":
+                return ExecResult(0, "/opt/bin/tmux\n", "", command=command)
+            self.launch_command = command
+            return ExecResult(0, "", "", command=command)
+
+        async def write_file(self, path: str, content: bytes | str) -> None:
+            self.extension_path = path
+
+        async def read_file(self, path: str) -> bytes:
+            return b""
+
+        async def stop(self) -> None:
+            return None
+
+        def describe(self) -> dict[str, Any]:
+            return {"kind": "FakeMachine"}
+
+    machine = FakeMachine()
+    ag = Agent(name="t", machine=machine, log=Log())
+
+    asyncio.run(launch_agent(ag, server_url="ws://example/test", execution_id="eid"))
+
+    assert "/opt/bin/tmux has-session" in machine.launch_command
+    assert "/opt/bin/pi --extension" in machine.launch_command

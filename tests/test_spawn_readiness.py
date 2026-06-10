@@ -9,7 +9,9 @@ from pathlib import Path
 import pytest
 
 from ramure import LocalImage, Runtime
+from ramure.machines.base import Image, Machine
 from ramure.process import ProcessScope, _current_process, agent
+from ramure.types import ExecResult
 from tests.helpers import FakeAgentClient, disable_agent_launch, wait_for_server
 
 
@@ -120,6 +122,100 @@ def test_spawn_readiness_blocks_until_registered(tmp_path: Path, monkeypatch) ->
             assert worker.name == "test-agent"
             assert runtime.agents["test-agent"].registered.is_set()
             assert elapsed >= 0.25
+        finally:
+            await _teardown(runtime, scope, token)
+
+    asyncio.run(run())
+
+
+def test_usage_event_is_mirrored_to_runtime_log(tmp_path: Path, monkeypatch) -> None:
+    async def run() -> None:
+        runtime, scope, token = await _setup(tmp_path, monkeypatch)
+        try:
+            disable_agent_launch(runtime, monkeypatch)
+            worker = await agent("worker")
+
+            await asyncio.to_thread(wait_for_server, runtime.server_url)
+            client = await _make_client(runtime, "worker")
+            try:
+                await asyncio.to_thread(client.register)
+                await asyncio.to_thread(
+                    client._send,
+                    {
+                        "type": "event",
+                        "event_type": "usage",
+                        "data": {
+                            "model": "test-model",
+                            "total_tokens": 123,
+                            "cost": {"total": 0.0042},
+                        },
+                    },
+                )
+                assert await asyncio.to_thread(client.next_event, "usage")
+
+                assert runtime.log is not None
+                usage_entries = [
+                    e for e in runtime.log.after(0) if e.type == "usage"
+                ]
+                assert usage_entries[-1].data == {
+                    "agent": worker.name,
+                    "model": "test-model",
+                    "total_tokens": 123,
+                    "cost": {"total": 0.0042},
+                }
+            finally:
+                await asyncio.to_thread(client.close)
+        finally:
+            await _teardown(runtime, scope, token)
+
+    asyncio.run(run())
+
+
+def test_spawned_machine_stops_if_agent_launch_fails(tmp_path: Path, monkeypatch) -> None:
+    class StoppableMachine(Machine):
+        stopped = False
+
+        async def exec(
+            self,
+            command: str,
+            *,
+            user: str = "agent",
+            timeout: int | None = None,
+        ) -> ExecResult:
+            return ExecResult(0, "", "", command=command)
+
+        async def write_file(self, path: str, content: bytes | str) -> None:
+            return None
+
+        async def read_file(self, path: str) -> bytes:
+            return b""
+
+        async def stop(self) -> None:
+            self.stopped = True
+
+    class OneMachineImage(Image):
+        id = "one-machine"
+
+        def __init__(self, machine: StoppableMachine) -> None:
+            self.machine = machine
+
+        async def spawn(self) -> Machine:
+            return self.machine
+
+    async def run() -> None:
+        runtime, scope, token = await _setup(tmp_path, monkeypatch)
+        machine = StoppableMachine()
+        try:
+            async def fail_launch(ag):
+                raise RuntimeError("launch failed")
+
+            monkeypatch.setattr(runtime, "launch_agent", fail_launch)
+
+            with pytest.raises(RuntimeError, match="launch failed"):
+                await agent("bad", image=OneMachineImage(machine))
+
+            assert machine.stopped
+            assert "bad" not in runtime.agents
         finally:
             await _teardown(runtime, scope, token)
 

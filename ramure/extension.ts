@@ -13,7 +13,13 @@ const toolResultMaxBytes = Math.max(
   0,
   parseInt(process.env.RAMURE_TOOL_RESULT_MAX_BYTES || "16384", 10),
 );
-
+// Cap on visible message text per event. This logs assistant/user text
+// emitted by pi, but deliberately does not include hidden thinking blocks.
+// Set to 0 to forward without truncation.
+const messageMaxBytes = Math.max(
+  0,
+  parseInt(process.env.RAMURE_MESSAGE_MAX_BYTES || "16384", 10),
+);
 type RemoteTool = {
   name: string;
   description?: string;
@@ -337,7 +343,14 @@ function setupActivityForwarding(pi: ExtensionAPI): void {
   });
 
   pi.on("message_end", async (event) => {
-    sendEvent("message_end", { role: event.message?.role });
+    sendEvent("message_end", {
+      role: event.message?.role,
+      ...extractMessageLogFields(event.message),
+    });
+    const usage = extractUsageEventFields(event.message);
+    if (usage) {
+      sendEvent("usage", usage);
+    }
   });
 
   pi.on("tool_execution_start", async (event) => {
@@ -361,6 +374,105 @@ function setupActivityForwarding(pi: ExtensionAPI): void {
       ...extractToolResultFields(event.result),
     });
   });
+}
+
+function extractUsageEventFields(message: any): Record<string, unknown> | null {
+  if (!message || message.role !== "assistant" || !message.usage) {
+    return null;
+  }
+
+  const usage = message.usage || {};
+  const cost = usage.cost || {};
+  return {
+    api: message.api,
+    provider: message.provider,
+    model: message.model,
+    response_model: message.responseModel,
+    stop_reason: message.stopReason,
+    input_tokens: numberOrNull(usage.input),
+    output_tokens: numberOrNull(usage.output),
+    cache_read_tokens: numberOrNull(usage.cacheRead),
+    cache_write_tokens: numberOrNull(usage.cacheWrite),
+    total_tokens: numberOrNull(usage.totalTokens),
+    cost: {
+      input: numberOrNull(cost.input),
+      output: numberOrNull(cost.output),
+      cache_read: numberOrNull(cost.cacheRead),
+      cache_write: numberOrNull(cost.cacheWrite),
+      total: numberOrNull(cost.total),
+    },
+  };
+}
+
+function numberOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function extractMessageLogFields(message: any): Record<string, unknown> {
+  if (!message) {
+    return { text: "", truncated: false };
+  }
+
+  const textParts: string[] = [];
+  const toolCalls: Array<Record<string, unknown>> = [];
+  let thinkingBlocks = 0;
+  let thinkingChars = 0;
+  let imageBlocks = 0;
+  let otherBlocks = 0;
+
+  const content = message.content;
+  if (typeof content === "string") {
+    textParts.push(content);
+  } else if (Array.isArray(content)) {
+    for (const item of content) {
+      if (!item || typeof item !== "object") {
+        otherBlocks += 1;
+        continue;
+      }
+      const it = item as Record<string, unknown>;
+      if (it.type === "text" && typeof it.text === "string") {
+        textParts.push(it.text);
+      } else if (it.type === "toolCall") {
+        toolCalls.push({
+          id: typeof it.id === "string" ? it.id : undefined,
+          name: typeof it.name === "string" ? it.name : undefined,
+          arguments: it.arguments,
+        });
+      } else if (it.type === "thinking") {
+        thinkingBlocks += 1;
+        const thinking = typeof it.thinking === "string" ? it.thinking : "";
+        thinkingChars += thinking.length;
+      } else if (it.type === "image") {
+        imageBlocks += 1;
+      } else {
+        otherBlocks += 1;
+      }
+    }
+  }
+
+  const out: Record<string, unknown> = {
+    ...applyMessageTruncation(textParts.join("")),
+    content_blocks: Array.isArray(content) ? content.length : (content ? 1 : 0),
+  };
+  if (toolCalls.length > 0) out.tool_calls = toolCalls;
+  if (thinkingBlocks > 0) {
+    out.thinking_blocks_redacted = thinkingBlocks;
+    out.thinking_chars_redacted = thinkingChars;
+  }
+  if (imageBlocks > 0) out.image_blocks = imageBlocks;
+  if (otherBlocks > 0) out.other_blocks = otherBlocks;
+  return out;
+}
+
+function applyMessageTruncation(text: string): Record<string, unknown> {
+  if (messageMaxBytes === 0 || text.length <= messageMaxBytes) {
+    return { text, truncated: false };
+  }
+  return {
+    text: text.slice(0, messageMaxBytes) + "... [truncated]",
+    truncated: true,
+    original_length: text.length,
+  };
 }
 
 // Pull the human-readable parts out of pi's ToolExecutionEndEvent

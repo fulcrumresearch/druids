@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import shlex
-import shutil
 from typing import TYPE_CHECKING
 
 from ramure.extension import extension_source
@@ -19,6 +18,26 @@ def agent_extension_path(execution_id: str, agent_name: str) -> str:
 
 def agent_session_name(execution_id: str, agent_name: str) -> str:
     return f"ramure-{execution_id}-{agent_name}"
+
+
+async def _resolve_machine_command(agent: Agent, binary: str) -> str:
+    """Resolve an executable path on the agent machine.
+
+    Probing the machine avoids assuming that the host's absolute paths exist
+    inside a container or VM. Images used for agents must provide ``pi`` and
+    ``tmux`` on the agent user's PATH.
+    """
+    probe = await agent.machine.exec(f"command -v {shlex.quote(binary)}", timeout=10)
+    if probe.ok:
+        lines = [line.strip() for line in probe.stdout.splitlines() if line.strip()]
+        if lines:
+            return lines[0]
+
+    detail = probe.stderr.strip() or probe.stdout.strip()
+    suffix = f": {detail}" if detail else ""
+    raise RuntimeError(
+        f"`{binary}` must be available on the agent machine to launch agents{suffix}"
+    )
 
 
 def build_agent_launch_command(
@@ -51,10 +70,8 @@ async def launch_agent(agent: Agent, *, server_url: str, execution_id: str) -> s
 
     Returns the tmux session name.
     """
-    pi_command = shutil.which("pi")
-    tmux_command = shutil.which("tmux")
-    if not pi_command or not tmux_command:
-        raise RuntimeError("pi and tmux must both be available to launch agents")
+    pi_command = await _resolve_machine_command(agent, "pi")
+    tmux_command = await _resolve_machine_command(agent, "tmux")
 
     extension_path = agent_extension_path(execution_id, agent.name)
     await agent.machine.write_file(extension_path, extension_source())
@@ -65,11 +82,12 @@ async def launch_agent(agent: Agent, *, server_url: str, execution_id: str) -> s
         "RAMURE_AGENT_ID": agent.name,
         "RAMURE_SYSTEM_PROMPT": agent.system_prompt or "",
     }
-    # Pass through the truncation cap from the host env if set; the
-    # extension on the VM reads it at startup. Unset = extension's
-    # default (16 KiB).
+    # Pass through truncation caps from the host env if set; the
+    # extension on the VM reads them at startup. Unset = extension defaults.
     if os.environ.get("RAMURE_TOOL_RESULT_MAX_BYTES"):
         env["RAMURE_TOOL_RESULT_MAX_BYTES"] = os.environ["RAMURE_TOOL_RESULT_MAX_BYTES"]
+    if os.environ.get("RAMURE_MESSAGE_MAX_BYTES"):
+        env["RAMURE_MESSAGE_MAX_BYTES"] = os.environ["RAMURE_MESSAGE_MAX_BYTES"]
     # Forward provider credentials from the host so pi on the remote machine
     # can authenticate. Silently skipped if unset.
     for key in (
