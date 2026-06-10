@@ -179,6 +179,12 @@ class Runtime:
             await self.spawn_agent(ag)
         except Exception:
             self.agents.pop(name, None)
+            ag.log.close()
+            if spawned_machine is not None:
+                try:
+                    await spawned_machine.stop()
+                except Exception:
+                    pass
             raise
 
         return ag, spawned_machine

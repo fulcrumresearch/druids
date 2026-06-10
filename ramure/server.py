@@ -110,6 +110,11 @@ class Server:
     # -- reactions: the only place derived entries are produced --
 
     async def _react(self, agent_id: str, log: Log, entry: LogEntry) -> None:
+        if entry.type == "usage":
+            if self.runtime.log is not None:
+                self.runtime.log.emit("usage", {"agent": agent_id, **entry.data})
+            return
+
         if entry.type == "register":
             try:
                 tools = self.runtime.register_agent(

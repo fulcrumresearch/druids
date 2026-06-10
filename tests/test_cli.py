@@ -204,8 +204,49 @@ def test_ssh_argv_omits_tty_flag_when_not_requested(isolated_home):
 
 
 # ---------------------------------------------------------------------------
-# _remote_tmux_attach / _remote_login_shell / _guard_finished
+# Docker/Morph attach helpers / _guard_finished
 # ---------------------------------------------------------------------------
+
+
+def test_docker_tmux_attach_argv_execs_as_agent_user():
+    argv = ramure_cli._docker_tmux_attach_argv(
+        {"kind": "DockerMachine", "container_id": "abc123"},
+        "ramure-x-worker",
+    )
+    assert argv == [
+        "docker",
+        "exec",
+        "-it",
+        "--user",
+        "agent",
+        "abc123",
+        "tmux",
+        "attach-session",
+        "-t",
+        "ramure-x-worker",
+    ]
+
+
+def test_docker_login_shell_argv_uses_workdir():
+    argv = ramure_cli._docker_login_shell_argv(
+        {
+            "kind": "DockerMachine",
+            "container_id": "abc123",
+            "workdir": "/home/agent/project",
+        }
+    )
+    assert argv == [
+        "docker",
+        "exec",
+        "-it",
+        "--user",
+        "agent",
+        "--workdir",
+        "/home/agent/project",
+        "abc123",
+        "/bin/bash",
+        "-l",
+    ]
 
 
 def test_remote_tmux_attach_sudos_to_agent_user():

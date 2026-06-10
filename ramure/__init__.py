@@ -1,6 +1,7 @@
 from ramure.agent import Agent
 from ramure.log import Log, LogEntry
 from ramure.machines.base import Image, Machine
+from ramure.machines.docker import DockerImage, DockerMachine
 from ramure.machines.local import LocalImage, LocalMachine
 from ramure.process import (
     ProcessHandle,
@@ -24,6 +25,8 @@ from ramure.types import ExecResult, ExecutionFailed
 
 __all__ = [
     "Agent",
+    "DockerImage",
+    "DockerMachine",
     "Event",
     "ExecResult",
     "ExecutionFailed",

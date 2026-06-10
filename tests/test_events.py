@@ -209,7 +209,23 @@ def test_subscribe_preserves_async_iter() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_listen_for_replays_existing_match() -> None:
+def test_listen_for_default_skips_existing_match() -> None:
+    async def run() -> None:
+        stream = Stream()
+        stream.emit("tool_call", {"tool": "report"})
+
+        event = await stream.listen_for(
+            "tool_call",
+            timeout=0.01,
+            where=lambda e: e.data.get("tool") == "report",
+        )
+
+        assert event is None
+
+    asyncio.run(run())
+
+
+def test_listen_for_replay_true_checks_existing_match() -> None:
     async def run() -> None:
         stream = Stream()
         stream.emit("tool_call", {"tool": "report"})
@@ -218,6 +234,7 @@ def test_listen_for_replays_existing_match() -> None:
             "tool_call",
             timeout=0.1,
             where=lambda e: e.data.get("tool") == "report",
+            replay=True,
         )
 
         assert event == Event(type="tool_call", data={"tool": "report"})
@@ -234,7 +251,6 @@ def test_listen_for_waits_for_live_match() -> None:
                 "tool_call",
                 timeout=0.5,
                 where=lambda e: e.data.get("tool") == "report",
-                replay=False,
             )
         )
         await asyncio.sleep(0)
