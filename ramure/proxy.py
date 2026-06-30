@@ -203,6 +203,11 @@ class ModelProxy:
         for k, v in resp.getheaders():
             if k.lower() in _HOP_BY_HOP:
                 continue
+            # Defense-in-depth: never relay a header whose name/value contains a
+            # CR or LF (would enable response splitting). Trusted upstreams never
+            # do this, so nothing legitimate is dropped.
+            if "\r" in k or "\n" in k or "\r" in v or "\n" in v:
+                continue
             h.send_header(k, v)
         h.send_header("Connection", "close")
         h.end_headers()
