@@ -37,6 +37,16 @@ _ROUTES = {
     "openai": ("api.openai.com", "authorization", "OPENAI_API_KEY"),
 }
 
+# Per-route allow-list of forwarded request paths (query stripped). Any other path
+# is rejected with 403 — the agent can reach only these inference endpoints, not
+# arbitrary paths (file upload, fine-tuning, admin, …) on the provider host. These
+# are the only paths pi actually calls: Anthropic Messages, OpenAI Responses, and
+# OpenAI Chat Completions (used by some models instead of Responses).
+_ALLOWED_PATHS = {
+    "anthropic": {"/v1/messages"},
+    "openai": {"/v1/responses", "/v1/chat/completions"},
+}
+
 
 def load_provider_keys(env: Optional[Mapping[str, str]] = None) -> dict[str, str]:
     """Read the real provider keys from the host environment (names per ``_ROUTES``)."""
@@ -64,11 +74,16 @@ class ModelProxy:
         keys: Mapping[str, str],
         host: str = "127.0.0.1",
         upstreams: Optional[Mapping[str, str]] = None,
+        allowed_paths: Optional[Mapping[str, set]] = None,
     ) -> None:
         self.token = token
         self.keys = dict(keys)
         self.host = host
         self.upstreams = {r: (upstreams or {}).get(r, default) for r, (default, _h, _k) in _ROUTES.items()}
+        self.allowed_paths = (
+            {r: set(p) for r, p in allowed_paths.items()} if allowed_paths is not None
+            else {r: set(p) for r, p in _ALLOWED_PATHS.items()}
+        )
         self.hits: dict[str, int] = {r: 0 for r in _ROUTES}  # forwarded requests per route
         self._server: Optional[http.server.ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
@@ -135,6 +150,12 @@ class ModelProxy:
         presented = h.headers.get(cred_header, "") or ""
         if self.token not in presented:
             h.send_error(401, "invalid proxy token")
+            return
+
+        # Allow-list: forward only known inference endpoints, never arbitrary paths.
+        clean_path = forward_path.split("?", 1)[0]
+        if clean_path not in self.allowed_paths.get(route, ()):
+            h.send_error(403, "path not allowed by proxy")
             return
 
         length = int(h.headers.get("content-length", 0) or 0)
