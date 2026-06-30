@@ -5,6 +5,10 @@ const serverUrl = process.env.RAMURE_SERVER_URL;
 const executionId = process.env.RAMURE_EXECUTION_ID;
 const agentId = process.env.RAMURE_AGENT_ID;
 const appendedSystemPrompt = process.env.RAMURE_SYSTEM_PROMPT || "";
+// When set, ramure runs a host-side model proxy; route provider traffic
+// through it so the container holds only a scoped token (no real keys) and
+// needs no direct internet access.
+const proxyUrl = process.env.RAMURE_PROXY_URL;
 // Cap on pi_tool_result text per event. A full ``cargo build``
 // can be tens of KB; truncate to keep per-agent jsonl files
 // bounded. Callers can raise or lower via the env var; set it to
@@ -530,6 +534,16 @@ function applyTruncation(text: string): Record<string, unknown> {
 // -- Extension entry point --
 
 export default function ramureExtension(pi: ExtensionAPI) {
+  // Redirect built-in providers through ramure's host-side model proxy.
+  // Only baseUrl is overridden, so the providers' existing models are preserved.
+  if (proxyUrl) {
+    const registerProvider = (pi as any).registerProvider;
+    if (typeof registerProvider === "function") {
+      registerProvider.call(pi, "anthropic", { baseUrl: `${proxyUrl}/anthropic` });
+      registerProvider.call(pi, "openai", { baseUrl: `${proxyUrl}/openai/v1` });
+    }
+  }
+
   const registeredTools = new Set<string>();
   let started = false;
 

@@ -47,6 +47,7 @@ class Runtime:
         host: str = "127.0.0.1",
         port: int = 0,
         base_url: str | None = None,
+        proxy_models: bool | None = None,
     ):
         """Create a Runtime.
 
@@ -79,6 +80,15 @@ class Runtime:
         self.host = host
         self.port = port
         self.base_url = base_url
+        # Optional host-side model proxy (see ramure.proxy). When enabled and the
+        # host has provider keys, agents reach LLM providers only through it: no
+        # real keys in-container, so the container can be network-isolated to the
+        # host. Enable via proxy_models=True or env RAMURE_PROXY_MODELS=1.
+        if proxy_models is None:
+            proxy_models = os.environ.get("RAMURE_PROXY_MODELS", "") not in ("", "0", "false", "False")
+        self.proxy_models = proxy_models
+        self.proxy: "ModelProxy | None" = None
+        self.proxy_token: str | None = None
 
     async def start(self) -> None:
         self.execution_id = str(uuid.uuid4())
@@ -94,6 +104,15 @@ class Runtime:
             or f"ws://{self.host}:{self.server_instance.port}"
         )
 
+        if self.proxy_models:
+            from ramure.proxy import ModelProxy, load_provider_keys
+
+            keys = load_provider_keys()
+            if keys:
+                self.proxy_token = uuid.uuid4().hex
+                self.proxy = ModelProxy(token=self.proxy_token, keys=keys, host=self.host)
+                self.proxy.start()
+
         self.control = ControlServer(self)
         await self.control.start()
 
@@ -102,6 +121,7 @@ class Runtime:
             {
                 "execution_id": self.execution_id,
                 "server_url": self.server_url,
+                "model_proxy_url": self.proxy.base_url if self.proxy else None,
                 "pid": os.getpid(),
                 "started_at": self.started_at,
             },
@@ -118,6 +138,10 @@ class Runtime:
         if self.server_instance is not None:
             await self.server_instance.stop()
             self.server_instance = None
+        if self.proxy is not None:
+            self.proxy.stop()
+            self.proxy = None
+            self.proxy_token = None
         self.server_url = None
         self.execution_id = None
         self.started_at = None
@@ -255,7 +279,11 @@ class Runtime:
             raise RuntimeError("Server is not running")
 
         session_name = await _launch_agent_impl(
-            agent, server_url=server_url, execution_id=self.execution_id or ""
+            agent,
+            server_url=server_url,
+            execution_id=self.execution_id or "",
+            proxy_url=(self.proxy.base_url if self.proxy is not None else None),
+            proxy_token=self.proxy_token,
         )
         if self.log is not None:
             self.log.emit(

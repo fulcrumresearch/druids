@@ -65,8 +65,19 @@ def build_agent_launch_command(
     )
 
 
-async def launch_agent(agent: Agent, *, server_url: str, execution_id: str) -> str:
+async def launch_agent(
+    agent: Agent,
+    *,
+    server_url: str,
+    execution_id: str,
+    proxy_url: str | None = None,
+    proxy_token: str | None = None,
+) -> str:
     """Write the pi extension and start a tmux session for the agent.
+
+    If ``proxy_url``/``proxy_token`` are given, the agent reaches LLM providers
+    only through ramure's host-side model proxy: the container is handed the
+    scoped token in place of real provider keys, which never leave the host.
 
     Returns the tmux session name.
     """
@@ -88,17 +99,27 @@ async def launch_agent(agent: Agent, *, server_url: str, execution_id: str) -> s
         env["RAMURE_TOOL_RESULT_MAX_BYTES"] = os.environ["RAMURE_TOOL_RESULT_MAX_BYTES"]
     if os.environ.get("RAMURE_MESSAGE_MAX_BYTES"):
         env["RAMURE_MESSAGE_MAX_BYTES"] = os.environ["RAMURE_MESSAGE_MAX_BYTES"]
-    # Forward provider credentials from the host so pi on the remote machine
-    # can authenticate. Silently skipped if unset.
-    for key in (
-        "ANTHROPIC_API_KEY",
-        "OPENAI_API_KEY",
-        "GEMINI_API_KEY",
-        "GOOGLE_API_KEY",
-    ):
-        value = os.environ.get(key)
-        if value:
-            env[key] = value
+    if proxy_url and proxy_token:
+        # Route provider traffic through ramure's host-side model proxy. The
+        # extension reads RAMURE_PROXY_URL and points the provider baseUrls at
+        # it; the container authenticates with the scoped token, and the real
+        # provider keys stay on the host. Real keys are deliberately NOT
+        # forwarded here.
+        env["RAMURE_PROXY_URL"] = proxy_url
+        env["ANTHROPIC_API_KEY"] = proxy_token
+        env["OPENAI_API_KEY"] = proxy_token
+    else:
+        # Forward provider credentials from the host so pi on the remote machine
+        # can authenticate. Silently skipped if unset.
+        for key in (
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+        ):
+            value = os.environ.get(key)
+            if value:
+                env[key] = value
     session_name = agent_session_name(execution_id, agent.name)
     command = build_agent_launch_command(
         pi_command=pi_command,
