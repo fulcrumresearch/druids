@@ -36,6 +36,9 @@ class Agent:
     handlers: dict[str, Handler] = field(default_factory=dict)
     registered: asyncio.Event = field(default_factory=asyncio.Event)
     scope: "ProcessScope | None" = field(default=None, repr=False)
+    #: Set by ``ProcessScope.cleanup()`` before the agent is killed, so a
+    #: disconnect caused by intentional teardown is not treated as a crash.
+    shutting_down: bool = False
 
     @property
     def events(self) -> Stream:

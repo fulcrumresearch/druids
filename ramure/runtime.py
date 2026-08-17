@@ -273,6 +273,26 @@ class Runtime:
             build_tool_definition(name, fn) for name, fn in ag.handlers.items()
         ]
 
+    def agent_disconnected(self, agent_id: str) -> None:
+        """React to an agent's websocket connection dropping.
+
+        An agent that disconnects while its owning process is still running
+        is gone for good — nothing reconnects it — so any ``wait()`` in that
+        process would block forever. Escalate to the owning scope as a
+        failure, exactly as if the process had called ``fail()`` itself, so
+        supervisors see a ``failed`` event and can respawn.
+
+        No-ops when the disconnect is expected: the agent is already being
+        torn down by its scope (``shutting_down``), was already deregistered,
+        or never completed registration.
+        """
+        ag = self.agents.get(agent_id)
+        if ag is None or ag.shutting_down or not ag.registered.is_set():
+            return
+        if ag.scope is None:
+            return
+        ag.scope.fail_external(f"agent '{agent_id}' disconnected")
+
     # -- Tool call dispatch --
 
     async def handle_tool_call(

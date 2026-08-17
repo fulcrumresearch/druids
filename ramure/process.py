@@ -57,6 +57,24 @@ class ProcessScope:
         if self._outcome is None:
             self._outcome = asyncio.get_running_loop().create_future()
 
+    def fail_external(self, reason: str) -> None:
+        """Resolve this scope's outcome as failed, from outside its context.
+
+        Called by the runtime when an agent owned by this scope dies
+        unexpectedly. Semantics match the ambient ``fail()``: a pending
+        ``wait()`` raises ``ExecutionFailed``, and the ``@agent_process``
+        decorator emits the ``failed`` event on the way out. A scope whose
+        outcome is already resolved is left untouched.
+        """
+        if self._outcome is not None and not self._outcome.done():
+            self._outcome.set_exception(ExecutionFailed(reason))
+            # The process may finish without ever awaiting the outcome
+            # (e.g. it loops over events instead of calling wait()).
+            # Mark the exception as retrieved so garbage collection does
+            # not log a spurious "exception was never retrieved" warning;
+            # a later ``wait()`` still raises.
+            self._outcome.exception()
+
     async def cleanup(self) -> None:
         """Tear down agents and machines owned by this scope."""
         eid = self.runtime.execution_id or ""
@@ -65,6 +83,7 @@ class ProcessScope:
         # internally by ``emit``; we then proceed to kill the tmux session.
         # Any client-side cleanup pi does is best-effort.
         for ag in self.agents:
+            ag.shutting_down = True
             try:
                 ag.log.emit("shutdown")
             except Exception:

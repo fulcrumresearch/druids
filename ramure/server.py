@@ -71,6 +71,10 @@ class Server:
             await ws.send(entry.to_json())
 
         unsubscribe = log.subscribe(send)
+        # Only the connection that registers as the agent represents the
+        # agent's liveness. Other clients on this endpoint (log viewers,
+        # sync-only probes) may come and go freely.
+        registered_here = False
         try:
             async for raw in ws:
                 try:
@@ -79,10 +83,17 @@ class Server:
                     # Malformed frame: ignore. All communication happens via
                     # log entries; there is no separate error channel.
                     continue
+                if (
+                    msg.get("type") == "event"
+                    and msg.get("event_type") == "register"
+                ):
+                    registered_here = True
                 await self._dispatch(agent_id, log, send, msg)
         finally:
             unsubscribe()
             log.emit("disconnected", {}, origin="agent")
+            if registered_here:
+                self.runtime.agent_disconnected(agent_id)
 
     async def _dispatch(
         self, agent_id: str, log: Log, send: Send, msg: dict[str, Any]
